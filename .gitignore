@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Outputs
+*.csv
+*.png
+fit_diagnostics.txt
+
+# Local data
+Tracklogs/

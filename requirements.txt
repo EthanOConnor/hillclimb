@@ -1,0 +1,3 @@
+fitparse
+typer
+matplotlib
