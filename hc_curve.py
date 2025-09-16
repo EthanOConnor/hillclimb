@@ -1,5 +1,6 @@
 import sys
 import os
+import bisect
 import csv
 import logging
 from dataclasses import dataclass
@@ -53,6 +54,24 @@ SOURCE_NAME_MAP = {
     "alt_enh": "altitude",
     "alt": "altitude",
 }
+
+USER_COLOR = "C0"
+GOAL_COLOR = "tab:green"
+PERSONAL_STYLE = (0, (3, 3, 1.5, 3))
+WR_STYLE = (0, (6, 4))
+
+SOURCE_DISPLAY_MAP = {
+    "runn_total_gain": "runn (total_gain)",
+    "runn_incline": "runn (incline)",
+    "altitude": "altitude",
+    "mixed": "mixed",
+    "auto": "auto",
+    "runn": "runn",
+}
+
+
+def _normalize_source_label(label: str) -> str:
+    return SOURCE_DISPLAY_MAP.get(label, label)
 
 
 # -----------------
@@ -235,13 +254,14 @@ def _merge_records(
 
     # Precompute overlap spans where >=2 files have tg present
     spans = _compute_tg_overlap_spans(records_by_file, policy=overlap_policy)
+    span_starts = [s for s, _, _ in spans]
 
     merged: List[Dict[str, Any]] = []
     eps = float(merge_eps_sec)
     for rec in allrecs:
         # Suppress losing tg within overlap spans
         if rec.get("tg") is not None:
-            winner = _lookup_overlap_winner(spans, rec["t"])
+            winner = _lookup_overlap_winner(spans, span_starts, rec["t"])
             if winner is not None and rec.get("file_id") != winner:
                 rec = dict(rec)
                 rec["tg"] = None
@@ -302,8 +322,12 @@ def _compute_tg_overlap_spans(records_by_file: List[List[Dict[str, Any]]], polic
     return spans
 
 
-def _lookup_overlap_winner(spans: List[Tuple[float, float, int]], t: float) -> Optional[int]:
-    for s, e, w in spans:
+def _lookup_overlap_winner(spans: List[Tuple[float, float, int]], starts: List[float], t: float) -> Optional[int]:
+    if not spans:
+        return None
+    idx = bisect.bisect_right(starts, t) - 1
+    if idx >= 0:
+        s, e, w = spans[idx]
         if s <= t <= e:
             return w
     return None
@@ -319,7 +343,7 @@ def _sessionize(merged: List[Dict[str, Any]], gap_sec: float = 600.0) -> List[Li
             cur = [r]
             sessions.append(cur)
         else:
-            if t - last_t > gap_sec:
+            if (t - last_t) >= (gap_sec - 1e-6):
                 cur = [r]
                 sessions.append(cur)
             else:
@@ -1002,6 +1026,60 @@ def _scoring_tables(
 # CLI
 # -----------------
 
+def _fmt_duration_label(value: int) -> str:
+    if value < 120:
+        return f"{int(value)}s"
+    if value < 3600:
+        return f"{int(round(value/60))}m"
+    return f"{round(value/3600,1)}h"
+
+
+def _setup_duration_axis(ax, durations: List[int]) -> None:
+    import numpy as np
+    import math
+
+    u0 = math.log10(60.0)
+    compress = 0.4
+
+    def _fwd(xx):
+        x = np.asarray(xx, dtype=float)
+        x = np.where(x <= 0, 1e-6, x)
+        u = np.log10(x)
+        y = np.where(u <= u0, u0 + compress * (u - u0), u)
+        return y
+
+    def _inv(yy):
+        y = np.asarray(yy, dtype=float)
+        u = np.where(y <= u0, u0 + (y - u0) / compress, y)
+        return 10.0 ** u
+
+    ax.set_xscale("function", functions=(_fwd, _inv))
+    dmin = max(1, int(min(durations))) if durations else 1
+    dmax = int(max(durations)) if durations else 1
+    sec_ticks: List[int] = []
+    for k in range(0, 2):
+        for m in (1, 2, 5):
+            v = int(m * (10 ** k))
+            if v < 60 and dmin <= v <= dmax:
+                sec_ticks.append(v)
+    min_ticks_all = [60, 120, 300, 600, 1200, 1800, 3600]
+    min_ticks = [t for t in min_ticks_all if dmin <= t <= dmax]
+    ticks = sec_ticks + min_ticks
+    if not ticks:
+        ticks = [dmin, dmax]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([_fmt_duration_label(t) for t in ticks])
+    ax.grid(True, which="both", axis="both", linestyle=":", alpha=0.6)
+
+
+def _summarize_magic(magic_rows: Optional[List[Dict[str, Any]]], goals_topk: int) -> Tuple[List[Dict[str, Any]], Set[int]]:
+    if not magic_rows:
+        return [], set()
+    valid_rows = [r for r in magic_rows if isinstance(r.get('score_pct'), (int, float))]
+    weakest = sorted(valid_rows, key=lambda r: r['score_pct'])[:goals_topk]
+    return weakest, {int(r['duration_s']) for r in weakest}
+
+
 def _plot_curve(
     curve: List[CurvePoint],
     out_png: str,
@@ -1025,21 +1103,10 @@ def _plot_curve(
     climbs = [cp.max_climb_m for cp in curve]
     dense = len(curve) > 100
 
-    def fmt_dur(s: int) -> str:
-        if s < 120:
-            return f"{int(s)}s"
-        if s < 3600:
-            return f"{int(round(s/60))}m"
-        return f"{round(s/3600,1)}h"
-
     plt.style.use("ggplot")
     fig, ax = plt.subplots(figsize=(12, 7))
-    user_color = "C0"
-    goal_color = "tab:green"
-    personal_style = (0, (3, 3, 1.5, 3))
-    wr_style = (0, (6, 4))
 
-    ax.plot(durs, rates, marker="" if dense else "o", linewidth=1.8, color=user_color, label="Climb rate (m/h)")
+    ax.plot(durs, rates, marker="" if dense else "o", linewidth=1.8, color=USER_COLOR, label="Climb rate (m/h)")
 
     # Use a custom compressed-log x-scale that compresses < 60s
     # so that more horizontal space is devoted to >= 1 minute.
@@ -1077,16 +1144,16 @@ def _plot_curve(
         ticks = [dmin, dmax]
     ax.set_xticks(ticks)
     ax.set_xticklabels([fmt_dur(s) for s in ticks])
+    _setup_duration_axis(ax, durs)
     ax.set_xlabel("Duration")
-    ax.set_ylabel("Climb rate (m/h)", color="C0")
-    ax.grid(True, which="both", axis="both", linestyle=":", alpha=0.6)
+    ax.set_ylabel("Climb rate (m/h)", color=USER_COLOR)
 
     ax2 = ax.twinx()
-    ax2.plot(durs, climbs, marker="" if dense else "s", linestyle="--", linewidth=1.5, color=user_color, label="Max climb (m)")
+    ax2.plot(durs, climbs, marker="" if dense else "s", linestyle="--", linewidth=1.5, color=USER_COLOR, label="Max climb (m)")
     if not dense:
         for x, y in zip(durs, climbs):
-            ax2.annotate(f"{y:.0f}", (x, y), textcoords="offset points", xytext=(0, -12), ha="center", fontsize=9, color=user_color)
-    ax2.set_ylabel("Max climb (m)", color=user_color)
+            ax2.annotate(f"{y:.0f}", (x, y), textcoords="offset points", xytext=(0, -12), ha="center", fontsize=9, color=USER_COLOR)
+    ax2.set_ylabel("Max climb (m)", color=USER_COLOR)
 
     ax.set_title(f"Ascent Rate Curve — {source_label}")
 
@@ -1094,14 +1161,14 @@ def _plot_curve(
     if show_wr and wr_curve is not None:
         wr_durs, wr_vals = wr_curve
         wr_rates = [v / w * 3600.0 if w > 0 else 0.0 for w, v in zip(wr_durs, wr_vals)]
-        ax.plot(wr_durs, wr_rates, linestyle=wr_style, color="0.3", alpha=0.9, label="WR rate")
-        ax2.plot(wr_durs, wr_vals, linestyle=wr_style, color="0.3", alpha=0.9, label="WR climb")
+        ax.plot(wr_durs, wr_rates, linestyle=WR_STYLE, color="0.3", alpha=0.9, label="WR rate")
+        ax2.plot(wr_durs, wr_vals, linestyle=WR_STYLE, color="0.3", alpha=0.9, label="WR climb")
 
     if show_personal and personal_curve is not None:
         p_durs, p_vals = personal_curve
         p_rates = [v / w * 3600.0 if w > 0 else 0.0 for w, v in zip(p_durs, p_vals)]
-        ax.plot(p_durs, p_rates, linestyle=personal_style, linewidth=1.2, color=user_color, alpha=0.6, label="Personal rate")
-        ax2.plot(p_durs, p_vals, linestyle=personal_style, linewidth=1.2, color=user_color, alpha=0.6, label="Personal climb")
+        ax.plot(p_durs, p_rates, linestyle=PERSONAL_STYLE, linewidth=1.2, color=USER_COLOR, alpha=0.6, label="Personal rate")
+        ax2.plot(p_durs, p_vals, linestyle=PERSONAL_STYLE, linewidth=1.2, color=USER_COLOR, alpha=0.6, label="Personal climb")
 
     # Magic connectors and goals
     if magic_rows:
@@ -1124,7 +1191,7 @@ def _plot_curve(
                 target = None
             if target is not None:
                 ax2.plot([w, w], [usr, target], linestyle=":", color="gray", alpha=0.8)
-            ax2.plot([w], [usr], marker="o", color=user_color)
+            ax2.plot([w], [usr], marker="o", color=USER_COLOR)
             if show_wr and wrv is not None:
                 ax2.plot([w], [wrv], marker="o", color="0.3", alpha=0.9)
             pct = row.get('score_pct')
@@ -1141,7 +1208,7 @@ def _plot_curve(
                 )
             if isinstance(row.get('goal_gain_m'), (int, float, float)):
                 goal = row.get('goal_gain_m')
-                ax2.plot([w], [goal], marker=">", color=goal_color)
+                ax2.plot([w], [goal], marker=">", color=GOAL_COLOR)
                 wrv2 = row.get('wr_gain_m')
                 gpct = (goal / wrv2 * 100.0) if isinstance(wrv2, (int, float)) and wrv2 > 0 else None
                 label = f"goal {goal:.0f} m" + (f" • {gpct:.0f}%" if gpct is not None else "")
@@ -1152,7 +1219,7 @@ def _plot_curve(
                     xytext=(-6, 10),
                     ha="right",
                     fontsize=8,
-                    color=goal_color,
+                    color=GOAL_COLOR,
                 )
             label_toggle *= -1
     lines, labels = ax.get_legend_handles_labels()
@@ -1183,8 +1250,6 @@ def _plot_split(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import numpy as np
-        import math
     except Exception as e:  # pragma: no cover
         raise RuntimeError("matplotlib is required for plotting. Install with: pip install matplotlib") from e
 
@@ -1193,69 +1258,30 @@ def _plot_split(
     climbs = [cp.max_climb_m for cp in curve]
     dense = len(curve) > 100
 
-    def fmt_dur(s: int) -> str:
-        if s < 120:
-            return f"{int(s)}s"
-        if s < 3600:
-            return f"{int(round(s/60))}m"
-        return f"{round(s/3600,1)}h"
-
-    def setup_x(ax):
-        u0 = math.log10(60.0)
-        compress = 0.4
-        def _fwd(xx):
-            x = np.asarray(xx, dtype=float)
-            x = np.where(x <= 0, 1e-6, x)
-            u = np.log10(x)
-            y = np.where(u <= u0, u0 + compress * (u - u0), u)
-            return y
-        def _inv(yy):
-            y = np.asarray(yy, dtype=float)
-            u = np.where(y <= u0, u0 + (y - u0) / compress, y)
-            return 10.0 ** u
-        ax.set_xscale("function", functions=(_fwd, _inv))
-        dmin = max(1, int(min(durs)))
-        dmax = int(max(durs))
-        sec_ticks: List[int] = []
-        for k in range(0, 2):
-            for m in (1, 2, 5):
-                v = int(m * (10 ** k))
-                if v < 60 and dmin <= v <= dmax:
-                    sec_ticks.append(v)
-        min_ticks_all = [60, 120, 300, 600, 1200, 1800, 3600]
-        min_ticks = [t for t in min_ticks_all if dmin <= t <= dmax]
-        ticks = sec_ticks + min_ticks
-        if not ticks:
-            ticks = [dmin, dmax]
-        ax.set_xticks(ticks)
-        ax.set_xticklabels([fmt_dur(s) for s in ticks])
-        ax.grid(True, which="both", axis="both", linestyle=":", alpha=0.6)
+    import numpy as np
+    import math
 
     # Rate plot
     plt.style.use("ggplot")
     fig1, ax1 = plt.subplots(figsize=(12, 7))
-    user_color = "C0"
-    goal_color = "tab:green"
-    personal_style = (0, (3, 3, 1.5, 3))
-    wr_style = (0, (6, 4))
 
-    ax1.plot(durs, rates, marker="" if dense else "o", linewidth=1.8, color=user_color, label="Climb rate (m/h)")
+    ax1.plot(durs, rates, marker="" if dense else "o", linewidth=1.8, color=USER_COLOR, label="Climb rate (m/h)")
     if show_wr and wr_curve is not None:
         wr_durs, wr_vals = wr_curve
         wr_rates = [v / w * 3600.0 if w > 0 else 0.0 for w, v in zip(wr_durs, wr_vals)]
-        ax1.plot(wr_durs, wr_rates, linestyle=wr_style, color="0.3", alpha=0.9, label="WR rate (≥min)")
+        ax1.plot(wr_durs, wr_rates, linestyle=WR_STYLE, color="0.3", alpha=0.9, label="WR rate (≥min)")
     if show_personal and personal_curve is not None:
         p_durs, p_vals = personal_curve
         p_rates = [v / w * 3600.0 if w > 0 else 0.0 for w, v in zip(p_durs, p_vals)]
-        ax1.plot(p_durs, p_rates, linestyle=personal_style, linewidth=1.2, color=user_color, alpha=0.6, label="Personal rate")
+        ax1.plot(p_durs, p_rates, linestyle=PERSONAL_STYLE, linewidth=1.2, color=USER_COLOR, alpha=0.6, label="Personal rate")
     if goal_curve is not None:
         g_durs, g_vals = goal_curve
         gd = [(w, v) for w, v in zip(g_durs, g_vals) if w >= goal_min_seconds]
         if gd:
             gx, gy = zip(*gd)
             g_rates = [v / w * 3600.0 if w > 0 else 0.0 for w, v in gd]
-            ax1.plot(gx, g_rates, linestyle="-", linewidth=1.2, color=goal_color, alpha=0.8, label="Goal rate")
-    setup_x(ax1)
+            ax1.plot(gx, g_rates, linestyle="-", linewidth=1.2, color=GOAL_COLOR, alpha=0.8, label="Goal rate")
+    _setup_duration_axis(ax1, durs)
     ax1.set_xlabel("Duration")
     ax1.set_ylabel("Climb rate (m/h)")
     if ylog_rate:
@@ -1263,11 +1289,7 @@ def _plot_split(
         ax1.set_yscale('log')
         ax1.set_ylim(bottom=ymin)
     # Magic annotations for rate
-    weak_ws: Set[int] = set()
-    if magic_rows:
-        valid_rows = [r for r in magic_rows if isinstance(r.get('score_pct'), (int, float))]
-        weak_rows = sorted(valid_rows, key=lambda r: r['score_pct'])[:goals_topk]
-        weak_ws = {int(r['duration_s']) for r in weak_rows}
+    weak_rows, weak_ws = _summarize_magic(magic_rows, goals_topk)
 
     if magic_rows:
         label_toggle = 1
@@ -1308,7 +1330,7 @@ def _plot_split(
                     xytext=(0, 12),
                     ha="center",
                     fontsize=8,
-                    color=goal_color,
+                    color=GOAL_COLOR,
                 )
             label_toggle *= -1
 
@@ -1321,20 +1343,20 @@ def _plot_split(
 
     # Climb plot
     fig2, axc = plt.subplots(figsize=(12, 7))
-    axc.plot(durs, climbs, marker="" if dense else "s", linewidth=1.8, color=user_color, label="Max climb (m)")
+    axc.plot(durs, climbs, marker="" if dense else "s", linewidth=1.8, color=USER_COLOR, label="Max climb (m)")
     if show_wr and wr_curve is not None:
         wr_durs, wr_vals = wr_curve
-        axc.plot(wr_durs, wr_vals, linestyle=wr_style, color="0.3", alpha=0.9, label="WR climb (≥min)")
+        axc.plot(wr_durs, wr_vals, linestyle=WR_STYLE, color="0.3", alpha=0.9, label="WR climb (≥min)")
     if show_personal and personal_curve is not None:
         p_durs, p_vals = personal_curve
-        axc.plot(p_durs, p_vals, linestyle=personal_style, linewidth=1.2, color=user_color, alpha=0.6, label="Personal climb")
+        axc.plot(p_durs, p_vals, linestyle=PERSONAL_STYLE, linewidth=1.2, color=USER_COLOR, alpha=0.6, label="Personal climb")
     if goal_curve is not None:
         g_durs, g_vals = goal_curve
         gd = [(w, v) for w, v in zip(g_durs, g_vals) if w >= goal_min_seconds]
         if gd:
             gx, gy = zip(*gd)
-            axc.plot(gx, gy, linestyle="-", linewidth=1.2, color=goal_color, alpha=0.8, label="Goal climb")
-    setup_x(axc)
+            axc.plot(gx, gy, linestyle="-", linewidth=1.2, color=GOAL_COLOR, alpha=0.8, label="Goal climb")
+    _setup_duration_axis(axc, durs)
     axc.set_xlabel("Duration")
     axc.set_ylabel("Max climb (m)")
     if ylog_climb:
@@ -1344,12 +1366,10 @@ def _plot_split(
     axc.set_title(f"Ascent Max Climb — {source_label}")
 
     # Magic connectors/labels on climb plot
-    if magic_rows:
-        valid = [r for r in magic_rows if isinstance(r.get('score_pct'), (int, float))]
-        weak = sorted(valid, key=lambda r: r['score_pct'])[:goals_topk]
-        weak_ws = set(int(r['duration_s']) for r in weak)
+    weak_rows, weak_ws = _summarize_magic(magic_rows, goals_topk)
+    if weak_rows:
         label_toggle = 1
-        for row in weak:
+        for row in weak_rows:
             w = int(row['duration_s'])
             usr = row.get('user_gain_m')
             wrv = row.get('wr_gain_m')
@@ -1363,7 +1383,7 @@ def _plot_split(
                 target = None
             if target is not None:
                 axc.plot([w, w], [usr, target], linestyle=":", color="gray", alpha=0.8)
-            axc.plot([w], [usr], marker="o", color=user_color)
+            axc.plot([w], [usr], marker="o", color=USER_COLOR)
             if show_wr and wrv is not None:
                 axc.plot([w], [wrv], marker="o", color="0.3", alpha=0.9)
             pct = row.get('score_pct')
@@ -1380,7 +1400,7 @@ def _plot_split(
                 )
             if w in weak_ws and w >= goal_min_seconds and isinstance(row.get('goal_gain_m'), (int, float, float)):
                 goal = row.get('goal_gain_m')
-                axc.plot([w], [goal], marker=">", color=goal_color)
+                axc.plot([w], [goal], marker=">", color=GOAL_COLOR)
                 wrv2 = row.get('wr_gain_m')
                 gpct = (goal / wrv2 * 100.0) if isinstance(wrv2, (int, float)) and wrv2 > 0 else None
                 label = f"goal {goal:.0f} m" + (f" • {gpct:.0f}%" if gpct is not None else "")
@@ -1391,7 +1411,7 @@ def _plot_split(
                     xytext=(-6, 10),
                     ha="right",
                     fontsize=8,
-                    color=goal_color,
+                    color=GOAL_COLOR,
                 )
             label_toggle *= -1
 
@@ -1465,13 +1485,9 @@ def _run(
         overall_sources: Set[str] = set()
 
         def _register_auto_sources(raw_sources: Set[str]) -> None:
-            if not raw_sources:
-                return
-            mapped = {SOURCE_NAME_MAP.get(src, src) for src in raw_sources if SOURCE_NAME_MAP.get(src, src)}
-            if mapped:
-                overall_sources.update(mapped)
-            else:
-                overall_sources.update(raw_sources)
+            for raw in raw_sources:
+                canonical = SOURCE_NAME_MAP.get(raw, raw)
+                overall_sources.add(_normalize_source_label(canonical))
 
         if all_windows:
             combined: Dict[int, CurvePoint] = {}
@@ -1485,7 +1501,7 @@ def _run(
                     st_times, st_vals, label = _build_timeseries(sess, source=source, gain_eps=gain_eps)
                     if not st_times:
                         continue
-                    overall_sources.add(label)
+                    overall_sources.add(_normalize_source_label(label))
                 if resample_1hz:
                     st_times, st_vals = _resample_to_1hz(st_times, st_vals)
                 total = int(st_times[-1])
@@ -1511,7 +1527,7 @@ def _run(
                     st_times, st_vals, label = _build_timeseries(sess, source=source, gain_eps=gain_eps)
                     if not st_times:
                         continue
-                    overall_sources.add(label)
+                    overall_sources.add(_normalize_source_label(label))
                 if resample_1hz:
                     st_times, st_vals = _resample_to_1hz(st_times, st_vals)
                 durs = durations
@@ -1528,12 +1544,16 @@ def _run(
                         by_dur[key] = cp
             curve = [by_dur[k] for k in sorted(by_dur.keys())]
 
+        if not curve:
+            logging.error("No data available to compute curve after merging sessions.")
+            return 2
+
         if not overall_sources:
-            selected = "mixed" if source == "auto" else source
+            selected = _normalize_source_label("mixed" if source == "auto" else source)
         elif len(overall_sources) == 1:
             selected = next(iter(overall_sources))
         else:
-            selected = "mixed"
+            selected = _normalize_source_label("mixed")
     except Exception as e:
         logging.error(str(e))
         return 2
