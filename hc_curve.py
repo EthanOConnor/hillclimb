@@ -1482,12 +1482,12 @@ def _run(
         sessions = _sessionize(merged, gap_sec=session_gap_sec)
         if len(sessions) > 1:
             logging.info("Sessions detected: %d (windows do not cross)", len(sessions))
-        overall_sources: Set[str] = set()
+        overall_sources_raw: Set[str] = set()
 
         def _register_auto_sources(raw_sources: Set[str]) -> None:
             for raw in raw_sources:
                 canonical = SOURCE_NAME_MAP.get(raw, raw)
-                overall_sources.add(_normalize_source_label(canonical))
+                overall_sources_raw.add(canonical)
 
         if all_windows:
             combined: Dict[int, CurvePoint] = {}
@@ -1501,7 +1501,7 @@ def _run(
                     st_times, st_vals, label = _build_timeseries(sess, source=source, gain_eps=gain_eps)
                     if not st_times:
                         continue
-                    overall_sources.add(_normalize_source_label(label))
+                    overall_sources_raw.add(label)
                 if resample_1hz:
                     st_times, st_vals = _resample_to_1hz(st_times, st_vals)
                 total = int(st_times[-1])
@@ -1527,7 +1527,7 @@ def _run(
                     st_times, st_vals, label = _build_timeseries(sess, source=source, gain_eps=gain_eps)
                     if not st_times:
                         continue
-                    overall_sources.add(_normalize_source_label(label))
+                    overall_sources_raw.add(label)
                 if resample_1hz:
                     st_times, st_vals = _resample_to_1hz(st_times, st_vals)
                 durs = durations
@@ -1548,12 +1548,13 @@ def _run(
             logging.error("No data available to compute curve after merging sessions.")
             return 2
 
-        if not overall_sources:
-            selected = _normalize_source_label("mixed" if source == "auto" else source)
-        elif len(overall_sources) == 1:
-            selected = next(iter(overall_sources))
+        if not overall_sources_raw:
+            selected_raw = "mixed" if source == "auto" else source
+        elif len(overall_sources_raw) == 1:
+            selected_raw = next(iter(overall_sources_raw))
         else:
-            selected = _normalize_source_label("mixed")
+            selected_raw = "mixed"
+        selected = _normalize_source_label(selected_raw)
     except Exception as e:
         logging.error(str(e))
         return 2
@@ -1636,7 +1637,7 @@ def _run(
                     "climb_rate_m_per_hr": round(cp.climb_rate_m_per_hr, 3),
                     "start_offset_s": round(cp.start_offset_s, 3),
                     "end_offset_s": round(cp.end_offset_s, 3),
-                    "source": selected,
+                    "source": selected_raw,
                 }
             )
 
