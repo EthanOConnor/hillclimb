@@ -698,6 +698,7 @@ def _build_canonical_timeseries(
     session: List[Dict[str, Any]],
     gain_eps: float,
     dwell_sec: float = 5.0,
+    gap_threshold: float = 600.0,
 ) -> Tuple[List[float], List[float], Set[str], List[Tuple[float, float]]]:
     times, tg_cum, inc_cum, alt_cum = _build_per_source_cum(session, gain_eps)
     if not times:
@@ -716,7 +717,7 @@ def _build_canonical_timeseries(
     for idx, t in enumerate(times):
         if idx > 0:
             delta = t - last_time
-            if delta > dwell_sec:
+            if delta > gap_threshold:
                 gaps.append((last_time, t))
             last_time = t
         avail: Dict[str, Optional[float]] = {}
@@ -1477,7 +1478,12 @@ def _run(
         overall_sources_raw: Set[str] = set()
         inactivity_gaps: List[Tuple[float, float]] = []
         if source == "auto":
-            times, values, used, gaps = _build_canonical_timeseries(merged, gain_eps=gain_eps)
+            times, values, used, gaps = _build_canonical_timeseries(
+                merged,
+                gain_eps=gain_eps,
+                dwell_sec=5.0,
+                gap_threshold=session_gap_sec,
+            )
             overall_sources_raw = {SOURCE_NAME_MAP.get(u, u) for u in used if u}
             inactivity_gaps = gaps
         else:
@@ -1485,7 +1491,7 @@ def _run(
             overall_sources_raw = {label}
 
         if not times:
-            logging.error("No data available to compute curve after merging sessions.")
+            logging.error("No data available to compute curve after merging inputs.")
             return 2
 
         if resample_1hz:
@@ -1680,7 +1686,7 @@ def _build_typer_app():  # pragma: no cover
         overlap_policy: str = typer.Option("file:last", "--overlap-policy", help="Overlap precedence for tg: file:first|file:last"),
         resample_1hz: bool = typer.Option(False, "--resample-1hz", help="Resample cumulative series to 1 Hz"),
         gain_eps: float = typer.Option(0.5, "--gain-eps", help="Altitude hysteresis (m) for ascent from altitude"),
-        session_gap_sec: float = typer.Option(600.0, "--session-gap-sec", help="Gap (s) to start a new session; windows do not cross sessions"),
+        session_gap_sec: float = typer.Option(600.0, "--session-gap-sec", help="Gap (s) considered inactivity when summarising and reporting; windows span all gaps"),
         all_windows: bool = typer.Option(False, "--all", help="Compute per-second curve via concave envelope sweep (near-linear)"),
         wr_profile: str = typer.Option("overall", "--wr-profile", help="WR envelope profile: overall|stairs|female_overall|female_stairs"),
         wr_anchors: Optional[str] = typer.Option(None, "--wr-anchors", help="Path to JSON defining WR anchors [{w_s,gain_m}]"),
