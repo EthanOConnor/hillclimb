@@ -33,3 +33,4 @@ Upcoming Stabilization Work
 - Harden mixed-source stitching by fixing dwell fallback and preserving contributing `file_id` during timestamp coalescing.
 - Connect the CLI `--source` option to the actual computation path so CSV metadata reflects the selected stream.
 - Swap the exhaustive/all-windows sweep to the linear-time concave-envelope implementation for better scaling on long sessions.
+- Enable cross-session windows by building a global canonical timeseries and using prefix sums so the curve can report multi-day spans across breaks.

@@ -333,25 +333,6 @@ def _lookup_overlap_winner(spans: List[Tuple[float, float, int]], starts: List[f
     return None
 
 
-def _sessionize(merged: List[Dict[str, Any]], gap_sec: float = 600.0) -> List[List[Dict[str, Any]]]:
-    sessions: List[List[Dict[str, Any]]] = []
-    cur: List[Dict[str, Any]] = []
-    last_t: Optional[float] = None
-    for r in merged:
-        t = r["t"]
-        if last_t is None:
-            cur = [r]
-            sessions.append(cur)
-        else:
-            if (t - last_t) >= (gap_sec - 1e-6):
-                cur = [r]
-                sessions.append(cur)
-            else:
-                cur.append(r)
-        last_t = t
-    return sessions
-
-
 def _build_timeseries(
     merged: List[Dict[str, Any]],
     source: str = "auto",
@@ -713,7 +694,7 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
     return times, tg_cum, inc_cum, alt_cum
 
 
-def _build_canonical_session(
+def _build_canonical_timeseries(
     session: List[Dict[str, Any]],
     gain_eps: float,
     dwell_sec: float = 5.0,
@@ -1478,74 +1459,42 @@ def _run(
             records_by_file.append(_parse_single_fit_records(fp, file_id=i))
         merged = _merge_records(records_by_file, merge_eps_sec=merge_eps_sec, overlap_policy=overlap_policy)
         logging.info("Merged samples: %d", len(merged))
-        # Sessionize and build canonical per session
-        sessions = _sessionize(merged, gap_sec=session_gap_sec)
-        if len(sessions) > 1:
-            logging.info("Sessions detected: %d (windows do not cross)", len(sessions))
-        overall_sources_raw: Set[str] = set()
+        if session_gap_sec > 0 and len(merged) > 1:
+            gap_count = sum(1 for i in range(1, len(merged)) if merged[i]["t"] - merged[i-1]["t"] > session_gap_sec)
+            if gap_count:
+                logging.info("Detected %d gap(s) longer than %.0fs (windows span all gaps).", gap_count, session_gap_sec)
 
-        def _register_auto_sources(raw_sources: Set[str]) -> None:
-            for raw in raw_sources:
-                canonical = SOURCE_NAME_MAP.get(raw, raw)
-                overall_sources_raw.add(canonical)
+        times: List[float]
+        values: List[float]
+        overall_sources_raw: Set[str] = set()
+        if source == "auto":
+            times, values, used = _build_canonical_timeseries(merged, gain_eps=gain_eps)
+            overall_sources_raw = {SOURCE_NAME_MAP.get(u, u) for u in used if u}
+        else:
+            times, values, label = _build_timeseries(merged, source=source, gain_eps=gain_eps)
+            overall_sources_raw = {label}
+
+        if not times:
+            logging.error("No data available to compute curve after merging sessions.")
+            return 2
+
+        if resample_1hz:
+            times, values = _resample_to_1hz(times, values)
 
         if all_windows:
-            combined: Dict[int, CurvePoint] = {}
-            for sess in sessions:
-                if source == "auto":
-                    st_times, st_vals, used = _build_canonical_session(sess, gain_eps=gain_eps)
-                    if not st_times:
-                        continue
-                    _register_auto_sources(used)
-                else:
-                    st_times, st_vals, label = _build_timeseries(sess, source=source, gain_eps=gain_eps)
-                    if not st_times:
-                        continue
-                    overall_sources_raw.add(label)
-                if resample_1hz:
-                    st_times, st_vals = _resample_to_1hz(st_times, st_vals)
-                total = int(st_times[-1])
-                if total <= 0:
-                    continue
-                step_for_all = step_s if step_s > 0 else 1
-                per = all_windows_curve(st_times, st_vals, step=step_for_all)
-                for cp in per:
-                    key = cp.duration_s
-                    if key not in combined or cp.max_climb_m > combined[key].max_climb_m:
-                        combined[key] = cp
-            curve = [combined[k] for k in sorted(combined.keys())]
+            step_for_all = step_s if step_s > 0 else 1
+            curve = all_windows_curve(times, values, step=step_for_all)
         else:
-            # Fixed durations: take max across sessions
-            by_dur: Dict[int, CurvePoint] = {}
-            for sess in sessions:
-                if source == "auto":
-                    st_times, st_vals, used = _build_canonical_session(sess, gain_eps=gain_eps)
-                    if not st_times:
-                        continue
-                    _register_auto_sources(used)
-                else:
-                    st_times, st_vals, label = _build_timeseries(sess, source=source, gain_eps=gain_eps)
-                    if not st_times:
-                        continue
-                    overall_sources_raw.add(label)
-                if resample_1hz:
-                    st_times, st_vals = _resample_to_1hz(st_times, st_vals)
-                durs = durations
-                if exhaustive:
-                    total = int(st_times[-1])
-                    limit = min(max_duration_s or total, total)
-                    if step_s <= 0:
-                        step_s = 1
-                    durs = list(range(step_s, limit + 1, step_s))
-                sess_curve = compute_curve(st_times, st_vals, durs)
-                for cp in sess_curve:
-                    key = cp.duration_s
-                    if key not in by_dur or cp.max_climb_m > by_dur[key].max_climb_m:
-                        by_dur[key] = cp
-            curve = [by_dur[k] for k in sorted(by_dur.keys())]
+            durs = durations
+            if exhaustive:
+                total = int(times[-1])
+                limit = min(max_duration_s or total, total)
+                step_eval = step_s if step_s > 0 else 1
+                durs = list(range(step_eval, limit + 1, step_eval))
+            curve = compute_curve(times, values, durs)
 
         if not curve:
-            logging.error("No data available to compute curve after merging sessions.")
+            logging.error("Unable to compute curve for requested durations.")
             return 2
 
         if not overall_sources_raw:
