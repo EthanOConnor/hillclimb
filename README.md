@@ -11,26 +11,48 @@ Data sources
 Usage
 -----
 
-Requirements: `fitparse`, `typer` (see `requirements.txt`).
+Requirements: `fitparse`, `typer`, `matplotlib` (see `requirements.txt`).
 
-Examples:
+Recommended environment setup:
 
 ```
-# Single file
-python hc_curve.py curve activity.fit --output curve.csv --durations 60 120 300 600 1200 1800 3600 --source auto
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+All examples below assume either an activated virtualenv or invoking the tooling via `.venv/bin/python`. Plot generation automatically writes Matplotlib cache data to a local `.mplconfig/` directory so you don’t need system-level write access.
+
+Examples (recommended):
+
+```
+# Single file (fixed durations)
+.venv/bin/python hc_curve.py curve activity.fit -o curve.csv -d 60 120 300 600 1200 1800 3600 --split-plots --goal-min-seconds 120 --personal-min-seconds 60
 
 # Multiple files merged (overlaps handled)
-python hc_curve.py curve Tracklogs/Treadmill/file1.fit Tracklogs/Treadmill/file2.fit -o curve.csv -d 60 120 300 600 1200 1800 3600
+.venv/bin/python hc_curve.py curve Tracklogs/Treadmill/file1.fit Tracklogs/Treadmill/file2.fit -o curve.csv -d 60 120 300 600 1200 1800 3600 --split-plots --goal-min-seconds 120 --personal-min-seconds 60
 
 # Diagnostics (summarize fields and candidate gain keys)
-python hc_curve.py diagnose Tracklogs/Treadmill/*.fit --out fit_diagnostics.txt
+.venv/bin/python hc_curve.py diagnose Tracklogs/Treadmill/*.fit --out fit_diagnostics.txt
+
+# Exhaustive curve (every second up to activity length)
+.venv/bin/python hc_curve.py curve activity.fit -o exhaustive_curve.csv --all --resample-1hz --split-plots --goal-min-seconds 120 --personal-min-seconds 60
+
+# Exhaustive up to 2 hours with 5s steps
+.venv/bin/python hc_curve.py curve activity.fit -o exhaustive_curve.csv --exhaustive --max-duration 7200 --step 5 --split-plots --goal-min-seconds 120 --personal-min-seconds 60
 ```
 
 Options:
 - `--output, -o`: Output CSV path (default: `curve.csv`).
 - `--durations, -d`: Durations in seconds (default: 60, 120, 300, 600, 1200, 1800, 3600).
+- `--all`: Exact per-second curve across the whole activity (recommended).
+- `--exhaustive`: Evaluate a grid of durations (use `--step`).
+- `--step`: Step size in seconds for exhaustive durations (default 1s).
+- `--max-duration`: Limit maximum duration (seconds) when using `--exhaustive`.
 - `--source`: `auto` (default), `runn`, or `altitude`.
 - `--verbose, -v`: Verbose logging.
+- Plotting defaults: split plots on; WR overlay off; goal curve hidden below 120s. Use `--plot-wr` to show WR.
+- `--goal-min-seconds`: Hide goal curve/labels below this duration (default 120s).
+- `--personal-min-seconds`: Anchor personal curve scaling at best relative point ≥ this duration (default 60s).
 
 CSV columns
 -----------

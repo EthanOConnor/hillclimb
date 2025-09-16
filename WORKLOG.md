@@ -22,3 +22,14 @@ Repo Setup
 ----------
 - To be initialized as a git repository with initial commit including docs.
 
+Environment Setup
+-----------------
+- Created a local `.venv` virtual environment with `python3 -m venv .venv` and installed requirements; documented the workflow in the README so commands run via `.venv/bin/python`.
+- Added automatic Matplotlib cache configuration to use a repo-local `.mplconfig/` directory, preventing font/cache warnings during plotting.
+- Tweaked rate/climb plot annotations to alternate offsets and moved legends away from the data so overlays stay legible.
+
+Upcoming Stabilization Work
+---------------------------
+- Harden mixed-source stitching by fixing dwell fallback and preserving contributing `file_id` during timestamp coalescing.
+- Connect the CLI `--source` option to the actual computation path so CSV metadata reflects the selected stream.
+- Swap the exhaustive/all-windows sweep to the linear-time concave-envelope implementation for better scaling on long sessions.
