@@ -698,10 +698,10 @@ def _build_canonical_timeseries(
     session: List[Dict[str, Any]],
     gain_eps: float,
     dwell_sec: float = 5.0,
-) -> Tuple[List[float], List[float], Set[str]]:
+) -> Tuple[List[float], List[float], Set[str], List[Tuple[float, float]]]:
     times, tg_cum, inc_cum, alt_cum = _build_per_source_cum(session, gain_eps)
     if not times:
-        return [], [], set()
+        return [], [], set(), []
     rank = {"tg": 3, "incline": 2, "alt_enh": 1, "alt": 0}
     # In our arrays, alt_cum includes both enhanced_altitude/altitude merged already; we won't distinguish here
     # Availability selection
@@ -711,7 +711,14 @@ def _build_canonical_timeseries(
     last = None
     last_switch_t = None
     used_sources: Set[str] = set()
+    gaps: List[Tuple[float, float]] = []
+    last_time = times[0]
     for idx, t in enumerate(times):
+        if idx > 0:
+            delta = t - last_time
+            if delta > dwell_sec:
+                gaps.append((last_time, t))
+            last_time = t
         avail: Dict[str, Optional[float]] = {}
         if tg_cum[idx] is not None:
             avail["tg"] = tg_cum[idx]
@@ -756,7 +763,7 @@ def _build_canonical_timeseries(
             c = last
         canonical.append(c)
         last = c
-    return times, canonical, used_sources
+    return times, canonical, used_sources, gaps
 
 
 def _resample_to_1hz(times: List[float], values: List[float]) -> Tuple[List[float], List[float]]:
@@ -1226,6 +1233,7 @@ def _plot_split(
     ylog_rate: bool = False,
     ylog_climb: bool = False,
     goal_min_seconds: float = 120.0,
+    inactivity_gaps: Optional[List[Tuple[float, float]]] = None,
 ) -> None:
     try:
         import matplotlib
@@ -1467,9 +1475,11 @@ def _run(
         times: List[float]
         values: List[float]
         overall_sources_raw: Set[str] = set()
+        inactivity_gaps: List[Tuple[float, float]] = []
         if source == "auto":
-            times, values, used = _build_canonical_timeseries(merged, gain_eps=gain_eps)
+            times, values, used, gaps = _build_canonical_timeseries(merged, gain_eps=gain_eps)
             overall_sources_raw = {SOURCE_NAME_MAP.get(u, u) for u in used if u}
+            inactivity_gaps = gaps
         else:
             times, values, label = _build_timeseries(merged, source=source, gain_eps=gain_eps)
             overall_sources_raw = {label}
