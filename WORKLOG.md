@@ -34,3 +34,4 @@ Upcoming Stabilization Work
 - Connect the CLI `--source` option to the actual computation path so CSV metadata reflects the selected stream.
 - Swap the exhaustive/all-windows sweep to the linear-time concave-envelope implementation for better scaling on long sessions.
 - Enable cross-session windows by building a global canonical timeseries and using prefix sums so the curve can report multi-day spans across breaks.
+- Introduce a `stats` report CLI that exports detailed tables (curve summary, best windows, timeline overview, gap report, session rollups), derived metrics (peak streaks, consistency scores, inactivity insights, multi-day gains), and supporting visuals (gap-aware curves, heatmaps, calendars) in Markdown/HTML/JSON so the new inactivity data becomes actionable.
