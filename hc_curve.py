@@ -5,6 +5,7 @@ import csv
 import logging
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple, Dict, Any, Set
+import json
 
 try:
     import typer
@@ -72,6 +73,33 @@ SOURCE_DISPLAY_MAP = {
 
 def _normalize_source_label(label: str) -> str:
     return SOURCE_DISPLAY_MAP.get(label, label)
+
+
+QC_DEFAULT_SPEC: Dict[float, float] = {
+    5.0: 8.0,
+    10.0: 12.0,
+    30.0: 25.0,
+    60.0: 40.0,
+    300.0: 150.0,
+    600.0: 250.0,
+    1800.0: 500.0,
+    3600.0: 900.0,
+}
+
+
+def _load_qc_spec(path: str) -> Dict[float, float]:
+    with open(path, "r") as f:
+        data = json.load(f)
+    spec: Dict[float, float] = {}
+    for key, value in data.items():
+        try:
+            window = float(key)
+            limit = float(value)
+        except (TypeError, ValueError):
+            continue
+        if window > 0 and limit > 0:
+            spec[window] = limit
+    return spec
 
 
 # -----------------
@@ -459,6 +487,7 @@ def _build_timeseries(
             G.append(cum)
     if len(times) < 2:
         raise RuntimeError("Insufficient data to compute curve after merging.")
+
     return times, G, selected
 
 
@@ -784,6 +813,53 @@ def _resample_to_1hz(times: List[float], values: List[float]) -> Tuple[List[floa
     return new_times, new_vals
 
 
+def _apply_qc_censor(
+    times: List[float],
+    values: List[float],
+    qc_spec: Dict[float, float],
+) -> Tuple[List[float], int, float]:
+    if not qc_spec:
+        return list(values), 0, 0.0
+    vals = list(values)
+    n = len(vals)
+    segments_removed = 0
+    gain_removed = 0.0
+    eps = 1e-9
+    for window_sec, limit_gain in sorted(qc_spec.items(), key=lambda kv: kv[0]):
+        if window_sec <= 0 or limit_gain <= 0:
+            continue
+        i = 0
+        j = 0
+        while i < n:
+            if j <= i:
+                j = i + 1
+            while j < n and times[j] - times[i] <= window_sec + eps:
+                gain = vals[j] - vals[i]
+                if gain > limit_gain + eps:
+                    base = vals[i]
+                    delta = gain
+                    if delta <= 0:
+                        j += 1
+                        continue
+                    for k in range(i + 1, j + 1):
+                        vals[k] = base
+                    for k in range(j + 1, n):
+                        vals[k] -= delta
+                    segments_removed += 1
+                    gain_removed += delta
+                    continue  # Re-evaluate same j with flattened values
+                j += 1
+            i += 1
+    # Restore monotonicity in case of numerical drift
+    last = vals[0]
+    for idx in range(1, n):
+        if vals[idx] < last:
+            vals[idx] = last
+        else:
+            last = vals[idx]
+    return vals, segments_removed, gain_removed
+
+
 def _build_lcm_envelope(T: List[float], P: List[float]) -> Tuple[List[float], List[float], List[float]]:
     hull: List[int] = []
     for i in range(len(T)):
@@ -1079,6 +1155,7 @@ def _plot_curve(
     goals_topk: int = 3,
     show_wr: bool = True,
     show_personal: bool = True,
+    inactivity_gaps: Optional[List[Tuple[float, float]]] = None,
 ) -> None:
     try:
         import matplotlib
@@ -1455,6 +1532,8 @@ def _run(
     ylog_climb: bool = False,
     goal_min_seconds: float = 120.0,
     personal_min_seconds: float = 60.0,
+    qc_enabled: bool = True,
+    qc_spec_path: Optional[str] = None,
 ) -> int:
     _setup_logging(verbose, log_file=log_file)
 
@@ -1493,6 +1572,24 @@ def _run(
         if not times:
             logging.error("No data available to compute curve after merging inputs.")
             return 2
+
+        qc_limits: Optional[Dict[float, float]] = None
+        if qc_enabled:
+            qc_limits = dict(QC_DEFAULT_SPEC)
+            if qc_spec_path:
+                try:
+                    qc_limits.update(_load_qc_spec(qc_spec_path))
+                except Exception as exc:
+                    logging.warning("Failed to load QC spec %s: %s", qc_spec_path, exc)
+        qc_segments = 0
+        if qc_limits:
+            values, qc_segments, qc_removed = _apply_qc_censor(times, values, qc_limits)
+            if qc_segments:
+                logging.info(
+                    "QC censored %d spike segment(s); removed %.1f m of ascent.",
+                    qc_segments,
+                    qc_removed,
+                )
 
         if resample_1hz:
             times, values = _resample_to_1hz(times, values)
@@ -1631,6 +1728,7 @@ def _run(
                     ylog_rate=ylog_rate,
                     ylog_climb=ylog_climb,
                     goal_min_seconds=goal_min_seconds,
+                    inactivity_gaps=inactivity_gaps,
                 )
                 logging.info("Wrote plots: %s", png_path)
             else:
@@ -1644,6 +1742,7 @@ def _run(
                     goals_topk=goals_topk,
                     show_wr=plot_wr,
                     show_personal=plot_personal,
+                    inactivity_gaps=inactivity_gaps,
                 )
                 logging.info("Wrote plot: %s", png_path)
         except Exception as e:
@@ -1687,6 +1786,8 @@ def _build_typer_app():  # pragma: no cover
         resample_1hz: bool = typer.Option(False, "--resample-1hz", help="Resample cumulative series to 1 Hz"),
         gain_eps: float = typer.Option(0.5, "--gain-eps", help="Altitude hysteresis (m) for ascent from altitude"),
         session_gap_sec: float = typer.Option(600.0, "--session-gap-sec", help="Gap (s) considered inactivity when summarising and reporting; windows span all gaps"),
+        qc: bool = typer.Option(True, "--qc/--no-qc", help="Censor implausible ascent spikes before computing the curve"),
+        qc_spec: Optional[str] = typer.Option(None, "--qc-spec", help="Path to JSON overriding QC windows {window_s: max_gain_m}"),
         all_windows: bool = typer.Option(False, "--all", help="Compute per-second curve via concave envelope sweep (near-linear)"),
         wr_profile: str = typer.Option("overall", "--wr-profile", help="WR envelope profile: overall|stairs|female_overall|female_stairs"),
         wr_anchors: Optional[str] = typer.Option(None, "--wr-anchors", help="Path to JSON defining WR anchors [{w_s,gain_m}]"),
@@ -1736,6 +1837,8 @@ def _build_typer_app():  # pragma: no cover
             ylog_climb=ylog_climb,
             goal_min_seconds=goal_min_seconds,
             personal_min_seconds=personal_min_seconds,
+            qc_enabled=qc,
+            qc_spec_path=qc_spec,
         )
         if code != 0:
             raise typer.Exit(code)
