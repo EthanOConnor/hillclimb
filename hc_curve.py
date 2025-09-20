@@ -468,6 +468,7 @@ def _build_timeseries(
         # Sum positive altitude deltas across merged files
         last_alt: Optional[float] = None
         cum = 0.0
+        pending_gain = 0.0
         last_time: Optional[float] = None
         for r in merged:
             alt = r.get("alt")
@@ -478,13 +479,19 @@ def _build_timeseries(
                 # should not happen due to sorting, but guard
                 continue
             if last_alt is not None:
-                d = alt - last_alt
-                if d > gain_eps:
-                    cum += d
+                delta = alt - last_alt
+                if delta > 0:
+                    pending_gain += delta
+                    if pending_gain >= gain_eps:
+                        cum += pending_gain
+                        pending_gain = 0.0
+                elif delta < 0:
+                    pending_gain = max(0.0, pending_gain + delta)
             last_alt = alt
             last_time = t_rel
             times.append(t_rel)
             G.append(cum)
+
     if len(times) < 2:
         raise RuntimeError("Insufficient data to compute curve after merging.")
 
@@ -639,6 +646,77 @@ def _diagnose_curve_monotonicity(curve: List[CurvePoint], epsilon: float = 1e-9)
         last_end = cp.end_offset_s
 
 
+def _upper_concave_envelope(durations: List[int], climbs: List[float]) -> List[float]:
+    if not climbs:
+        return []
+    if len(climbs) == 1:
+        return list(climbs)
+
+    hull: List[int] = []
+    for idx, (d, c) in enumerate(zip(durations, climbs)):
+        hull.append(idx)
+        while len(hull) >= 3:
+            i1, i2, i3 = hull[-3], hull[-2], hull[-1]
+            x1, x2, x3 = durations[i1], durations[i2], durations[i3]
+            y1, y2, y3 = climbs[i1], climbs[i2], climbs[i3]
+            dx12 = x2 - x1
+            dx23 = x3 - x2
+            if dx12 <= 0 or dx23 <= 0:
+                hull.pop(-2)
+                continue
+            slope12 = (y2 - y1) / dx12
+            slope23 = (y3 - y2) / dx23
+            if slope23 > slope12 + 1e-9:
+                hull.pop(-2)
+            else:
+                break
+
+    adjusted = list(climbs)
+    for a, b in zip(hull, hull[1:]):
+        x1, x2 = durations[a], durations[b]
+        y1, y2 = climbs[a], climbs[b]
+        if x2 == x1:
+            continue
+        slope = (y2 - y1) / (x2 - x1)
+        for j in range(a + 1, b):
+            x = durations[j]
+            adjusted[j] = y1 + slope * (x - x1)
+    return adjusted
+
+
+def _enforce_curve_shape(curve: List[CurvePoint]) -> None:
+    if not curve:
+        return
+    durs = [cp.duration_s for cp in curve]
+    climbs = [cp.max_climb_m for cp in curve]
+
+    # Ensure cumulative gain is non-decreasing with duration
+    best = 0.0
+    for idx, val in enumerate(climbs):
+        if val < best:
+            climbs[idx] = best
+        else:
+            best = val
+
+    # Enforce concavity so that climb rate is non-increasing
+    concave = _upper_concave_envelope(durs, climbs)
+
+    # Final pass to apply values and recompute rates monotonically
+    best_climb = 0.0
+    best_rate = float("inf")
+    for cp, gain in zip(curve, concave):
+        gain = max(gain, best_climb)
+        rate = (gain / cp.duration_s * 3600.0) if cp.duration_s > 0 else 0.0
+        if rate > best_rate:
+            rate = best_rate
+            gain = rate / 3600.0 * cp.duration_s
+        else:
+            best_rate = rate
+        cp.max_climb_m = gain
+        cp.climb_rate_m_per_hr = rate
+        if gain > best_climb:
+            best_climb = gain
+
 # -----------------
 # Canonical timeline and all-windows sweep
 # -----------------
@@ -660,6 +738,7 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
     # Alt cumulative with hysteresis
     alt_cum: List[Optional[float]] = []
     cum_alt = 0.0
+    pending_alt = 0.0
     last_alt: Optional[float] = None
     last_time: Optional[float] = None
 
@@ -680,7 +759,8 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
 
         # Incline
         dist = r.get("dist")
-        inc = r.get("inc") if r.get("inc") is not None else last_inc
+        raw_inc = r.get("inc")
+        inc = raw_inc if raw_inc is not None else last_inc
         if dist is not None and last_dist is not None and inc is not None:
             dd = dist - last_dist
             if dd < 0:
@@ -689,16 +769,23 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
                 cum_inc += dd * (inc / 100.0)
         if dist is not None:
             last_dist = dist
-        last_inc = inc
-        inc_cum.append(cum_inc if last_dist is not None else None)
+        if raw_inc is not None:
+            last_inc = raw_inc
+        inc_available = last_inc is not None and last_dist is not None
+        inc_cum.append(cum_inc if inc_available else None)
 
         # Altitude
         alt = r.get("alt")
         if alt is not None:
             if last_alt is not None:
-                d = alt - last_alt
-                if d > gain_eps:
-                    cum_alt += d
+                delta = alt - last_alt
+                if delta > 0:
+                    pending_alt += delta
+                    if pending_alt >= gain_eps:
+                        cum_alt += pending_alt
+                        pending_alt = 0.0
+                elif delta < 0:
+                    pending_alt = max(0.0, pending_alt + delta)
             last_alt = alt
             alt_cum.append(cum_alt)
         else:
@@ -858,77 +945,77 @@ def _apply_qc_censor(
         else:
             last = vals[idx]
     return vals, segments_removed, gain_removed
-
-
-def _build_lcm_envelope(T: List[float], P: List[float]) -> Tuple[List[float], List[float], List[float]]:
-    hull: List[int] = []
-    for i in range(len(T)):
-        hull.append(i)
-        while len(hull) >= 3:
-            i1, i2, i3 = hull[-3], hull[-2], hull[-1]
-            s12 = (P[i2]-P[i1]) / max(T[i2]-T[i1], 1e-12)
-            s23 = (P[i3]-P[i2]) / max(T[i3]-T[i2], 1e-12)
-            if s12 < s23:
-                hull.pop(-2)
-            else:
-                break
-    ex = [T[i] for i in hull]
-    ey = [P[i] for i in hull]
-    s: List[float] = []
-    for k in range(len(ex)-1):
-        s.append((ey[k+1]-ey[k]) / max(ex[k+1]-ex[k], 1e-12))
-    return ex, ey, s
-
-
-def _U_eval(ex: List[float], ey: List[float], s: List[float], t: float) -> float:
-    import bisect
-    j = bisect.bisect_left(ex, t)
-    if j <= 0:
-        return ey[0]
-    if j >= len(ex):
-        return ey[-1]
-    k = j - 1
-    return ey[k] + s[k] * (t - ex[k])
-
-
 def all_windows_curve(T: List[float], P: List[float], step: int = 1) -> List[CurvePoint]:
     if not T or len(T) < 2:
         return []
-    ex, ey, s = _build_lcm_envelope(T, P)
-    t0 = T[0]
-    t1 = T[-1]
-    Wmax = int((t1 - t0) // step)
-    # Initialize x at domain start
-    x = t0
-    import bisect
-    i = max(bisect.bisect_left(ex, x) - 1, 0)
+    if step <= 0:
+        step = 1
+
+    base_dt = T[1] - T[0]
+    # Verify uniform spacing (required for the sweep implementation)
+    for idx in range(2, len(T)):
+        if abs((T[idx] - T[0]) - idx * base_dt) > 1e-6:
+            raise RuntimeError("all_windows_curve requires uniform sampling; enable --resample-1hz")
+
+    try:
+        import numpy as np
+    except Exception:
+        np = None
+
+    max_duration = int(round(T[-1]))
+    if max_duration < step:
+        return []
+
     results: List[CurvePoint] = []
-    for w_idx in range(1, Wmax + 1):
-        w = w_idx * step
-        end = x + w
-        j = max(min(bisect.bisect_left(ex, end) - 1, len(s)-1), 0)
-        while True:
-            deriv = s[j] - s[i]
-            if deriv <= 1e-15:
+    if np is not None:
+        times = np.asarray(T, dtype=float)
+        gains = np.asarray(P, dtype=float)
+        for duration in range(step, max_duration + 1, step):
+            stride = int(round(duration / base_dt))
+            if stride <= 0 or stride >= gains.size:
                 break
-            next_start = ex[i+1] if i+1 < len(ex) else float('inf')
-            next_end = ex[j+1] if j+1 < len(ex) else float('inf')
-            dx1 = next_start - x
-            dx2 = next_end - (x + w)
-            dx = dx1 if dx1 <= dx2 else dx2
-            if dx <= 1e-12:
-                dx = 1e-12
-            x += dx
-            if i+1 < len(s) and abs(x - next_start) <= 1e-12:
-                i += 1
-            if j+1 < len(s) and abs(x + w - next_end) <= 1e-12:
-                j += 1
-            if j >= len(s):
-                j = len(s) - 1
+            deltas = gains[stride:] - gains[:-stride]
+            idx = int(np.argmax(deltas))
+            gain = float(deltas[idx])
+            start_t = float(times[idx])
+            end_t = float(times[idx + stride])
+            dur_sec = end_t - start_t
+            rate = gain / dur_sec * 3600.0 if dur_sec > 0 else 0.0
+            results.append(
+                CurvePoint(
+                    duration_s=int(round(dur_sec)),
+                    max_climb_m=gain,
+                    climb_rate_m_per_hr=rate,
+                    start_offset_s=start_t,
+                    end_offset_s=end_t,
+                )
+            )
+    else:
+        n = len(P)
+        for duration in range(step, max_duration + 1, step):
+            stride = int(round(duration / base_dt))
+            if stride <= 0 or stride >= n:
                 break
-        g = _U_eval(ex, ey, s, x + w) - _U_eval(ex, ey, s, x)
-        rate = g / w * 3600.0
-        results.append(CurvePoint(duration_s=int(w), max_climb_m=g, climb_rate_m_per_hr=rate, start_offset_s=x - t0, end_offset_s=x - t0 + w))
+            best_gain = -1.0
+            best_idx = 0
+            for idx in range(n - stride):
+                gain = P[idx + stride] - P[idx]
+                if gain > best_gain:
+                    best_gain = gain
+                    best_idx = idx
+            start_t = T[best_idx]
+            end_t = T[best_idx + stride]
+            dur_sec = end_t - start_t
+            rate = best_gain / dur_sec * 3600.0 if dur_sec > 0 else 0.0
+            results.append(
+                CurvePoint(
+                    duration_s=int(round(dur_sec)),
+                    max_climb_m=best_gain if best_gain > 0 else 0.0,
+                    climb_rate_m_per_hr=rate if best_gain > 0 else 0.0,
+                    start_offset_s=start_t,
+                    end_offset_s=end_t,
+                )
+            )
     return results
 
 
@@ -1167,6 +1254,12 @@ def _plot_curve(
     durs = [cp.duration_s for cp in curve]
     rates = [cp.climb_rate_m_per_hr for cp in curve]
     climbs = [cp.max_climb_m for cp in curve]
+    base_durations = sorted({cp.duration_s for cp in curve})
+    def _near_base_duration(w: int) -> bool:
+        for b in base_durations:
+            if abs(w - b) <= max(30, 0.05 * max(b, 1)):
+                return True
+        return False
     dense = len(curve) > 100
 
     plt.style.use("ggplot")
@@ -1263,6 +1356,8 @@ def _plot_curve(
             pct = row.get('score_pct')
             if isinstance(pct, (int, float)):
                 offset_y = -14 if label_toggle > 0 else -28
+                if not dense and _near_base_duration(w):
+                    offset_y -= 12
                 ax2.annotate(
                     f"{usr:.0f} m • {pct:.0f}%",
                     (w, usr),
@@ -1278,11 +1373,14 @@ def _plot_curve(
                 wrv2 = row.get('wr_gain_m')
                 gpct = (goal / wrv2 * 100.0) if isinstance(wrv2, (int, float)) and wrv2 > 0 else None
                 label = f"goal {goal:.0f} m" + (f" • {gpct:.0f}%" if gpct is not None else "")
+                goal_offset = 10
+                if not dense and _near_base_duration(w):
+                    goal_offset += 6
                 ax2.annotate(
                     label,
                     (w, goal),
                     textcoords="offset points",
-                    xytext=(-6, 10),
+                    xytext=(-6, goal_offset),
                     ha="right",
                     fontsize=8,
                     color=GOAL_COLOR,
@@ -1323,6 +1421,12 @@ def _plot_split(
     durs = [cp.duration_s for cp in curve]
     rates = [cp.climb_rate_m_per_hr for cp in curve]
     climbs = [cp.max_climb_m for cp in curve]
+    base_durations = sorted({cp.duration_s for cp in curve})
+    def _near_base_duration(w: int) -> bool:
+        for b in base_durations:
+            if abs(w - b) <= max(30, 0.05 * max(b, 1)):
+                return True
+        return False
     dense = len(curve) > 100
 
     import numpy as np
@@ -1333,6 +1437,20 @@ def _plot_split(
     fig1, ax1 = plt.subplots(figsize=(12, 7))
 
     ax1.plot(durs, rates, marker="" if dense else "o", linewidth=1.8, color=USER_COLOR, label="Climb rate (m/h)")
+    if not dense:
+        label_toggle = 1
+        for cp in curve:
+            offset_y = -12 if label_toggle > 0 else -26
+            ax1.annotate(
+                f"{cp.climb_rate_m_per_hr:.0f} m/h",
+                (cp.duration_s, cp.climb_rate_m_per_hr),
+                textcoords="offset points",
+                xytext=(0, offset_y),
+                ha="center",
+                fontsize=8,
+                color=USER_COLOR,
+            )
+            label_toggle *= -1
     if show_wr and wr_curve is not None:
         wr_durs, wr_vals = wr_curve
         wr_rates = [v / w * 3600.0 if w > 0 else 0.0 for w, v in zip(wr_durs, wr_vals)]
@@ -1377,6 +1495,8 @@ def _plot_split(
             if isinstance(pct, (int, float)) and w in weak_ws:
                 text += f" • {pct:.0f}%"
             offset_y = -12 if label_toggle > 0 else -26
+            if not dense and _near_base_duration(w):
+                offset_y -= 12
             ax1.annotate(
                 text,
                 (w, u_rate),
@@ -1390,11 +1510,14 @@ def _plot_split(
             wrv = row.get('wr_gain_m')
             if w in weak_ws and w >= goal_min_seconds and isinstance(wrv, (int, float)) and wrv > 0:
                 gpct = goal / wrv * 100.0
+                goal_offset = 12
+                if not dense and _near_base_duration(w):
+                    goal_offset += 8
                 ax1.annotate(
                     f"goal {g_rate:.0f} • {gpct:.0f}%",
                     (w, g_rate),
                     textcoords="offset points",
-                    xytext=(0, 12),
+                    xytext=(0, goal_offset),
                     ha="center",
                     fontsize=8,
                     color=GOAL_COLOR,
@@ -1456,6 +1579,8 @@ def _plot_split(
             pct = row.get('score_pct')
             if isinstance(pct, (int, float)):
                 offset_y = -14 if label_toggle > 0 else -28
+                if not dense and _near_base_duration(w):
+                    offset_y -= 12
                 axc.annotate(
                     f"{usr:.0f} m • {pct:.0f}%",
                     (w, usr),
@@ -1471,11 +1596,14 @@ def _plot_split(
                 wrv2 = row.get('wr_gain_m')
                 gpct = (goal / wrv2 * 100.0) if isinstance(wrv2, (int, float)) and wrv2 > 0 else None
                 label = f"goal {goal:.0f} m" + (f" • {gpct:.0f}%" if gpct is not None else "")
+                goal_offset = 10
+                if not dense and _near_base_duration(w):
+                    goal_offset += 6
                 axc.annotate(
                     label,
                     (w, goal),
                     textcoords="offset points",
-                    xytext=(-6, 10),
+                    xytext=(-6, goal_offset),
                     ha="right",
                     fontsize=8,
                     color=GOAL_COLOR,
@@ -1596,6 +1724,8 @@ def _run(
 
         if all_windows:
             step_for_all = step_s if step_s > 0 else 1
+            if not resample_1hz:
+                times, values = _resample_to_1hz(times, values)
             curve = all_windows_curve(times, values, step=step_for_all)
         else:
             durs = durations
@@ -1621,15 +1751,8 @@ def _run(
         logging.error(str(e))
         return 2
 
-    # Ensure non-decreasing climb with increasing duration (monotonic fix)
-    best_climb = 0.0
-    for cp in curve:
-        if cp.max_climb_m < best_climb:
-            cp.max_climb_m = best_climb
-        else:
-            best_climb = cp.max_climb_m
-        # Recompute rate from climb to avoid any stale/clamped values
-        cp.climb_rate_m_per_hr = (cp.max_climb_m / cp.duration_s * 3600.0) if cp.duration_s > 0 else 0.0
+    # Enforce monotonic climb and non-increasing rate behaviour
+    _enforce_curve_shape(curve)
 
     # Diagnose monotonicity issues (should be non-decreasing max climb with duration)
     _diagnose_curve_monotonicity(curve, epsilon=1e-6)

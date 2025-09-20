@@ -36,3 +36,4 @@ Upcoming Stabilization Work
 - Enable cross-session windows by building a global canonical timeseries and using prefix sums so the curve can report multi-day spans across breaks.
 - Introduce a `stats` report CLI that exports detailed tables (curve summary, best windows, timeline overview, gap report, session rollups), derived metrics (peak streaks, consistency scores, inactivity insights, multi-day gains), and supporting visuals (gap-aware curves, heatmaps, calendars) in Markdown/HTML/JSON so the new inactivity data becomes actionable.
 - Add a QC layer that scans from short to long durations (e.g., 5s/10s/30s/1m/5m/etc.), flags ascent bursts exceeding realistic thresholds, and censors the affected cumulative gain segments by flattening them before the curve computation.
+- Resolve remaining plot label overlap at shared durations (e.g., 30 min) by improving the de-duplication/offset strategy for base-point and magic annotations in dense and non-dense modes.
