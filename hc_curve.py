@@ -164,6 +164,14 @@ def _setup_logging(verbose: bool, log_file: Optional[str] = None) -> None:
         fh.setLevel(level)
         fh.setFormatter(logging.Formatter(fmt, datefmt))
         logging.getLogger().addHandler(fh)
+    # Suppress very chatty third-party DEBUG logs (e.g., matplotlib findfont)
+    try:
+        logging.getLogger("matplotlib").setLevel(logging.WARNING)
+        logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
+        logging.getLogger("PIL").setLevel(logging.INFO)
+        logging.getLogger("fontTools").setLevel(logging.INFO)
+    except Exception:
+        pass
 
 
 def _require_dependency(dep, name: str, install_hint: Optional[str] = None) -> None:
