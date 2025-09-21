@@ -598,31 +598,52 @@ def _build_timeseries(
             times.append(t_rel)
             G.append(cum)
     else:
-        # Sum positive altitude deltas across merged files
-        last_alt: Optional[float] = None
-        cum = 0.0
-        pending_gain = 0.0
-        last_time: Optional[float] = None
+        # Physically-motivated processing on altitude
+        alt_raw_t: List[float] = []
+        alt_raw_v: List[float] = []
         for r in merged:
             alt = r.get("alt")
             if alt is None:
                 continue
             t_rel = r["t"] - t0
-            if last_time is not None and t_rel < last_time:
-                # should not happen due to sorting, but guard
-                continue
-            if last_alt is not None:
-                delta = alt - last_alt
-                if delta > 0:
-                    pending_gain += delta
-                    if pending_gain >= gain_eps:
-                        cum += pending_gain
-                        pending_gain = 0.0
-                elif delta < 0:
-                    pending_gain = max(0.0, pending_gain + delta)
-            last_alt = alt
-            last_time = t_rel
-            times.append(t_rel)
+            alt_raw_t.append(t_rel)
+            alt_raw_v.append(float(alt))
+        if len(alt_raw_t) < 2:
+            raise RuntimeError("Insufficient altitude data to compute curve after merging.")
+        t_alt = np.asarray(alt_raw_t, dtype=np.float64)
+        z_alt = np.asarray(alt_raw_v, dtype=np.float64)
+        # Estimate median speed and grade from merged
+        d_all = [r.get("dist") for r in merged]
+        t_all = [r.get("t") - t0 for r in merged]
+        speed_med = 0.0
+        if any(d is not None for d in d_all):
+            d_arr = np.asarray([float(d) if d is not None else np.nan for d in d_all], dtype=np.float64)
+            dt_all = np.diff(np.asarray(t_all, dtype=np.float64))
+            dd_all = np.diff(d_arr)
+            m = (~np.isnan(dd_all)) & (dt_all > 1e-6)
+            if np.any(m):
+                v = dd_all[m] / dt_all[m]
+                if v.size:
+                    speed_med = float(np.median(np.clip(v, 0.0, np.inf)))
+        inc_all = [r.get("inc") for r in merged]
+        grade_med = 0.0
+        if any(i is not None for i in inc_all):
+            inc_arr = np.asarray([float(x) if x is not None else np.nan for x in inc_all], dtype=np.float64)
+            val = inc_arr[~np.isnan(inc_arr)]
+            if val.size:
+                grade_med = float(np.median(np.clip(val / 100.0, -1.0, 1.0)))
+        alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med)
+        # Cumulative ascent
+        eps_gain = 0.1
+        cum = 0.0
+        last_z = float(alt_eff[0])
+        for i in range(t_alt.size):
+            if i > 0:
+                dv = float(alt_eff[i]) - last_z
+                if dv > 0:
+                    cum += max(0.0, dv - eps_gain)
+                last_z = float(alt_eff[i])
+            times.append(float(t_alt[i]))
             G.append(cum)
 
     if len(times) < 2:
@@ -775,6 +796,140 @@ def _split_sessions_from_gaps(
     _append_session(n)
     return sessions
 
+
+def _hampel_mask_dh(dh: np.ndarray, window: int = 7, n_sigmas: float = 3.0) -> np.ndarray:
+    n = dh.size
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    w = max(1, int(window))
+    out = np.zeros(n, dtype=bool)
+    for i in range(n):
+        lo = max(0, i - w)
+        hi = min(n, i + w + 1)
+        seg = dh[lo:hi]
+        med = np.median(seg)
+        mad = np.median(np.abs(seg - med))
+        sigma = 1.4826 * mad if mad > 0 else 0.0
+        if sigma > 0 and abs(dh[i] - med) > n_sigmas * sigma:
+            out[i] = True
+    return out
+
+
+def _local_poly_smooth(t: np.ndarray, y: np.ndarray, min_span_s: float = 0.4, max_points: int = 9, poly: int = 2) -> np.ndarray:
+    n = y.size
+    if n == 0:
+        return y
+    max_points = max(3, int(max_points) | 1)  # make odd
+    out = np.empty_like(y)
+    for i in range(n):
+        # Expand window to cover at least min_span_s
+        lo = i
+        hi = i
+        while True:
+            span = (t[hi] - t[lo]) if hi > lo else 0.0
+            count = hi - lo + 1
+            if span >= min_span_s or count >= max_points or (lo == 0 and hi == n - 1):
+                break
+            if lo > 0:
+                lo -= 1
+                count += 1
+            if count < max_points and hi < n - 1:
+                hi += 1
+        idx = slice(lo, hi + 1)
+        tt = t[idx] - t[i]
+        yy = y[idx]
+        # Build Vandermonde for degree poly
+        X = np.vstack([tt ** k for k in range(poly + 1)]).T
+        # Solve normal equations
+        try:
+            coef, *_ = np.linalg.lstsq(X, yy, rcond=None)
+            out[i] = coef[0]
+        except Exception:
+            out[i] = y[i]
+    return out
+
+
+from collections import deque
+
+
+def _sliding_extrema_sym(t: np.ndarray, y: np.ndarray, half_window_s: float, mode: str) -> np.ndarray:
+    n = y.size
+    if n == 0:
+        return y
+    res = np.empty_like(y)
+    dq: deque[int] = deque()
+    right = 0
+    for i in range(n):
+        left_bound = t[i] - half_window_s
+        right_bound = t[i] + half_window_s
+        while right < n and t[right] <= right_bound:
+            # Push right maintaining monotonic deque
+            while dq:
+                if mode == 'max' and y[right] >= y[dq[-1]]:
+                    dq.pop()
+                elif mode == 'min' and y[right] <= y[dq[-1]]:
+                    dq.pop()
+                else:
+                    break
+            dq.append(right)
+            right += 1
+        # Pop left indices out of window
+        while dq and t[dq[0]] < left_bound:
+            dq.popleft()
+        if dq:
+            res[i] = y[dq[0]]
+        else:
+            res[i] = y[i]
+    return res
+
+
+def _morphological_closing_time(t: np.ndarray, y: np.ndarray, T: float) -> np.ndarray:
+    hw = max(0.0, float(T) * 0.5)
+    if hw <= 0:
+        return y.copy()
+    dil = _sliding_extrema_sym(t, y, hw, mode='max')
+    clo = _sliding_extrema_sym(t, dil, hw, mode='min')
+    return clo
+
+
+def _effective_altitude_path(
+    t: np.ndarray,
+    z: np.ndarray,
+    speed_med: float = 1.5,
+    grade_med: float = 0.0,
+) -> np.ndarray:
+    if z.size <= 2:
+        return z.copy()
+    # Outlier rejection on vertical speed and Hampel on dh
+    dt = np.diff(t)
+    dz = np.diff(z)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        v = dz / np.where(dt > 1e-9, dt, 1e-9)
+    spike = np.abs(v) > 2.0
+    hamp = _hampel_mask_dh(dz, window=5, n_sigmas=3.0)
+    mask_bad = spike | hamp
+    z1 = z.copy()
+    if np.any(mask_bad):
+        bad_idx = np.where(mask_bad)[0] + 1  # affect the next sample
+        bad = np.zeros(z1.size, dtype=bool)
+        bad[np.clip(bad_idx, 0, z1.size - 1)] = True
+        # Linear interpolation over bad points
+        good = ~bad
+        if np.count_nonzero(good) >= 2:
+            z1[bad] = np.interp(t[bad], t[good], z1[good])
+    # Quantization repair via local quadratic smoothing (tiny bandwidth)
+    z2 = _local_poly_smooth(t, z1, min_span_s=0.4, max_points=7, poly=2)
+    # Time-scale selection
+    sp = max(0.5, float(speed_med))
+    T = 4.0 * (1.5 / sp) ** 0.5
+    T = float(max(3.0, min(8.0, T)))
+    if grade_med > 0.20:
+        T = max(3.0, 0.8 * T)
+    # Morphological closing to remove micro-descents
+    zc = _morphological_closing_time(t, z2, T)
+    # Weak post-smoothing to remove quantization
+    z3 = _local_poly_smooth(t, zc, min_span_s=0.8, max_points=9, poly=2)
+    return z3
 
 def _prepare_envelope_arrays(
     times: List[float],
@@ -1532,11 +1687,11 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
     cum_inc = 0.0
     last_dist: Optional[float] = None
     last_inc: Optional[float] = None
-    # Alt cumulative with hysteresis
+    # Alt cumulative (physically-motivated)
     alt_cum: List[Optional[float]] = []
-    cum_alt = 0.0
-    pending_alt = 0.0
-    last_alt: Optional[float] = None
+    alt_raw_t: List[float] = []
+    alt_raw_v: List[float] = []
+    alt_raw_idx: List[int] = []
     last_time: Optional[float] = None
 
     for r in session:
@@ -1571,20 +1726,13 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
         inc_available = last_inc is not None and last_dist is not None
         inc_cum.append(cum_inc if inc_available else None)
 
-        # Altitude
+        # Altitude (defer processing)
         alt = r.get("alt")
         if alt is not None:
-            if last_alt is not None:
-                delta = alt - last_alt
-                if delta > 0:
-                    pending_alt += delta
-                    if pending_alt >= gain_eps:
-                        cum_alt += pending_alt
-                        pending_alt = 0.0
-                elif delta < 0:
-                    pending_alt = max(0.0, pending_alt + delta)
-            last_alt = alt
-            alt_cum.append(cum_alt)
+            alt_raw_t.append(t_rel)
+            alt_raw_v.append(float(alt))
+            alt_raw_idx.append(len(times) - 1)
+            alt_cum.append(0.0)  # placeholder
         else:
             alt_cum.append(None)
 
@@ -1603,6 +1751,46 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
                 lastv = v
     enforce_monotone(tg_cum)
     enforce_monotone(inc_cum)
+
+    # Compute effective altitude path and convert to cumulative ascent per spec
+    if alt_raw_t:
+        t_alt = np.asarray(alt_raw_t, dtype=np.float64)
+        z_alt = np.asarray(alt_raw_v, dtype=np.float64)
+        # Estimate median speed (m/s) and grade if available from session
+        d_all = [r.get("dist") for r in session]
+        t_all = [times[i] for i in range(len(session))]
+        speed_med = 0.0
+        if any(d is not None for d in d_all):
+            d_arr = np.asarray([float(d) if d is not None else np.nan for d in d_all], dtype=np.float64)
+            dt_all = np.diff(np.asarray(t_all, dtype=np.float64))
+            dd_all = np.diff(d_arr)
+            m = (~np.isnan(dd_all)) & (dt_all > 1e-6)
+            if np.any(m):
+                v = dd_all[m] / dt_all[m]
+                if v.size:
+                    speed_med = float(np.median(np.clip(v, 0.0, np.inf)))
+        inc_all = [r.get("inc") for r in session]
+        grade_med = 0.0
+        if any(i is not None for i in inc_all):
+            inc_arr = np.asarray([float(x) if x is not None else np.nan for x in inc_all], dtype=np.float64)
+            val = inc_arr[~np.isnan(inc_arr)]
+            if val.size:
+                grade_med = float(np.median(np.clip(val / 100.0, -1.0, 1.0)))
+
+        alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med)
+        eps_gain = 0.1
+        cum = 0.0
+        last_z = float(alt_eff[0]) if alt_eff.size else 0.0
+        cum_series: List[float] = []
+        for val in alt_eff:
+            dv = float(val) - last_z
+            if dv > 0:
+                cum += max(0.0, dv - eps_gain)
+            last_z = float(val)
+            cum_series.append(cum)
+        for j, idx in enumerate(alt_raw_idx):
+            alt_cum[idx] = cum_series[j]
+    # Ensure monotone in-place
     enforce_monotone(alt_cum)
     return times, tg_cum, inc_cum, alt_cum
 
