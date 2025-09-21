@@ -642,38 +642,28 @@ def _build_timeseries(
                 grade_med = float(np.median(np.clip(val / 100.0, -1.0, 1.0)))
         diag: Dict[str, Any] = {}
         alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med, diag)
-        # Cumulative ascent
-        eps_gain = 0.1
-        cum = 0.0
-        last_z = float(alt_eff[0])
+        # Cumulative ascent (uprun epsilon)
+        eps_gain = 0.05
+        cum_series = _cum_ascent_from_alt(alt_eff, eps_gain, mode="uprun", diag=diag)
         for i in range(t_alt.size):
-            if i > 0:
-                dv = float(alt_eff[i]) - last_z
-                if dv > 0:
-                    cum += max(0.0, dv - eps_gain)
-                last_z = float(alt_eff[i])
             times.append(float(t_alt[i]))
-            G.append(cum)
+            G.append(float(cum_series[i]))
         # Diagnostics
         try:
-            dz3 = np.diff(alt_eff)
-            gross_noeps = float(np.sum(np.maximum(0.0, dz3))) if dz3.size else 0.0
-            gross_eps = float(np.sum(np.maximum(0.0, dz3 - eps_gain))) if dz3.size else 0.0
-            eps_loss = max(0.0, gross_noeps - gross_eps)
-            diag["gross_eps_m"] = gross_eps
-            diag["eps_loss_m"] = eps_loss
-            diag["eps_loss_pct"] = (eps_loss / gross_noeps) if gross_noeps > 1e-9 else 0.0
             logging.debug(
                 "Altitude ascent diagnostics: n=%d net=%.1fm peak(start->max)=%.1fm range=%.1fm gross_noeps=%.1fm gross_eps=%.1fm eps_loss=%.1fm(%.0f%%) "
-                "neg_pre=%.1fm neg_post=%.1fm spikes=%d hampel=%d T=%.2fs speed_med=%.2f m/s grade_med=%.2f%%",
+                "up_runs=%d pos_steps=%d eps_mode=%s neg_pre=%.1fm neg_post=%.1fm spikes=%d hampel=%d T=%.2fs speed_med=%.2f m/s grade_med=%.2f%%",
                 diag.get("n_alt", 0),
                 diag.get("net_gain_m", float('nan')),
                 diag.get("peak_gain_from_start_m", float('nan')),
                 diag.get("range_max_min_m", float('nan')),
                 diag.get("gross_noeps_m", float('nan')),
-                gross_eps,
-                eps_loss,
+                diag.get("gross_eps_m", float('nan')),
+                diag.get("eps_loss_m", float('nan')),
                 100.0 * diag.get("eps_loss_pct", 0.0),
+                diag.get("up_runs", 0),
+                diag.get("pos_steps", 0),
+                str(diag.get("eps_mode", "uprun")),
                 diag.get("neg_sum_pre_close_m", float('nan')),
                 diag.get("neg_sum_post_m", float('nan')),
                 diag.get("spike_count", 0),
@@ -1020,6 +1010,63 @@ def _effective_altitude_path(
         except Exception:
             pass
     return z3
+
+
+def _cum_ascent_from_alt(
+    alt: np.ndarray,
+    eps_gain: float = 0.05,
+    mode: str = "uprun",
+    diag: Optional[Dict[str, Any]] = None,
+) -> List[float]:
+    """Compute cumulative gross ascent from an effective altitude trace.
+
+    - mode='uprun': apply epsilon once per contiguous positive run (recommended).
+    - mode='sample': apply epsilon to each positive increment (legacy).
+    - mode='none': no epsilon.
+    """
+    n = alt.size
+    if n == 0:
+        return []
+    eps = max(0.0, float(eps_gain))
+    cum = 0.0
+    series: List[float] = [0.0]
+    up_runs = 0
+    pos_steps = 0
+    run_gain = 0.0
+    for i in range(1, n):
+        dv = float(alt[i] - alt[i - 1])
+        if dv > 0:
+            pos_steps += 1
+            if mode == "sample":
+                cum += max(0.0, dv - eps)
+            else:
+                run_gain += dv
+        else:
+            if mode == "uprun" and run_gain > 0.0:
+                up_runs += 1
+                cum += max(0.0, run_gain - eps)
+                run_gain = 0.0
+        series.append(cum)
+    if mode == "uprun" and run_gain > 0.0:
+        up_runs += 1
+        cum += max(0.0, run_gain - eps)
+        series[-1] = cum
+
+    if diag is not None:
+        try:
+            dz = np.diff(alt)
+            gross_noeps = float(np.sum(np.maximum(0.0, dz))) if dz.size else 0.0
+            gross_eps = float(series[-1]) if series else 0.0
+            eps_loss = max(0.0, gross_noeps - gross_eps)
+            diag["eps_mode"] = mode
+            diag["up_runs"] = up_runs
+            diag["pos_steps"] = pos_steps
+            diag["gross_eps_m"] = gross_eps
+            diag["eps_loss_m"] = eps_loss
+            diag["eps_loss_pct"] = (eps_loss / gross_noeps) if gross_noeps > 1e-9 else 0.0
+        except Exception:
+            pass
+    return series
 
 def _prepare_envelope_arrays(
     times: List[float],
@@ -1869,36 +1916,24 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
 
         diag: Dict[str, Any] = {}
         alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med, diag)
-        eps_gain = 0.1
-        cum = 0.0
-        last_z = float(alt_eff[0]) if alt_eff.size else 0.0
-        cum_series: List[float] = []
-        for val in alt_eff:
-            dv = float(val) - last_z
-            if dv > 0:
-                cum += max(0.0, dv - eps_gain)
-            last_z = float(val)
-            cum_series.append(cum)
+        eps_gain = 0.05
+        cum_series = _cum_ascent_from_alt(alt_eff, eps_gain, mode="uprun", diag=diag)
         # Log diagnostics at DEBUG level
         try:
-            dz3 = np.diff(alt_eff)
-            gross_noeps = float(np.sum(np.maximum(0.0, dz3))) if dz3.size else 0.0
-            gross_eps = float(np.sum(np.maximum(0.0, dz3 - eps_gain))) if dz3.size else 0.0
-            eps_loss = max(0.0, gross_noeps - gross_eps)
-            diag["gross_eps_m"] = gross_eps
-            diag["eps_loss_m"] = eps_loss
-            diag["eps_loss_pct"] = (eps_loss / gross_noeps) if gross_noeps > 1e-9 else 0.0
             logging.debug(
                 "Altitude ascent diagnostics: n=%d net=%.1fm peak(start->max)=%.1fm range=%.1fm gross_noeps=%.1fm gross_eps=%.1fm eps_loss=%.1fm(%.0f%%) "
-                "neg_pre=%.1fm neg_post=%.1fm spikes=%d hampel=%d T=%.2fs speed_med=%.2f m/s grade_med=%.2f%%",
+                "up_runs=%d pos_steps=%d eps_mode=%s neg_pre=%.1fm neg_post=%.1fm spikes=%d hampel=%d T=%.2fs speed_med=%.2f m/s grade_med=%.2f%%",
                 diag.get("n_alt", 0),
                 diag.get("net_gain_m", float('nan')),
                 diag.get("peak_gain_from_start_m", float('nan')),
                 diag.get("range_max_min_m", float('nan')),
                 diag.get("gross_noeps_m", float('nan')),
-                gross_eps,
-                eps_loss,
+                diag.get("gross_eps_m", float('nan')),
+                diag.get("eps_loss_m", float('nan')),
                 100.0 * diag.get("eps_loss_pct", 0.0),
+                diag.get("up_runs", 0),
+                diag.get("pos_steps", 0),
+                str(diag.get("eps_mode", "uprun")),
                 diag.get("neg_sum_pre_close_m", float('nan')),
                 diag.get("neg_sum_post_m", float('nan')),
                 diag.get("spike_count", 0),
