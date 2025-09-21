@@ -5,6 +5,8 @@ import csv
 import logging
 import math
 import copy
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple, Dict, Any, Set, NamedTuple, Union, Literal
 import json
@@ -63,6 +65,19 @@ class CurvePoint:
     climb_rate_m_per_hr: float
     start_offset_s: float
     end_offset_s: float
+
+
+class _StageProfiler:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self._last = time.perf_counter()
+
+    def lap(self, label: str) -> None:
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        logging.info("Profile %-18s %.3fs", label, now - self._last)
+        self._last = now
 
 
 SOURCE_NAME_MAP = {
@@ -165,19 +180,15 @@ def _parse_single_fit_records(fit_path: str, file_id: int) -> List[Dict[str, Any
     _require_dependency(FitFile, "fitparse", "pip install fitparse")
     fit = FitFile(fit_path)
     fit.parse()
-    records = list(fit.get_messages("record"))
     out: List[Dict[str, Any]] = []
     # Detect a preferred total gain key for this file
     total_gain_key: Optional[str] = None
-    for msg in records[:100]:
+    for idx, msg in enumerate(fit.get_messages("record")):
         vals = msg.get_values()
-        k = _pick_total_gain_key(vals)
-        if k is not None:
-            total_gain_key = k
-            break
-
-    for msg in records:
-        vals = msg.get_values()
+        if total_gain_key is None and idx < 200:
+            candidate = _pick_total_gain_key(vals)
+            if candidate is not None:
+                total_gain_key = candidate
         ts = vals.get("timestamp")
         if ts is None:
             continue
@@ -595,6 +606,19 @@ def _find_gaps(times: List[float], gap_sec: float) -> List[Gap]:
         if dt > gap_sec:
             gaps.append(Gap(times[i - 1], times[i], dt))
     return gaps
+
+
+def _freeze_for_cache(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return tuple(sorted((k, _freeze_for_cache(v)) for k, v in obj.items()))
+    if isinstance(obj, (list, tuple)):
+        return tuple(_freeze_for_cache(v) for v in obj)
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    return repr(obj)
+
+
+_WR_ENVELOPE_CACHE: Dict[Tuple[Any, ...], Tuple[Any, Dict[str, Any]]] = {}
 
 
 def _split_sessions_from_gaps(
@@ -1194,7 +1218,10 @@ def nice_durations_for_span(
             return int(round(value / 3600.0)) * 3600
 
         while True:
-            x *= 1.0 + pct_step
+            step_ratio = pct_step
+            if x >= 6 * 3600:
+                step_ratio = max(pct_step, 0.015)
+            x *= 1.0 + step_ratio
             d = _round_nice_seconds(x)
             if d > total_span_s:
                 break
@@ -1828,6 +1855,60 @@ def _resolve_vertical_cap(config: Dict[str, Any]) -> Dict[str, float]:
         caps = {"default": 1.0}
     caps["v_cap"] = min(min(caps.values()), WR_VCAP_HARD_MAX)
     return caps
+
+
+def _wr_envelope_cache_key(
+    profile_name: str,
+    profile_config: Dict[str, Any],
+    wr_min_seconds: float,
+    wr_anchors_path: Optional[str],
+    cap_mode: str,
+) -> Tuple[Any, ...]:
+    anchors_sig: Optional[Tuple[Any, ...]]
+    if wr_anchors_path:
+        try:
+            stat = os.stat(wr_anchors_path)
+            anchors_sig = (wr_anchors_path, stat.st_mtime, stat.st_size)
+        except OSError:
+            anchors_sig = (wr_anchors_path, None, None)
+    else:
+        anchors_sig = None
+    return (
+        profile_name,
+        _freeze_for_cache(profile_config),
+        float(wr_min_seconds),
+        cap_mode,
+        anchors_sig,
+    )
+
+
+def _get_wr_envelope(
+    profile_name: str,
+    profile_config: Dict[str, Any],
+    wr_min_seconds: float,
+    wr_anchors_path: Optional[str],
+    cap_mode: str,
+):
+    key = _wr_envelope_cache_key(
+        profile_name,
+        profile_config,
+        wr_min_seconds,
+        wr_anchors_path,
+        cap_mode,
+    )
+    cached = _WR_ENVELOPE_CACHE.get(key)
+    if cached is not None:
+        H_WR_cached, env_cached = cached
+        return H_WR_cached, copy.deepcopy(env_cached)
+
+    H_WR, wr_env = _build_wr_envelope(
+        copy.deepcopy(profile_config),
+        wr_min_seconds,
+        wr_anchors_path,
+        cap_mode,
+    )
+    _WR_ENVELOPE_CACHE[key] = (H_WR, copy.deepcopy(wr_env))
+    return H_WR, wr_env
 
 
 def _H_sbpl_cap(t_s: np.ndarray, v_cap: float, s_inf: float, t_star: float, k: float) -> np.ndarray:
@@ -2519,25 +2600,38 @@ def _scoring_tables(
     magic_ws: List[int],
     min_anchor_s: float = 60.0,
     topk: int = 3,
+    wr_curve_sample: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> Tuple[List[float], List[float], List[Dict[str, Any]], List[Dict[str, Any]]]:
     import numpy as np
-    H_wr = [H_WR_func(w) for w in W_s]
-    rat = [ (u / wr) if wr > 0 else 0.0 for u, wr in zip(H_user, H_wr) ]
-    # best relative point >= min_anchor_s
-    r_star = 0.0
-    idx_best = None
-    for i, w in enumerate(W_s):
-        if w >= min_anchor_s and H_wr[i] > 0:
-            if idx_best is None or rat[i] > rat[idx_best]:
-                idx_best = i
-    if idx_best is not None:
-        r_star = min(rat[idx_best], 1.0)
-    H_pers = [r_star * wr for wr in H_wr]
+    W_arr = np.asarray(W_s, dtype=np.float64)
+    H_user_arr = np.asarray(H_user, dtype=np.float64)
+    if wr_curve_sample is not None and wr_curve_sample[0].size and wr_curve_sample[1].size:
+        wr_durs, wr_climbs = wr_curve_sample
+        H_wr_arr = np.interp(W_arr, wr_durs, wr_climbs, left=wr_climbs[0], right=wr_climbs[-1])
+    else:
+        H_wr_arr = np.array([H_WR_func(float(w)) for w in W_arr], dtype=np.float64)
 
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rat_arr = np.divide(H_user_arr, H_wr_arr, out=np.zeros_like(H_user_arr), where=H_wr_arr > 0)
+
+    mask = (W_arr >= float(min_anchor_s)) & (H_wr_arr > 0)
+    r_star = 0.0
+    if np.any(mask):
+        masked = np.where(mask, rat_arr, -np.inf)
+        idx_best = int(np.argmax(masked))
+        if masked[idx_best] > 0:
+            r_star = float(min(masked[idx_best], 1.0))
+
+    H_pers_arr = r_star * H_wr_arr
+    H_wr = H_wr_arr.tolist()
+    
     rows: List[Dict[str, Any]] = []
     for w in magic_ws:
+        if wr_curve_sample is not None and wr_curve_sample[0].size:
+            wr = float(np.interp(float(w), wr_curve_sample[0], wr_curve_sample[1], left=wr_curve_sample[1][0], right=wr_curve_sample[1][-1]))
+        else:
+            wr = H_WR_func(w)
         u = _interp_monotone(w, W_s, H_user)
-        wr = H_WR_func(w)
         pct = (u / wr * 100.0) if wr > 0 else None
         pers = r_star * wr
         goal = u + (2.0/3.0) * (pers - u)
@@ -2551,7 +2645,7 @@ def _scoring_tables(
         })
     valid = [r for r in rows if isinstance(r.get('score_pct'), (int, float))]
     weakest = sorted(valid, key=lambda r: r['score_pct'])[:topk]
-    return H_wr, H_pers, rows, weakest
+    return H_wr, H_pers_arr.tolist(), rows, weakest
 
 
 # -----------------
@@ -2673,6 +2767,7 @@ def _plot_curve(
     full_span_seconds: Optional[float] = None,
     session_curves: Optional[List[Dict[str, Any]]] = None,
     envelope_curve: Optional[Tuple[List[int], List[float]]] = None,
+    fast_plot: bool = True,
 ) -> None:
     try:
         import matplotlib
@@ -2786,7 +2881,7 @@ def _plot_curve(
                 return True
         return False
 
-    if not dense:
+    if not dense and not fast_plot:
         for x, y in zip(durs, climbs):
             if _is_near_magic(x, weak_ws):
                 continue
@@ -2810,32 +2905,64 @@ def _plot_curve(
 
     # Magic connectors and goals
     if magic_rows:
-        # Only annotate up to goals_topk weakest to avoid clutter, but connect all
         label_toggle = 1
         for row in weak_rows:
             w = int(row['duration_s'])
             usr = row.get('user_gain_m')
-            wrv = row.get('wr_gain_m')
-            if usr is None or wrv is None:
+            if not isinstance(usr, (int, float)):
                 continue
-            if show_wr and wrv is not None:
-                target = wrv
-            elif show_personal and isinstance(row.get('personal_gain_m'), (int, float)):
-                target = row['personal_gain_m']
-            else:
+            wrv = row.get('wr_gain_m') if isinstance(row.get('wr_gain_m'), (int, float)) else None
+            goal_val = row.get('goal_gain_m') if isinstance(row.get('goal_gain_m'), (int, float)) else None
+            if not fast_plot:
                 target = None
-            if target is not None:
-                ax2.plot([w, w], [usr, target], linestyle=":", color="gray", alpha=0.8)
-            ax2.plot([w], [usr], marker="o", color=USER_COLOR)
-            if show_wr and wrv is not None:
-                ax2.plot([w], [wrv], marker="o", color="0.3", alpha=0.9)
-            pct = row.get('score_pct')
-            if isinstance(pct, (int, float)):
-                offset_y = -14 if label_toggle > 0 else -28
-                if not dense and _near_base_duration(w):
-                    offset_y -= 12
+                if show_wr and wrv is not None:
+                    target = wrv
+                elif show_personal and isinstance(row.get('personal_gain_m'), (int, float)):
+                    target = row['personal_gain_m']
+                if target is not None:
+                    ax2.plot([w, w], [usr, target], linestyle=":", color="gray", alpha=0.8)
+                ax2.plot([w], [usr], marker="o", color=USER_COLOR)
+                if show_wr and wrv is not None:
+                    ax2.plot([w], [wrv], marker="o", color="0.3", alpha=0.9)
+                pct = row.get('score_pct')
+                if isinstance(pct, (int, float)):
+                    offset_y = -14 if label_toggle > 0 else -28
+                    if not dense and _near_base_duration(w):
+                        offset_y -= 12
+                    ax2.annotate(
+                        f"{usr:.0f} m • {pct:.0f}%",
+                        (w, usr),
+                        textcoords="offset points",
+                        xytext=(0, offset_y),
+                        ha="center",
+                        fontsize=8,
+                        color="black",
+                    )
+                if goal_val is not None:
+                    ax2.plot([w], [goal_val], marker=">", color=GOAL_COLOR)
+                    gpct = (goal_val / wrv * 100.0) if isinstance(wrv, (int, float)) and wrv > 0 else None
+                    label = f"goal {goal_val:.0f} m" + (f" • {gpct:.0f}%" if gpct is not None else "")
+                    goal_offset = 10
+                    if not dense and _near_base_duration(w):
+                        goal_offset += 6
+                    ax2.annotate(
+                        label,
+                        (w, goal_val),
+                        textcoords="offset points",
+                        xytext=(-6, goal_offset),
+                        ha="right",
+                        fontsize=8,
+                        color=GOAL_COLOR,
+                    )
+            else:
+                ax2.plot([w], [usr], marker="o", color=USER_COLOR, alpha=0.85)
+                pct = row.get('score_pct')
+                text = f"{usr:.0f} m"
+                if isinstance(pct, (int, float)):
+                    text += f" • {pct:.0f}%"
+                offset_y = -14 if label_toggle > 0 else -26
                 ax2.annotate(
-                    f"{usr:.0f} m • {pct:.0f}%",
+                    text,
                     (w, usr),
                     textcoords="offset points",
                     xytext=(0, offset_y),
@@ -2843,24 +2970,8 @@ def _plot_curve(
                     fontsize=8,
                     color="black",
                 )
-            if isinstance(row.get('goal_gain_m'), (int, float, float)):
-                goal = row.get('goal_gain_m')
-                ax2.plot([w], [goal], marker=">", color=GOAL_COLOR)
-                wrv2 = row.get('wr_gain_m')
-                gpct = (goal / wrv2 * 100.0) if isinstance(wrv2, (int, float)) and wrv2 > 0 else None
-                label = f"goal {goal:.0f} m" + (f" • {gpct:.0f}%" if gpct is not None else "")
-                goal_offset = 10
-                if not dense and _near_base_duration(w):
-                    goal_offset += 6
-                ax2.annotate(
-                    label,
-                    (w, goal),
-                    textcoords="offset points",
-                    xytext=(-6, goal_offset),
-                    ha="right",
-                    fontsize=8,
-                    color=GOAL_COLOR,
-                )
+                if goal_val is not None:
+                    ax2.plot([w], [goal_val], marker=">", color=GOAL_COLOR, alpha=0.75)
             label_toggle *= -1
     lines, labels = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
@@ -2890,6 +3001,7 @@ def _plot_split(
     full_span_seconds: Optional[float] = None,
     session_curves: Optional[List[Dict[str, Any]]] = None,
     envelope_curve: Optional[Tuple[List[int], List[float]]] = None,
+    fast_plot: bool = True,
 ) -> None:
     try:
         import matplotlib
@@ -2928,7 +3040,7 @@ def _plot_split(
     ax1.plot(durs, rates, marker="" if dense else "o", linewidth=1.8, color=USER_COLOR, label="Climb rate (m/h)")
 
     annotated_magic_rate_durs: Set[int] = set()
-    if magic_rows:
+    if magic_rows and not fast_plot:
         seen_durations: Set[int] = set()
         for row in magic_rows:
             w = int(row['duration_s'])
@@ -3032,7 +3144,7 @@ def _plot_split(
     # Magic annotations for rate
     weak_rows, weak_ws = _summarize_magic(magic_rows, goals_topk)
 
-    if magic_rows:
+    if magic_rows and not fast_plot:
         label_toggle = 1
         seen_durations: Set[int] = set()
         for row in magic_rows:
@@ -3157,27 +3269,60 @@ def _plot_split(
         for row in weak_rows:
             w = int(row['duration_s'])
             usr = row.get('user_gain_m')
-            wrv = row.get('wr_gain_m')
-            if usr is None or wrv is None:
+            if not isinstance(usr, (int, float)):
                 continue
-            if show_wr and wrv is not None:
-                target = wrv
-            elif show_personal and isinstance(row.get('personal_gain_m'), (int, float)):
-                target = row['personal_gain_m']
-            else:
+            wrv = row.get('wr_gain_m') if isinstance(row.get('wr_gain_m'), (int, float)) else None
+            goal_val = row.get('goal_gain_m') if isinstance(row.get('goal_gain_m'), (int, float)) else None
+            if not fast_plot:
                 target = None
-            if target is not None:
-                axc.plot([w, w], [usr, target], linestyle=":", color="gray", alpha=0.8)
-            axc.plot([w], [usr], marker="o", color=USER_COLOR)
-            if show_wr and wrv is not None:
-                axc.plot([w], [wrv], marker="o", color="0.3", alpha=0.9)
-            pct = row.get('score_pct')
-            if isinstance(pct, (int, float)):
-                offset_y = -14 if label_toggle > 0 else -28
-                if not dense and _near_base_duration(w):
-                    offset_y -= 12
+                if show_wr and wrv is not None:
+                    target = wrv
+                elif show_personal and isinstance(row.get('personal_gain_m'), (int, float)):
+                    target = row['personal_gain_m']
+                if target is not None:
+                    axc.plot([w, w], [usr, target], linestyle=":", color="gray", alpha=0.8)
+                axc.plot([w], [usr], marker="o", color=USER_COLOR)
+                if show_wr and wrv is not None:
+                    axc.plot([w], [wrv], marker="o", color="0.3", alpha=0.9)
+                pct = row.get('score_pct')
+                if isinstance(pct, (int, float)):
+                    offset_y = -14 if label_toggle > 0 else -28
+                    if not dense and _near_base_duration(w):
+                        offset_y -= 12
+                    axc.annotate(
+                        f"{usr:.0f} m • {pct:.0f}%",
+                        (w, usr),
+                        textcoords="offset points",
+                        xytext=(0, offset_y),
+                        ha="center",
+                        fontsize=8,
+                        color="black",
+                    )
+                if w in weak_ws and w >= goal_min_seconds and goal_val is not None:
+                    axc.plot([w], [goal_val], marker=">", color=GOAL_COLOR)
+                    gpct = (goal_val / wrv * 100.0) if isinstance(wrv, (int, float)) and wrv > 0 else None
+                    label = f"goal {goal_val:.0f} m" + (f" • {gpct:.0f}%" if gpct is not None else "")
+                    goal_offset = 10
+                    if not dense and _near_base_duration(w):
+                        goal_offset += 6
+                    axc.annotate(
+                        label,
+                        (w, goal_val),
+                        textcoords="offset points",
+                        xytext=(-6, goal_offset),
+                        ha="right",
+                        fontsize=8,
+                        color=GOAL_COLOR,
+                    )
+            else:
+                axc.plot([w], [usr], marker="o", color=USER_COLOR, alpha=0.85)
+                pct = row.get('score_pct')
+                text = f"{usr:.0f} m"
+                if isinstance(pct, (int, float)):
+                    text += f" • {pct:.0f}%"
+                offset_y = -14 if label_toggle > 0 else -26
                 axc.annotate(
-                    f"{usr:.0f} m • {pct:.0f}%",
+                    text,
                     (w, usr),
                     textcoords="offset points",
                     xytext=(0, offset_y),
@@ -3185,24 +3330,8 @@ def _plot_split(
                     fontsize=8,
                     color="black",
                 )
-            if w in weak_ws and w >= goal_min_seconds and isinstance(row.get('goal_gain_m'), (int, float, float)):
-                goal = row.get('goal_gain_m')
-                axc.plot([w], [goal], marker=">", color=GOAL_COLOR)
-                wrv2 = row.get('wr_gain_m')
-                gpct = (goal / wrv2 * 100.0) if isinstance(wrv2, (int, float)) and wrv2 > 0 else None
-                label = f"goal {goal:.0f} m" + (f" • {gpct:.0f}%" if gpct is not None else "")
-                goal_offset = 10
-                if not dense and _near_base_duration(w):
-                    goal_offset += 6
-                axc.annotate(
-                    label,
-                    (w, goal),
-                    textcoords="offset points",
-                    xytext=(-6, goal_offset),
-                    ha="right",
-                    fontsize=8,
-                    color=GOAL_COLOR,
-                )
+                if goal_val is not None:
+                    axc.plot([w], [goal_val], marker=">", color=GOAL_COLOR, alpha=0.75)
             label_toggle *= -1
 
     ymax = max(
@@ -3238,6 +3367,7 @@ def _run(
     merge_eps_sec: float = 0.5,
     overlap_policy: str = "file:last",
     resample_1hz: bool = False,
+    parse_workers: int = 0,
     gain_eps: float = 0.5,
     session_gap_sec: float = 600.0,
     all_windows: bool = False,
@@ -3259,20 +3389,40 @@ def _run(
     qc_spec_path: Optional[str] = None,
     concave_envelope: bool = True,
     engine: str = "auto",
+    profile: bool = False,
+    fast_plot: bool = True,
 ) -> int:
     _setup_logging(verbose, log_file=log_file)
 
     selected = "mixed"
     curve: List[CurvePoint] = []
     engine_mode = _resolve_engine(engine)
+    profiler = _StageProfiler(profile)
+    H_WR_func: Optional[Any] = None
     try:
         logging.info("Reading %d FIT file(s)...", len(fit_files))
-        records_by_file = []
-        for i, fp in enumerate(fit_files):
-            logging.info("Parsing: %s", fp)
-            records_by_file.append(_parse_single_fit_records(fp, file_id=i))
+        if parse_workers != 1 and len(fit_files) > 1:
+            max_workers = parse_workers if parse_workers and parse_workers > 0 else min(len(fit_files), max(1, (os.cpu_count() or 1)))
+            records_by_file = [None] * len(fit_files)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {}
+                for i, fp in enumerate(fit_files):
+                    logging.info("Parsing: %s", fp)
+                    future = executor.submit(_parse_single_fit_records, fp, i)
+                    future_map[future] = i
+                for future in as_completed(future_map):
+                    idx = future_map[future]
+                    records_by_file[idx] = future.result()
+            records_by_file = [rec if rec is not None else [] for rec in records_by_file]
+        else:
+            records_by_file = []
+            for i, fp in enumerate(fit_files):
+                logging.info("Parsing: %s", fp)
+                records_by_file.append(_parse_single_fit_records(fp, file_id=i))
+        profiler.lap("parse")
         merged = _merge_records(records_by_file, merge_eps_sec=merge_eps_sec, overlap_policy=overlap_policy)
         logging.info("Merged samples: %d", len(merged))
+        profiler.lap("merge")
         times: List[float]
         values: List[float]
         overall_sources_raw: Set[str] = set()
@@ -3397,6 +3547,7 @@ def _run(
                 engine=engine_mode,
             )
             duration_grid = list(durs)
+            profiler.lap("curve")
 
         if not curve:
             logging.error("Unable to compute curve for requested durations.")
@@ -3437,12 +3588,14 @@ def _run(
     magic_rows: Optional[List[Dict[str, Any]]] = None
     try:
         profile_config = _wr_profile_config(wr_profile)
-        H_WR, wr_env = _build_wr_envelope(
+        H_WR, wr_env = _get_wr_envelope(
+            wr_profile,
             profile_config,
             wr_min_seconds=wr_min_seconds,
             wr_anchors_path=wr_anchors_path,
             cap_mode=wr_short_cap,
         )
+        H_WR_func = H_WR
         cap_info = wr_env.get("cap_info", {})
         if cap_info:
             logging.info(
@@ -3495,7 +3648,26 @@ def _run(
         W_wr = [W_s[idx] for idx in wr_indices]
         parsed_magic = [ _parse_duration_token(t) for t in (magic.split(',') if magic else []) ] if magic else []
         magic_ws = [int(w) for w in parsed_magic if w >= wr_min_seconds]
-        H_wr_arr, H_pers_arr, rows, weakest = _scoring_tables(W_s, H_user, H_WR, magic_ws, min_anchor_s=personal_min_seconds, topk=goals_topk)
+        wr_sample_arrays: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        if wr_curve and wr_curve[0] and wr_curve[1]:
+            wr_sample_arrays = (
+                np.asarray(wr_curve[0], dtype=np.float64),
+                np.asarray(wr_curve[1], dtype=np.float64),
+            )
+        elif isinstance(wr_env.get("durations"), list) and isinstance(wr_env.get("climbs"), list):
+            wr_sample_arrays = (
+                np.asarray(wr_env.get("durations"), dtype=np.float64),
+                np.asarray(wr_env.get("climbs"), dtype=np.float64),
+            )
+        H_wr_arr, H_pers_arr, rows, weakest = _scoring_tables(
+            W_s,
+            H_user,
+            H_WR,
+            magic_ws,
+            min_anchor_s=personal_min_seconds,
+            topk=goals_topk,
+            wr_curve_sample=wr_sample_arrays,
+        )
         personal_curve = (W_wr, [H_pers_arr[idx] for idx in wr_indices]) if W_wr else None
         # Goal curve across full grid: user + 2/3*(personal - user)
         H_goal_full = [u + (2.0/3.0) * (p - u) for u, p in zip(H_user, H_pers_arr)]
@@ -3538,6 +3710,8 @@ def _run(
                     w.writerow(r)
     except Exception as e:
         logging.warning(f"WR/scoring computation failed: {e}")
+
+    profiler.lap("wr/scoring")
 
     session_curves: Optional[List[Dict[str, Any]]] = None
     try:
@@ -3583,33 +3757,50 @@ def _run(
         "start_offset_s",
         "end_offset_s",
         "source",
+        "wr_climb_m",
+        "wr_rate_m_per_hr",
     ]
-    fieldnames += ["wr_climb_m", "wr_rate_m_per_hr"]
+
+    wr_gain_arr: Optional[np.ndarray] = None
+    if wr_curve and wr_curve[0] and wr_curve[1]:
+        wr_durs_arr = np.asarray(wr_curve[0], dtype=np.float64)
+        wr_climbs_arr = np.asarray(wr_curve[1], dtype=np.float64)
+        cp_durations = np.asarray([cp.duration_s for cp in curve], dtype=np.float64)
+        wr_gain_arr = np.interp(cp_durations, wr_durs_arr, wr_climbs_arr, left=wr_climbs_arr[0], right=wr_climbs_arr[-1])
+    elif H_WR_func is not None:
+        cp_durations = np.asarray([cp.duration_s for cp in curve], dtype=np.float64)
+        try:
+            wr_gain_arr = np.array([float(H_WR_func(float(d))) for d in cp_durations], dtype=np.float64)
+        except Exception:
+            wr_gain_arr = None
+
     with open(output, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        # Build on-the-fly WR values at our grid for consistency
-        def _wr_at(w: int) -> Optional[float]:
-            try:
-                return float(H_WR(w)) if 'H_WR' in locals() and callable(H_WR) else None
-            except Exception:
-                return None
-        for cp in curve:
-            wr_gain = _wr_at(cp.duration_s)
-            wr_rate = (wr_gain / cp.duration_s * 3600.0) if (wr_gain is not None and cp.duration_s > 0) else None
-            row = {
-                "duration_s": cp.duration_s,
-                "max_climb_m": round(cp.max_climb_m, 3),
-                "climb_rate_m_per_hr": round(cp.climb_rate_m_per_hr, 3),
-                "start_offset_s": round(cp.start_offset_s, 3),
-                "end_offset_s": round(cp.end_offset_s, 3),
-                "source": selected_raw,
-                "wr_climb_m": round(wr_gain, 3) if isinstance(wr_gain, (int, float)) else None,
-                "wr_rate_m_per_hr": round(wr_rate, 3) if isinstance(wr_rate, (int, float)) else None,
-            }
-            writer.writerow(row)
+        writer = csv.writer(f)
+        writer.writerow(fieldnames)
+        rows_out: List[List[Any]] = []
+        for idx, cp in enumerate(curve):
+            wr_gain_val: Optional[float] = None
+            if wr_gain_arr is not None and idx < wr_gain_arr.size:
+                val = float(wr_gain_arr[idx])
+                if math.isfinite(val):
+                    wr_gain_val = val
+            wr_rate_val: Optional[float] = None
+            if wr_gain_val is not None and cp.duration_s > 0:
+                wr_rate_val = wr_gain_val / cp.duration_s * 3600.0
+            rows_out.append([
+                cp.duration_s,
+                round(cp.max_climb_m, 3),
+                round(cp.climb_rate_m_per_hr, 3),
+                round(cp.start_offset_s, 3),
+                round(cp.end_offset_s, 3),
+                selected_raw,
+                round(wr_gain_val, 3) if isinstance(wr_gain_val, float) else None,
+                round(wr_rate_val, 3) if isinstance(wr_rate_val, float) else None,
+            ])
+        writer.writerows(rows_out)
 
     logging.info("Wrote: %s", output)
+    profiler.lap("csv")
 
     if not no_plot:
         png_path = png
@@ -3639,6 +3830,7 @@ def _run(
                     full_span_seconds=full_span_seconds,
                     session_curves=session_curves,
                     envelope_curve=envelope_curve,
+                    fast_plot=fast_plot,
                 )
                 logging.info("Wrote plots: %s", png_path)
             else:
@@ -3657,10 +3849,13 @@ def _run(
                     full_span_seconds=full_span_seconds,
                     session_curves=session_curves,
                     envelope_curve=envelope_curve,
+                    fast_plot=fast_plot,
                 )
                 logging.info("Wrote plot: %s", png_path)
         except Exception as e:
             logging.error(f"Plotting failed: {e}")
+
+    profiler.lap("plot")
 
     return 0
 
@@ -3698,6 +3893,7 @@ def _build_typer_app():  # pragma: no cover
         merge_eps_sec: float = typer.Option(0.5, "--merge-eps-sec", help="Coalesce tolerance (seconds) for overlapping timestamps"),
         overlap_policy: str = typer.Option("file:last", "--overlap-policy", help="Overlap precedence for tg: file:first|file:last"),
         resample_1hz: bool = typer.Option(False, "--resample-1hz", help="Resample cumulative series to 1 Hz"),
+        parse_workers: int = typer.Option(0, "--parse-workers", help="Number of worker threads for FIT parsing (0=auto, 1=serial)"),
         gain_eps: float = typer.Option(0.5, "--gain-eps", help="Altitude hysteresis (m) for ascent from altitude"),
         session_gap_sec: float = typer.Option(600.0, "--session-gap-sec", help="Gap (s) considered inactivity when summarising and reporting; windows span all gaps"),
         qc: bool = typer.Option(True, "--qc/--no-qc", help="Censor implausible ascent spikes before computing the curve"),
@@ -3719,6 +3915,8 @@ def _build_typer_app():  # pragma: no cover
         personal_min_seconds: float = typer.Option(60.0, "--personal-min-seconds", help="Minimum duration (s) to anchor personal curve scaling"),
         concave_envelope: bool = typer.Option(True, "--concave-envelope/--no-concave-envelope", help="Apply concave envelope smoothing to the aggregate curve (auto-disabled when --exhaustive)", show_default=True),
         engine: str = typer.Option("auto", "--engine", help="Curve engine: auto|numpy|numba|stride"),
+        profile: bool = typer.Option(False, "--profile/--no-profile", help="Log stage timings for performance profiling"),
+        fast_plot: bool = typer.Option(True, "--fast-plot/--no-fast-plot", help="Skip heavy plot annotations for faster rendering"),
     ) -> None:
         """Compute the critical hill climb rate curve and save to CSV."""
         code = _run(
@@ -3736,6 +3934,7 @@ def _build_typer_app():  # pragma: no cover
             merge_eps_sec=merge_eps_sec,
             overlap_policy=overlap_policy,
             resample_1hz=resample_1hz,
+            parse_workers=parse_workers,
             gain_eps=gain_eps,
             session_gap_sec=session_gap_sec,
             all_windows=all_windows,
@@ -3757,6 +3956,8 @@ def _build_typer_app():  # pragma: no cover
             qc_spec_path=qc_spec,
             concave_envelope=concave_envelope,
             engine=engine,
+            profile=profile,
+            fast_plot=fast_plot,
         )
         if code != 0:
             raise typer.Exit(code)

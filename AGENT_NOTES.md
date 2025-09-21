@@ -26,6 +26,7 @@ Curve Algorithm
 - Durations use a multi-resolution grid: 1s steps to 2h, then ~1% geometric increments rounded to “nice” minutes/hours/days plus curated anchors (3h, 4h, daily, weekly, etc.).
 - Complexity stays linear in samples per duration even for multi-day spans, and the dense short-duration behaviour is unaffected.
 - Optional Numba engine jit-compiles the exhaustive sweep (parallel `prange`, pointer-based envelope lookups, gap skipping) and drops wall-clock by another ~5×; a stride engine reuses uniform 1 Hz cumulative sums when available.
+- Parsing can fan out across threads via `--parse-workers` (fitparse releases the GIL); use `--profile` to log parse/merge/curve/plot timings when chasing regressions.
 
 Diagnostics
 -----------

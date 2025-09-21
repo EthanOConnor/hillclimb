@@ -55,6 +55,9 @@ Options:
 - `--goal-min-seconds`: Hide goal curve/labels below this duration (default 120s).
 - `--personal-min-seconds`: Anchor personal curve scaling at best relative point ≥ this duration (default 60s).
 - `--engine`: Curve engine `auto|numpy|numba|stride` (auto prefers the Numba kernel when available; `stride` expects resampled 1 Hz data).
+- `--parse-workers`: Thread pool size for FIT parsing (0 = auto, 1 = serial).
+- `--fast-plot/--no-fast-plot`: Skip heavy annotations on plots for faster rendering (default fast).
+- `--profile`: Emit per-stage timing to the log for quick performance investigations.
 
 CSV columns
 -----------
@@ -69,6 +72,8 @@ Notes
 - You can pass multiple FIT files; timelines are merged by timestamp. If files overlap, windows extend across files as one continuous activity.
 - `--exhaustive` caches cumulative gain samples, prunes gap-only windows, and uses the multi-resolution grid so multi-day sweeps finish quickly without changing results.
 - Install `numba` to enable the just-in-time engine that brings another ~5× speedup for exhaustive grids (`pip install numba`).
+- `--parse-workers` lets you overlap FIT decoding across files; `--profile` logs parse/merge/curve/plot timings so you can spot slow stages quickly.
+- Keep `--fast-plot` enabled for day-to-day use; disable it when you need the detailed annotations on the PNGs.
 - If developer total gain is present in any file (e.g., NPE Runn), it is preferred and stitched across files, handling counter resets at file boundaries.
 - If no total gain is present but treadmill `incline` and `distance` exist (e.g., `inclineRunn` + `distance`), ascent is derived by integrating positive vertical: `delta_vertical = max(incline,0)% * delta_distance`.
 - Otherwise altitude-derived ascent is computed as the sum of positive elevation deltas.
