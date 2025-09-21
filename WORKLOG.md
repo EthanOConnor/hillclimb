@@ -23,6 +23,7 @@ Performance Improvements
 - Reworked `compute_curve` to cache cumulative gain values per sample, vectorize start/end window gains via NumPy `searchsorted`, and skip end-aligned windows that live entirely inside inactivity gaps.
 - Added a multi-resolution duration grid (dense seconds up to ~2h, geometric above with curated anchors) so the `--exhaustive` sweep remains exact where it matters but scales to multi-day spans.
 - Documented the new behaviour in `README.md` and `AGENT_NOTES.md` for future maintainers.
+- Added engine selection with a parallel Numba kernel (pointer-based envelope sweep) and a stride mode for 1 Hz data; auto-detect falls back to NumPy when Numba is unavailable.
 
 Repo Setup
 ----------

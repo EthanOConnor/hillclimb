@@ -6,7 +6,7 @@ import logging
 import math
 import copy
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple, Dict, Any, Set, NamedTuple, Union
+from typing import Iterable, List, Optional, Tuple, Dict, Any, Set, NamedTuple, Union, Literal
 import json
 
 import numpy as np
@@ -24,6 +24,14 @@ try:
     from fitparse import FitFile
 except Exception:  # pragma: no cover
     FitFile = None  # type: ignore
+
+try:
+    from numba import njit, prange
+    HAVE_NUMBA = True
+except Exception:  # pragma: no cover
+    njit = None  # type: ignore
+    prange = range  # type: ignore
+    HAVE_NUMBA = False
 
 
 _BASE_DIR = os.path.dirname(__file__)
@@ -639,7 +647,42 @@ def _split_sessions_from_gaps(
     return sessions
 
 
-def compute_curve(
+def _prepare_envelope_arrays(
+    times: List[float],
+    cumulative_gain: List[float],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if not times:
+        return (
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+        )
+
+    times_np = np.asarray(times, dtype=np.float64)
+    gains_np = np.asarray(cumulative_gain, dtype=np.float64)
+    if times_np.shape != gains_np.shape:
+        raise ValueError("times and cumulative_gain must have the same length")
+
+    slopes = np.zeros_like(gains_np)
+    if times_np.size >= 2:
+        dt = np.diff(times_np)
+        dg = np.diff(gains_np)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            seg_slopes = np.divide(
+                dg,
+                dt,
+                out=np.zeros_like(dg),
+                where=np.abs(dt) > 1e-12,
+            )
+        slopes[:-1] = seg_slopes
+        slopes[-1] = seg_slopes[-1]
+
+    U_at_sample = U_eval_many(times_np, gains_np, slopes, times_np)
+    return times_np, gains_np, slopes, U_at_sample
+
+
+def _compute_curve_numpy(
     times: List[float],
     cumulative_gain: List[float],
     durations: Iterable[int],
@@ -647,38 +690,18 @@ def compute_curve(
 ) -> List[CurvePoint]:
     results: List[CurvePoint] = []
 
-    n = len(times)
+    times_np, gains_np, slopes, U_at_sample = _prepare_envelope_arrays(times, cumulative_gain)
+    n = times_np.size
     if n == 0:
         return results
 
-    times_np = np.asarray(times, dtype=np.float64)
-    gains_np = np.asarray(cumulative_gain, dtype=np.float64)
-    if times_np.shape != gains_np.shape:
-        raise ValueError("times and cumulative_gain must have the same length")
-
-    ex = times_np
-    ey = gains_np
-
-    if ex.size >= 2:
-        dt = np.diff(ex)
-        dg = np.diff(ey)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            slopes = np.divide(
-                dg,
-                dt,
-                out=np.zeros_like(dg),
-                where=np.abs(dt) > 1e-12,
-            )
-    else:
-        slopes = np.zeros(1, dtype=np.float64)
-
-    U_at_sample = U_eval_many(ex, ey, slopes, times_np)
-
     gaps_list = gaps or []
-    start_time_min = float(ex[0])
-    end_time_max = float(ex[-1])
+    start_time_min = float(times_np[0])
+    end_time_max = float(times_np[-1])
 
     eps = 1e-9
+    ex = times_np
+    ey = gains_np
 
     for D in durations:
         D = int(D)
@@ -758,6 +781,330 @@ def compute_curve(
         )
 
     return results
+
+
+EngineMode = Literal["auto", "numpy", "numba", "stride"]
+
+
+def _resolve_engine(engine: str) -> EngineMode:
+    normalized = engine.strip().lower() if engine else "auto"
+    if normalized not in {"auto", "numpy", "numba", "stride"}:
+        logging.warning("Unknown engine '%s'; falling back to auto", engine)
+        return "auto"
+    return normalized  # type: ignore[return-value]
+
+
+NUMBA_EPS = 1e-9
+
+
+if HAVE_NUMBA:
+
+    @njit(cache=True, fastmath=True, parallel=True)
+    def _numba_curve_kernel(
+        times: np.ndarray,
+        ex: np.ndarray,
+        ey: np.ndarray,
+        slopes: np.ndarray,
+        U_at_sample: np.ndarray,
+        durations: np.ndarray,
+        gap_starts: np.ndarray,
+        gap_ends: np.ndarray,
+        gap_lengths: np.ndarray,
+        eps: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        m = durations.shape[0]
+        gains = np.zeros(m, dtype=np.float64)
+        starts = np.zeros(m, dtype=np.float64)
+        n = times.shape[0]
+        if n == 0:
+            return gains, starts
+
+        t_min = times[0]
+        t_max = times[n - 1]
+        n_ex = ex.shape[0]
+        gap_count = gap_lengths.shape[0]
+
+        for di in prange(m):
+            D = durations[di]
+            best_gain = -1.0
+            best_start = t_min
+
+            if D <= 0.0 or t_min + D > t_max + eps:
+                gains[di] = 0.0
+                starts[di] = t_min
+                continue
+
+            end_idx = 0
+            # Start-aligned windows
+            for i in range(n):
+                t0 = times[i]
+                t_plus = t0 + D
+                if t_plus > t_max + eps:
+                    break
+                while end_idx < n_ex and ex[end_idx] < t_plus:
+                    end_idx += 1
+                if end_idx <= 0:
+                    u_end = ey[0]
+                elif end_idx >= n_ex:
+                    u_end = ey[n_ex - 1]
+                else:
+                    seg_idx = end_idx - 1
+                    u_end = ey[seg_idx] + slopes[seg_idx] * (t_plus - ex[seg_idx])
+                gain = u_end - U_at_sample[i]
+                if gain > best_gain:
+                    best_gain = gain
+                    best_start = t0
+
+            # End-aligned windows
+            start_ptr = 0
+            gap_idx = 0
+            for k in range(n):
+                t_plus = times[k]
+                t_minus = t_plus - D
+                if t_minus < t_min - eps:
+                    continue
+
+                if gap_count > 0:
+                    while gap_idx < gap_count and t_minus > gap_ends[gap_idx]:
+                        gap_idx += 1
+                    if gap_idx < gap_count:
+                        if D <= gap_lengths[gap_idx] + eps:
+                            gap_hi = gap_ends[gap_idx] - D
+                            gap_lo = gap_starts[gap_idx]
+                            if gap_hi >= gap_lo - eps:
+                                if t_minus >= gap_lo - eps and t_minus <= gap_hi + eps:
+                                    continue
+
+                while start_ptr < n_ex and ex[start_ptr] < t_minus:
+                    start_ptr += 1
+                if start_ptr <= 0:
+                    u_start = ey[0]
+                elif start_ptr >= n_ex:
+                    u_start = ey[n_ex - 1]
+                else:
+                    seg_idx2 = start_ptr - 1
+                    u_start = ey[seg_idx2] + slopes[seg_idx2] * (t_minus - ex[seg_idx2])
+
+                gain = U_at_sample[k] - u_start
+                if gain > best_gain:
+                    best_gain = gain
+                    best_start = t_minus
+
+            if best_gain < 0.0:
+                best_gain = 0.0
+                best_start = t_min
+
+            max_start = t_max - D
+            if max_start < t_min:
+                max_start = t_min
+            if best_start < t_min:
+                best_start = t_min
+            if best_start > max_start:
+                best_start = max_start
+
+            gains[di] = best_gain
+            starts[di] = best_start
+
+        return gains, starts
+
+else:  # pragma: no cover - fallback when numba missing
+
+    def _numba_curve_kernel(*args, **kwargs):  # type: ignore[misc]
+        raise RuntimeError("Numba engine requested but numba is unavailable")
+
+def _compute_curve_numba(
+    times: List[float],
+    cumulative_gain: List[float],
+    durations: Iterable[int],
+    gaps: Optional[List[Gap]] = None,
+) -> List[CurvePoint]:
+    if not HAVE_NUMBA:
+        return _compute_curve_numpy(times, cumulative_gain, durations, gaps=gaps)
+
+    durations_list = [int(d) for d in durations]
+    if not durations_list:
+        return []
+
+    times_np, gains_np, slopes, U_at_sample = _prepare_envelope_arrays(times, cumulative_gain)
+    if times_np.size == 0:
+        return []
+
+    durations_arr = np.ascontiguousarray(np.asarray(durations_list, dtype=np.float64))
+    times_arr = np.ascontiguousarray(times_np)
+    gains_arr = np.ascontiguousarray(gains_np)
+    slopes_arr = np.ascontiguousarray(slopes)
+    u_at_arr = np.ascontiguousarray(U_at_sample)
+
+    if gaps:
+        gap_starts = np.ascontiguousarray(
+            np.asarray([g.start for g in gaps], dtype=np.float64)
+        )
+        gap_ends = np.ascontiguousarray(
+            np.asarray([g.end for g in gaps], dtype=np.float64)
+        )
+        gap_lengths = np.ascontiguousarray(
+            np.asarray([g.length for g in gaps], dtype=np.float64)
+        )
+    else:
+        gap_starts = np.ascontiguousarray(np.zeros(0, dtype=np.float64))
+        gap_ends = np.ascontiguousarray(np.zeros(0, dtype=np.float64))
+        gap_lengths = np.ascontiguousarray(np.zeros(0, dtype=np.float64))
+
+    gains_out, starts_out = _numba_curve_kernel(
+        times_arr,
+        times_arr,
+        gains_arr,
+        slopes_arr,
+        u_at_arr,
+        durations_arr,
+        gap_starts,
+        gap_ends,
+        gap_lengths,
+        NUMBA_EPS,
+    )
+
+    start_time_min = float(times_arr[0])
+    end_time_max = float(times_arr[-1])
+
+    results: List[CurvePoint] = []
+    for idx, D in enumerate(durations_list):
+        gain = float(gains_out[idx]) if idx < gains_out.size else 0.0
+        start = float(starts_out[idx]) if idx < starts_out.size else start_time_min
+
+        if D <= 0 or start_time_min + D > end_time_max + NUMBA_EPS:
+            gain = 0.0
+            start = start_time_min
+
+        if gain < 0.0:
+            gain = 0.0
+
+        max_start = end_time_max - D
+        if max_start < start_time_min:
+            max_start = start_time_min
+        if start < start_time_min:
+            start = start_time_min
+        if start > max_start:
+            start = max_start
+
+        end_offset = start + D
+        if end_offset > end_time_max + 1e-9:
+            end_offset = end_time_max
+        if end_offset < start:
+            end_offset = start
+
+        rate = gain / D * 3600.0 if D > 0 else 0.0
+        results.append(
+            CurvePoint(
+                duration_s=D,
+                max_climb_m=gain,
+                climb_rate_m_per_hr=rate,
+                start_offset_s=start,
+                end_offset_s=end_offset,
+            )
+        )
+
+    return results
+
+
+def _compute_curve_stride(
+    times: List[float],
+    cumulative_gain: List[float],
+    durations: Iterable[int],
+    gaps: Optional[List[Gap]] = None,
+) -> List[CurvePoint]:
+    durations_list = [int(d) for d in durations]
+    if not durations_list:
+        return []
+
+    times_np, gains_np, slopes, U_at_sample = _prepare_envelope_arrays(times, cumulative_gain)
+    n = times_np.size
+    if n == 0:
+        return []
+    if n < 2:
+        start = float(times_np[0])
+        return [
+            CurvePoint(d, 0.0, 0.0, start, start)
+            for d in durations_list
+        ]
+
+    dt = np.diff(times_np)
+    base_dt = dt[0]
+    if np.any(np.abs(dt - base_dt) > 1e-6) or base_dt <= 0:
+        return _compute_curve_numpy(times, cumulative_gain, durations, gaps=gaps)
+
+    for D in durations_list:
+        if D > 0 and abs(round(D / base_dt) * base_dt - D) > 1e-6:
+            return _compute_curve_numpy(times, cumulative_gain, durations, gaps=gaps)
+
+    start_time_min = float(times_np[0])
+    end_time_max = float(times_np[-1])
+    eps = 1e-9
+
+    results: List[CurvePoint] = []
+    for D in durations_list:
+        if D <= 0 or start_time_min + D > end_time_max + eps:
+            results.append(CurvePoint(D, 0.0, 0.0, start_time_min, start_time_min))
+            continue
+
+        stride = int(round(D / base_dt))
+        if stride <= 0 or stride >= n:
+            results.append(CurvePoint(D, 0.0, 0.0, start_time_min, start_time_min))
+            continue
+
+        deltas = U_at_sample[stride:] - U_at_sample[:-stride]
+        if deltas.size == 0:
+            results.append(CurvePoint(D, 0.0, 0.0, start_time_min, start_time_min))
+            continue
+
+        idx = int(np.argmax(deltas))
+        gain = float(deltas[idx])
+        if gain < 0.0:
+            gain = 0.0
+        start = float(times_np[idx])
+        max_start = end_time_max - D
+        if max_start < start_time_min:
+            max_start = start_time_min
+        if start < start_time_min:
+            start = start_time_min
+        if start > max_start:
+            start = max_start
+        end_offset = start + D
+        if end_offset > end_time_max + 1e-9:
+            end_offset = end_time_max
+        rate = gain / D * 3600.0 if D > 0 else 0.0
+        results.append(
+            CurvePoint(
+                duration_s=D,
+                max_climb_m=gain,
+                climb_rate_m_per_hr=rate,
+                start_offset_s=start,
+                end_offset_s=end_offset,
+            )
+        )
+
+    return results
+
+
+def compute_curve(
+    times: List[float],
+    cumulative_gain: List[float],
+    durations: Iterable[int],
+    gaps: Optional[List[Gap]] = None,
+    engine: EngineMode = "auto",
+) -> List[CurvePoint]:
+    resolved = _resolve_engine(engine)
+    if resolved == "auto":
+        if HAVE_NUMBA:
+            return _compute_curve_numba(times, cumulative_gain, durations, gaps=gaps)
+        return _compute_curve_numpy(times, cumulative_gain, durations, gaps=gaps)
+    if resolved == "numba":
+        if HAVE_NUMBA:
+            return _compute_curve_numba(times, cumulative_gain, durations, gaps=gaps)
+        logging.warning("Numba engine requested but numba is unavailable; using numpy engine")
+        return _compute_curve_numpy(times, cumulative_gain, durations, gaps=gaps)
+    if resolved == "stride":
+        return _compute_curve_stride(times, cumulative_gain, durations, gaps=gaps)
+    return _compute_curve_numpy(times, cumulative_gain, durations, gaps=gaps)
 
 
 def nice_durations_for_span(
@@ -2128,12 +2475,20 @@ def _build_wr_envelope(
 
     sample = np.logspace(math.log10(w_min), math.log10(w_max), 200)
     wr_values = _sample_curve(sample)
-    wr_rates = _rate_curve(sample) * 3600.0
+    wr_rates_inst = _rate_curve(sample) * 3600.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        wr_rates_avg = np.divide(
+            wr_values,
+            sample,
+            out=np.zeros_like(wr_values),
+            where=sample > 0,
+        ) * 3600.0
 
     return H_WR, {
         "durations": sample.tolist(),
         "climbs": wr_values.tolist(),
-        "rates": wr_rates.tolist(),
+        "rates": wr_rates_avg.tolist(),
+        "rates_inst": wr_rates_inst.tolist(),
         "anchors": anchors,
         "cap_info": cap_info,
         "params": params,
@@ -2903,11 +3258,13 @@ def _run(
     qc_enabled: bool = True,
     qc_spec_path: Optional[str] = None,
     concave_envelope: bool = True,
+    engine: str = "auto",
 ) -> int:
     _setup_logging(verbose, log_file=log_file)
 
     selected = "mixed"
     curve: List[CurvePoint] = []
+    engine_mode = _resolve_engine(engine)
     try:
         logging.info("Reading %d FIT file(s)...", len(fit_files))
         records_by_file = []
@@ -3032,7 +3389,13 @@ def _run(
                     )
                 durs = sorted(durs_set) if durs_set else list(DEFAULT_DURATIONS)
 
-            curve = compute_curve(times, values, durs, gaps=session_gap_list)
+            curve = compute_curve(
+                times,
+                values,
+                durs,
+                gaps=session_gap_list,
+                engine=engine_mode,
+            )
             duration_grid = list(durs)
 
         if not curve:
@@ -3189,7 +3552,13 @@ def _run(
                 valid_durs = [d for d in base_durations_for_sessions if 0 < d <= span]
                 if not valid_durs:
                     continue
-                seg_curve = compute_curve(segment["times"], segment["values"], valid_durs, gaps=None)
+                seg_curve = compute_curve(
+                    segment["times"],
+                    segment["values"],
+                    valid_durs,
+                    gaps=None,
+                    engine=engine_mode,
+                )
                 if not seg_curve:
                     continue
                 session_curves.append(
@@ -3349,6 +3718,7 @@ def _build_typer_app():  # pragma: no cover
         goal_min_seconds: float = typer.Option(120.0, "--goal-min-seconds", help="Hide goal curve and labels below this duration (s) to avoid blow-ups"),
         personal_min_seconds: float = typer.Option(60.0, "--personal-min-seconds", help="Minimum duration (s) to anchor personal curve scaling"),
         concave_envelope: bool = typer.Option(True, "--concave-envelope/--no-concave-envelope", help="Apply concave envelope smoothing to the aggregate curve (auto-disabled when --exhaustive)", show_default=True),
+        engine: str = typer.Option("auto", "--engine", help="Curve engine: auto|numpy|numba|stride"),
     ) -> None:
         """Compute the critical hill climb rate curve and save to CSV."""
         code = _run(
@@ -3386,6 +3756,7 @@ def _build_typer_app():  # pragma: no cover
             qc_enabled=qc,
             qc_spec_path=qc_spec,
             concave_envelope=concave_envelope,
+            engine=engine,
         )
         if code != 0:
             raise typer.Exit(code)

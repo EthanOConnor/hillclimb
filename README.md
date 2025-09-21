@@ -12,6 +12,7 @@ Usage
 -----
 
 Requirements: `fitparse`, `typer`, `matplotlib` (see `requirements.txt`).
+Optional acceleration: `numba` (auto-detected when available).
 
 Recommended environment setup:
 
@@ -53,6 +54,7 @@ Options:
 - Plotting defaults: split plots on; WR overlay off; goal curve hidden below 120s. Use `--plot-wr` to show WR.
 - `--goal-min-seconds`: Hide goal curve/labels below this duration (default 120s).
 - `--personal-min-seconds`: Anchor personal curve scaling at best relative point ≥ this duration (default 60s).
+- `--engine`: Curve engine `auto|numpy|numba|stride` (auto prefers the Numba kernel when available; `stride` expects resampled 1 Hz data).
 
 CSV columns
 -----------
@@ -66,6 +68,7 @@ Notes
 -----
 - You can pass multiple FIT files; timelines are merged by timestamp. If files overlap, windows extend across files as one continuous activity.
 - `--exhaustive` caches cumulative gain samples, prunes gap-only windows, and uses the multi-resolution grid so multi-day sweeps finish quickly without changing results.
+- Install `numba` to enable the just-in-time engine that brings another ~5× speedup for exhaustive grids (`pip install numba`).
 - If developer total gain is present in any file (e.g., NPE Runn), it is preferred and stitched across files, handling counter resets at file boundaries.
 - If no total gain is present but treadmill `incline` and `distance` exist (e.g., `inclineRunn` + `distance`), ascent is derived by integrating positive vertical: `delta_vertical = max(incline,0)% * delta_distance`.
 - Otherwise altitude-derived ascent is computed as the sum of positive elevation deltas.
