@@ -6,6 +6,7 @@ import logging
 import math
 import copy
 import time
+import heapq
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple, Dict, Any, Set, NamedTuple, Union, Literal
@@ -382,6 +383,32 @@ def _parse_single_fit_records(fit_path: str, file_id: int) -> List[Dict[str, Any
             except Exception:
                 dist_val = None
 
+        speed_val: Optional[float] = None
+        for name in ("enhanced_speed", "speed"):
+            if vals.get(name) is not None:
+                try:
+                    sv = float(vals.get(name))
+                except Exception:
+                    sv = None
+                if sv is not None and math.isfinite(sv):
+                    speed_val = max(0.0, sv)
+                    break
+
+        cad_val: Optional[float] = None
+        for name in (
+            "cadence",
+            "enhanced_running_cadence",
+            "enhanced_cadence",
+        ):
+            if vals.get(name) is not None:
+                try:
+                    cv = float(vals.get(name))
+                except Exception:
+                    cv = None
+                if cv is not None and math.isfinite(cv):
+                    cad_val = max(0.0, cv)
+                    break
+
         out.append({
             "t": t,
             "file_id": file_id,
@@ -390,6 +417,8 @@ def _parse_single_fit_records(fit_path: str, file_id: int) -> List[Dict[str, Any
             "inc": inc_val,
             "dist": dist_val,
             "dist_prio": dist_prio,
+            "speed": speed_val,
+            "cad": cad_val,
         })
     try:
         records_for_cache = [
@@ -401,6 +430,8 @@ def _parse_single_fit_records(fit_path: str, file_id: int) -> List[Dict[str, Any
                 "inc": rec.get("inc"),
                 "dist": rec.get("dist"),
                 "dist_prio": rec.get("dist_prio", 0),
+                "speed": rec.get("speed"),
+                "cad": rec.get("cad"),
             }
             for rec in out
         ]
@@ -450,6 +481,10 @@ def _merge_records(
                 chosen["alt"] = rec["alt"]
             if rec.get("inc") is not None and chosen.get("inc") is None:
                 chosen["inc"] = rec["inc"]
+            if rec.get("speed") is not None and chosen.get("speed") is None:
+                chosen["speed"] = rec["speed"]
+            if rec.get("cad") is not None and chosen.get("cad") is None:
+                chosen["cad"] = rec["cad"]
             # Prefer higher-priority distance source (developer total_distance highest)
             rec_dp = rec.get("dist_prio", 0) or 0
             ch_dp = chosen.get("dist_prio", 0) or 0
@@ -664,9 +699,24 @@ def _build_timeseries(
         except Exception:
             pass
         alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med, diag)
+        indoor_hint = _infer_indoor_mode(merged)
+        alt_idle, moving_mask, _ = _apply_idle_detection(
+            merged,
+            t_alt,
+            alt_eff,
+            diag,
+            t0,
+            indoor_hint=indoor_hint,
+        )
         # Cumulative ascent (uprun epsilon, baro/GNSS defaults lower)
         eps_gain = 0.02
-        cum_series = _cum_ascent_from_alt(alt_eff, eps_gain, mode="uprun", diag=diag)
+        cum_series = _cum_ascent_from_alt(
+            alt_idle,
+            eps_gain,
+            mode="uprun",
+            diag=diag,
+            moving_mask=moving_mask,
+        )
         for i in range(t_alt.size):
             times.append(float(t_alt[i]))
             G.append(float(cum_series[i]))
@@ -902,7 +952,7 @@ def _local_poly_smooth(t: np.ndarray, y: np.ndarray, min_span_s: float = 0.4, ma
     return out
 
 
-from collections import deque
+from collections import defaultdict, deque
 
 
 def _sliding_extrema_sym(t: np.ndarray, y: np.ndarray, half_window_s: float, mode: str) -> np.ndarray:
@@ -1038,17 +1088,561 @@ def _effective_altitude_path(
     return z3
 
 
+def _infer_indoor_mode(records: List[Dict[str, Any]]) -> bool:
+    if not records:
+        return False
+    dev_dist = 0
+    inc_samples = 0
+    for rec in records:
+        if rec.get("dist_prio", 0) and int(rec.get("dist_prio", 0)) >= 3:
+            dev_dist += 1
+        if rec.get("inc") is not None:
+            inc_samples += 1
+    total = len(records)
+    if total == 0:
+        return False
+    if dev_dist >= max(5, int(0.4 * total)) and inc_samples > 0:
+        return True
+    if dev_dist >= max(5, int(0.6 * total)):
+        return True
+    return False
+
+
+class _RollingMedian:
+    def __init__(self) -> None:
+        self._low: List[Tuple[float, int]] = []  # max-heap via negative values
+        self._high: List[Tuple[float, int]] = []  # min-heap
+        self._invalid_low: Dict[int, int] = defaultdict(int)
+        self._invalid_high: Dict[int, int] = defaultdict(int)
+        self._entries: Dict[int, float] = {}
+        self._size = 0
+
+    def _prune(self, heap: List[Tuple[float, int]], invalid: Dict[int, int]) -> None:
+        while heap:
+            value, idx = heap[0]
+            if invalid.get(idx, 0):
+                heapq.heappop(heap)
+                invalid[idx] -= 1
+                if invalid[idx] <= 0:
+                    invalid.pop(idx, None)
+            else:
+                break
+
+    def _rebalance(self) -> None:
+        self._prune(self._low, self._invalid_low)
+        self._prune(self._high, self._invalid_high)
+        if len(self._low) > len(self._high) + 1:
+            value, idx = heapq.heappop(self._low)
+            self._prune(self._low, self._invalid_low)
+            heapq.heappush(self._high, (-value, idx))
+            self._prune(self._high, self._invalid_high)
+        elif len(self._high) > len(self._low):
+            value, idx = heapq.heappop(self._high)
+            self._prune(self._high, self._invalid_high)
+            heapq.heappush(self._low, (-value, idx))
+            self._prune(self._low, self._invalid_low)
+
+    def add(self, value: float, idx: int) -> None:
+        if not math.isfinite(value):
+            return
+        self._entries[idx] = value
+        if not self._low or value <= -self._low[0][0]:
+            heapq.heappush(self._low, (-value, idx))
+        else:
+            heapq.heappush(self._high, (value, idx))
+        self._size += 1
+        self._rebalance()
+
+    def discard(self, idx: int) -> None:
+        if idx not in self._entries:
+            return
+        value = self._entries.pop(idx)
+        if self._low and value <= -self._low[0][0]:
+            self._invalid_low[idx] += 1
+            if self._low and self._low[0][1] == idx:
+                self._prune(self._low, self._invalid_low)
+        else:
+            self._invalid_high[idx] += 1
+            if self._high and self._high[0][1] == idx:
+                self._prune(self._high, self._invalid_high)
+        self._size -= 1
+        if self._size < 0:
+            self._size = 0
+        self._rebalance()
+
+    def median(self) -> float:
+        if self._size <= 0:
+            return 0.0
+        self._prune(self._low, self._invalid_low)
+        self._prune(self._high, self._invalid_high)
+        if len(self._low) > len(self._high):
+            return -self._low[0][0]
+        if len(self._high) > len(self._low):
+            return self._high[0][0]
+        return (-self._low[0][0] + self._high[0][0]) * 0.5
+
+
+def _rolling_median_time(t: np.ndarray, values: np.ndarray, window_s: float) -> np.ndarray:
+    n = values.size
+    out = np.zeros(n, dtype=np.float64)
+    if n == 0:
+        return out
+    rm = _RollingMedian()
+    added = [False] * n
+    start = 0
+    for i in range(n):
+        val = float(values[i])
+        if math.isfinite(val):
+            rm.add(val, i)
+            added[i] = True
+        while start <= i and t[i] - t[start] > window_s:
+            if added[start]:
+                rm.discard(start)
+            start += 1
+        out[i] = rm.median()
+    return out
+
+
+def _rolling_distance_advance(t: np.ndarray, dist: np.ndarray, window_s: float) -> np.ndarray:
+    n = dist.size
+    out = np.zeros(n, dtype=np.float64)
+    if n == 0:
+        return out
+    max_dq: deque[int] = deque()
+    min_dq: deque[int] = deque()
+    start = 0
+    for i in range(n):
+        while start <= i and t[i] - t[start] > window_s:
+            if max_dq and max_dq[0] == start:
+                max_dq.popleft()
+            if min_dq and min_dq[0] == start:
+                min_dq.popleft()
+            start += 1
+        while max_dq and dist[max_dq[-1]] <= dist[i]:
+            max_dq.pop()
+        max_dq.append(i)
+        while min_dq and dist[min_dq[-1]] >= dist[i]:
+            min_dq.pop()
+        min_dq.append(i)
+        if max_dq and min_dq:
+            out[i] = dist[max_dq[0]] - dist[min_dq[0]]
+        else:
+            out[i] = 0.0
+    return out
+
+
+def _instantaneous_speed(t: np.ndarray, dist: np.ndarray) -> np.ndarray:
+    n = dist.size
+    out = np.zeros(n, dtype=np.float64)
+    if n <= 1:
+        return out
+    dt = np.diff(t)
+    dd = np.diff(dist)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        speed = np.divide(dd, dt, out=np.zeros_like(dd), where=dt > 1e-6)
+    speed = np.clip(speed, 0.0, 20.0)
+    out[1:] = speed
+    out[0] = out[1] if n > 1 else 0.0
+    return out
+
+
+def _instantaneous_vertical_speed(t: np.ndarray, alt: np.ndarray) -> np.ndarray:
+    n = alt.size
+    out = np.zeros(n, dtype=np.float64)
+    if n <= 1:
+        return out
+    dt = np.diff(t)
+    dz = np.diff(alt)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vs = np.divide(dz, dt, out=np.zeros_like(dz), where=dt > 1e-6)
+    vs = np.clip(np.abs(vs), 0.0, 10.0)
+    out[1:] = vs
+    out[0] = out[1] if n > 1 else 0.0
+    return out
+
+
+def _estimate_speed_noise_floor(speed: np.ndarray) -> Tuple[float, float]:
+    if speed.size == 0:
+        return 0.15, 0.0
+    valid = speed[np.isfinite(speed)]
+    if valid.size == 0:
+        return 0.15, 0.0
+    valid = np.clip(valid, 0.0, None)
+    still = valid[valid <= 0.6]
+    if still.size > 0:
+        baseline = float(np.median(still))
+    else:
+        try:
+            baseline = float(np.percentile(valid, 10))
+        except Exception:
+            baseline = float(np.median(valid))
+    if not math.isfinite(baseline):
+        baseline = 0.0
+    baseline = max(0.0, baseline)
+    noise = max(0.15, baseline * 3.0)
+    return float(noise), baseline
+
+
+def _interp_series(
+    target_t: np.ndarray,
+    sample_t: np.ndarray,
+    sample_v: np.ndarray,
+    default: float,
+    left: Optional[float] = None,
+    right: Optional[float] = None,
+) -> np.ndarray:
+    if sample_t.size == 0:
+        return np.full_like(target_t, default, dtype=np.float64)
+    mask = np.isfinite(sample_t) & np.isfinite(sample_v)
+    if not np.any(mask):
+        return np.full_like(target_t, default, dtype=np.float64)
+    st = sample_t[mask]
+    sv = sample_v[mask]
+    if st.size == 0:
+        return np.full_like(target_t, default, dtype=np.float64)
+    order = np.argsort(st)
+    st = st[order]
+    sv = sv[order]
+    st_unique, idx = np.unique(st, return_index=True)
+    sv = sv[idx]
+    st = st_unique
+    left_val = sv[0] if left is None else left
+    right_val = sv[-1] if right is None else right
+    return np.interp(target_t, st, sv, left=left_val, right=right_val)
+
+
+def _apply_idle_hold(
+    t: np.ndarray,
+    alt: np.ndarray,
+    idle_mask: np.ndarray,
+    drift_limit: float,
+) -> np.ndarray:
+    out = alt.copy()
+    if out.size == 0 or not np.any(idle_mask):
+        return out
+    hold_value = out[0]
+    hold_time = t[0]
+    if idle_mask[0]:
+        hold_value = out[0]
+        hold_time = t[0]
+    for i in range(1, out.size):
+        if idle_mask[i]:
+            if not idle_mask[i - 1]:
+                hold_value = out[i - 1]
+                hold_time = t[i - 1]
+            if drift_limit > 0 and t[i] > hold_time:
+                max_delta = drift_limit * max(0.0, t[i] - hold_time)
+                lower = hold_value - max_delta
+                upper = hold_value + max_delta
+                val = out[i]
+                if val < lower:
+                    out[i] = lower
+                elif val > upper:
+                    out[i] = upper
+                else:
+                    out[i] = val
+            else:
+                out[i] = hold_value
+        else:
+            hold_value = out[i]
+            hold_time = t[i]
+    return out
+
+
+def _apply_idle_detection(
+    records: List[Dict[str, Any]],
+    t: np.ndarray,
+    alt_eff: np.ndarray,
+    diag: Optional[Dict[str, Any]],
+    t0: float,
+    indoor_hint: Optional[bool] = None,
+    window_s: float = 5.0,
+    drift_limit: float = 0.002,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = t.size
+    if n == 0:
+        return alt_eff.copy(), np.ones(0, dtype=bool), np.zeros(0, dtype=bool)
+    indoor = indoor_hint if indoor_hint is not None else _infer_indoor_mode(records)
+
+    dist_samples_t: List[float] = []
+    dist_samples_v: List[float] = []
+    speed_samples_t: List[float] = []
+    speed_samples_v: List[float] = []
+    cad_samples_t: List[float] = []
+    cad_samples_v: List[float] = []
+
+    for rec in records:
+        trel = float(rec.get("t", 0.0) - t0)
+        if not math.isfinite(trel):
+            continue
+        if rec.get("dist") is not None:
+            try:
+                dist_val = float(rec.get("dist"))
+            except Exception:
+                dist_val = None
+            if dist_val is not None and math.isfinite(dist_val):
+                dist_samples_t.append(trel)
+                dist_samples_v.append(dist_val)
+        if rec.get("speed") is not None:
+            try:
+                speed_val = float(rec.get("speed"))
+            except Exception:
+                speed_val = None
+            if speed_val is not None and math.isfinite(speed_val):
+                speed_samples_t.append(trel)
+                speed_samples_v.append(max(0.0, speed_val))
+        if rec.get("cad") is not None:
+            try:
+                cad_val = float(rec.get("cad"))
+            except Exception:
+                cad_val = None
+            if cad_val is not None and math.isfinite(cad_val):
+                cad_samples_t.append(trel)
+                cad_samples_v.append(max(0.0, cad_val))
+
+    dist_series: Optional[np.ndarray] = None
+    if dist_samples_t:
+        dist_t = np.asarray(dist_samples_t, dtype=np.float64)
+        dist_v = np.asarray(dist_samples_v, dtype=np.float64)
+        mask = np.isfinite(dist_t) & np.isfinite(dist_v)
+        if np.any(mask):
+            dist_t = dist_t[mask]
+            dist_v = dist_v[mask]
+            if dist_t.size == 1:
+                dist_series = np.full(n, float(dist_v[0]), dtype=np.float64)
+            elif dist_t.size > 1:
+                order = np.argsort(dist_t)
+                dist_t = dist_t[order]
+                dist_v = dist_v[order]
+                dist_v = np.maximum.accumulate(dist_v)
+                dist_t, idx = np.unique(dist_t, return_index=True)
+                dist_v = dist_v[idx]
+                dist_series = np.interp(t, dist_t, dist_v, left=dist_v[0], right=dist_v[-1])
+
+    if dist_series is None:
+        speed_series = None
+    else:
+        speed_series = _instantaneous_speed(t, dist_series)
+
+    if speed_series is None:
+        if speed_samples_t:
+            speed_series = _interp_series(
+                t,
+                np.asarray(speed_samples_t, dtype=np.float64),
+                np.asarray(speed_samples_v, dtype=np.float64),
+                default=0.0,
+                left=0.0,
+                right=0.0,
+            )
+        else:
+            speed_series = np.zeros(n, dtype=np.float64)
+
+    cad_series = _interp_series(
+        t,
+        np.asarray(cad_samples_t, dtype=np.float64),
+        np.asarray(cad_samples_v, dtype=np.float64),
+        default=0.0,
+        left=0.0,
+        right=0.0,
+    ) if cad_samples_t else np.zeros(n, dtype=np.float64)
+
+    cad_series = np.clip(cad_series, 0.0, None)
+
+    if dist_series is None:
+        dist_series = np.zeros(n, dtype=np.float64)
+
+    vertical_speed = _instantaneous_vertical_speed(t, alt_eff)
+
+    v_med = _rolling_median_time(t, speed_series, window_s)
+    cad_med = _rolling_median_time(t, cad_series, window_s)
+    vv_med = _rolling_median_time(t, vertical_speed, window_s)
+    ds_adv = _rolling_distance_advance(t, dist_series, window_s)
+
+    v_noise, v_baseline = _estimate_speed_noise_floor(speed_series)
+    if indoor:
+        V_ON = 0.1
+        V_OFF = 0.05
+    else:
+        V_ON = max(0.25, v_noise * 2.0)
+        V_OFF = max(0.15, v_noise * 1.2)
+
+    CAD_ON = 12.0
+    CAD_OFF = 6.0
+    DS_ON = 3.0
+    DS_OFF = 1.5
+    VV_ON = 0.05
+    VV_OFF = 0.02
+    T_enter = 2.0
+    T_exit = 1.0
+
+    idle_mask = np.zeros(n, dtype=bool)
+    in_idle = False
+    below_off = 0.0
+    above_on = 0.0
+
+    for i in range(n):
+        dt = 0.0 if i == 0 else max(0.0, float(t[i] - t[i - 1]))
+        is_moving_on = (
+            (v_med[i] >= V_ON)
+            or (cad_med[i] >= CAD_ON)
+            or (vv_med[i] >= VV_ON)
+            or (ds_adv[i] >= DS_ON)
+        )
+        is_idle_off = (
+            (v_med[i] < V_OFF)
+            and (cad_med[i] < CAD_OFF)
+            and (vv_med[i] < VV_OFF)
+            and (ds_adv[i] < DS_OFF)
+        )
+
+        if in_idle:
+            if is_moving_on:
+                above_on += dt
+                below_off = 0.0
+            else:
+                above_on = 0.0
+            if above_on >= T_exit:
+                in_idle = False
+                above_on = 0.0
+        else:
+            if is_idle_off:
+                below_off += dt
+                above_on = 0.0
+            else:
+                below_off = 0.0
+            if below_off >= T_enter:
+                in_idle = True
+                below_off = 0.0
+        idle_mask[i] = in_idle
+
+    moving_mask = ~idle_mask
+    alt_adj = _apply_idle_hold(t, alt_eff, idle_mask, drift_limit)
+
+    if n <= 0:
+        segments_count = 0
+    elif n == 1:
+        segments_count = 1 if idle_mask[0] else 0
+    else:
+        transitions = (~idle_mask[:-1]) & idle_mask[1:]
+        segments_count = int(np.count_nonzero(transitions))
+        if idle_mask[0]:
+            segments_count += 1
+
+    if diag is not None:
+        try:
+            dh_raw = np.diff(alt_eff)
+            dh_pos = np.maximum(dh_raw, 0.0)
+            moving_step = (~idle_mask[1:]).astype(float) if idle_mask.size > 1 else np.zeros(0)
+            gross_before = float(dh_pos.sum())
+            gross_after = float((dh_pos * moving_step).sum()) if moving_step.size else gross_before
+            gross_removed = max(0.0, gross_before - gross_after)
+
+            durations: List[float] = []
+            segments_detail: List[Dict[str, float]] = []
+            i = 0
+            while i < n:
+                if idle_mask[i]:
+                    start_idx = i
+                    start_t = float(t[i])
+                    while i < n and idle_mask[i]:
+                        i += 1
+                    end_idx = i - 1
+                    end_t = float(t[end_idx]) if end_idx >= 0 else start_t
+                    dur = max(0.0, end_t - start_t)
+                    durations.append(dur)
+                    raw_gain_seg = 0.0
+                    gated_gain_seg = 0.0
+                    if end_idx > start_idx and dh_pos.size >= end_idx:
+                        raw_gain_seg = float(dh_pos[start_idx:end_idx].sum())
+                        if moving_step.size >= end_idx:
+                            gated_gain_seg = float(
+                                (dh_pos[start_idx:end_idx] * moving_step[start_idx:end_idx]).sum()
+                            )
+                    segments_detail.append(
+                        {
+                            "start_s": start_t,
+                            "end_s": end_t,
+                            "duration_s": dur,
+                            "raw_gain_m": raw_gain_seg,
+                            "gated_gain_m": gated_gain_seg,
+                        }
+                    )
+                else:
+                    i += 1
+
+            span = float(t[-1] - t[0]) if n > 1 else 0.0
+            idle_time = float(sum(durations))
+            idle_fraction = (idle_time / span) if span > 1e-9 else 0.0
+            median_duration = float(np.median(durations)) if durations else 0.0
+
+            top_segments = sorted(
+                segments_detail,
+                key=lambda seg: seg.get("raw_gain_m", 0.0),
+                reverse=True,
+            )[:3]
+
+            diag["idle_time_fraction"] = idle_fraction
+            diag["idle_total_time_s"] = idle_time
+            diag["idle_segments"] = segments_count
+            diag["idle_median_duration_s"] = median_duration
+            diag["idle_thresholds"] = {
+                "V_ON": float(V_ON),
+                "V_OFF": float(V_OFF),
+                "CAD_ON": float(CAD_ON),
+                "CAD_OFF": float(CAD_OFF),
+                "DS_ON": float(DS_ON),
+                "DS_OFF": float(DS_OFF),
+                "VV_ON": float(VV_ON),
+                "VV_OFF": float(VV_OFF),
+                "T_enter": float(T_enter),
+                "T_exit": float(T_exit),
+            }
+            diag["idle_v_noise_mps"] = float(v_noise)
+            diag["idle_v_baseline_mps"] = float(v_baseline)
+            diag["idle_window_s"] = float(window_s)
+            diag["idle_drift_limit_mps"] = float(drift_limit)
+            diag["idle_indoor_mode"] = bool(indoor)
+            diag["idle_has_distance"] = bool(dist_samples_t)
+            diag["idle_has_cadence"] = bool(cad_samples_t)
+            diag["idle_gross_before_m"] = gross_before
+            diag["idle_gross_after_m"] = gross_after
+            diag["idle_gross_removed_m"] = gross_removed
+            diag["idle_segments_detail"] = top_segments
+        except Exception:
+            pass
+
+    try:
+        idle_pct = 100.0 * float(np.mean(idle_mask)) if n > 0 else 0.0
+        logging.debug(
+            "Idle detection: indoor=%s idle=%.1f%% segments=%d V_ON=%.2f V_OFF=%.2f cad_on=%.1f vv_on=%.3f",
+            indoor,
+            idle_pct,
+            segments_count,
+            V_ON,
+            V_OFF,
+            CAD_ON,
+            VV_ON,
+        )
+    except Exception:
+        pass
+
+    return alt_adj, moving_mask, idle_mask
+
+
 def _cum_ascent_from_alt(
     alt: np.ndarray,
     eps_gain: float = 0.05,
     mode: str = "uprun",
     diag: Optional[Dict[str, Any]] = None,
+    moving_mask: Optional[np.ndarray] = None,
 ) -> List[float]:
     """Compute cumulative gross ascent from an effective altitude trace.
 
     - mode='uprun': apply epsilon once per contiguous positive run (recommended).
     - mode='sample': apply epsilon to each positive increment (legacy).
     - mode='none': no epsilon.
+    - moving_mask: optional bool mask (length n) where True allows accumulation
+      for samples deemed "moving" by idle detection.
     """
     n = alt.size
     if n == 0:
@@ -1059,9 +1653,17 @@ def _cum_ascent_from_alt(
     up_runs = 0
     pos_steps = 0
     run_gain = 0.0
+    moving_flags: Optional[np.ndarray]
+    if moving_mask is not None and moving_mask.shape[0] == n:
+        moving_flags = moving_mask.astype(bool)
+    else:
+        moving_flags = None
     for i in range(1, n):
         dv = float(alt[i] - alt[i - 1])
-        if dv > 0:
+        move_allowed = True
+        if moving_flags is not None:
+            move_allowed = bool(moving_flags[i])
+        if dv > 0 and move_allowed:
             pos_steps += 1
             if mode == "sample":
                 cum += max(0.0, dv - eps)
@@ -1965,8 +2567,23 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
         except Exception:
             pass
         alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med, diag)
+        indoor_hint = _infer_indoor_mode(session)
+        alt_idle, moving_mask, _ = _apply_idle_detection(
+            session,
+            t_alt,
+            alt_eff,
+            diag,
+            t0,
+            indoor_hint=indoor_hint,
+        )
         eps_gain = 0.02
-        cum_series = _cum_ascent_from_alt(alt_eff, eps_gain, mode="uprun", diag=diag)
+        cum_series = _cum_ascent_from_alt(
+            alt_idle,
+            eps_gain,
+            mode="uprun",
+            diag=diag,
+            moving_mask=moving_mask,
+        )
         # Log diagnostics at DEBUG level
         try:
             logging.debug(
