@@ -641,9 +641,31 @@ def _build_timeseries(
             if val.size:
                 grade_med = float(np.median(np.clip(val / 100.0, -1.0, 1.0)))
         diag: Dict[str, Any] = {}
+        # Additional speed/grade diagnostics
+        try:
+            # Speed fractions over time
+            if any(d is not None for d in d_all):
+                d_arr = np.asarray([float(d) if d is not None else np.nan for d in d_all], dtype=np.float64)
+                t_arr = np.asarray(t_all, dtype=np.float64)
+                dt = np.diff(t_arr)
+                dd = np.diff(d_arr)
+                mask = (~np.isnan(dd)) & (dt > 1e-6)
+                if np.any(mask):
+                    v = dd[mask] / dt[mask]
+                    dtm = dt[mask]
+                    low = dtm[v < 0.5].sum() if np.any(v < 0.5) else 0.0
+                    diag["speed_low_time_pct"] = float(low / dtm.sum()) if dtm.sum() > 0 else 0.0
+            # Grade fraction by samples
+            if any(i is not None for i in inc_all):
+                inc_arr = np.asarray([float(x) if x is not None else np.nan for x in inc_all], dtype=np.float64)
+                steep = np.count_nonzero(inc_arr > 10.0)
+                total = np.count_nonzero(~np.isnan(inc_arr))
+                diag["grade_steep_sample_pct"] = float(steep / total) if total > 0 else 0.0
+        except Exception:
+            pass
         alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med, diag)
-        # Cumulative ascent (uprun epsilon)
-        eps_gain = 0.05
+        # Cumulative ascent (uprun epsilon, baro/GNSS defaults lower)
+        eps_gain = 0.02
         cum_series = _cum_ascent_from_alt(alt_eff, eps_gain, mode="uprun", diag=diag)
         for i in range(t_alt.size):
             times.append(float(t_alt[i]))
@@ -652,7 +674,7 @@ def _build_timeseries(
         try:
             logging.debug(
                 "Altitude ascent diagnostics: n=%d net=%.1fm peak(start->max)=%.1fm range=%.1fm gross_noeps=%.1fm gross_eps=%.1fm eps_loss=%.1fm(%.0f%%) "
-                "up_runs=%d pos_steps=%d eps_mode=%s neg_pre=%.1fm neg_post=%.1fm spikes=%d hampel=%d T=%.2fs speed_med=%.2f m/s grade_med=%.2f%%",
+                "up_runs=%d pos_steps=%d eps_mode=%s neg_pre=%.1fm neg_post=%.1fm spikes=%d hampel=%d T=%.2fs speed_med=%.2f m/s grade_med=%.2f%% speed<0.5=%.0f%% grade>10=%.0f%%",
                 diag.get("n_alt", 0),
                 diag.get("net_gain_m", float('nan')),
                 diag.get("peak_gain_from_start_m", float('nan')),
@@ -671,6 +693,8 @@ def _build_timeseries(
                 diag.get("closing_T_s", float('nan')),
                 diag.get("speed_med_mps", float('nan')),
                 100.0 * diag.get("grade_med_frac", float('nan')),
+                100.0 * diag.get("speed_low_time_pct", 0.0),
+                100.0 * diag.get("grade_steep_sample_pct", 0.0),
             )
         except Exception:
             pass
@@ -950,11 +974,13 @@ def _effective_altitude_path(
     # Quantization repair via local quadratic smoothing (tiny bandwidth)
     z2 = _local_poly_smooth(t, z1, min_span_s=0.4, max_points=7, poly=2)
     # Time-scale selection
-    sp = max(0.5, float(speed_med))
-    T = 4.0 * (1.5 / sp) ** 0.5
-    T = float(max(3.0, min(8.0, T)))
-    if grade_med > 0.20:
-        T = max(3.0, 0.8 * T)
+    sp = max(0.01, float(speed_med))
+    base_T = 4.0
+    if grade_med > 0.10:
+        base_T *= 0.7
+    if sp < 1.0:
+        base_T *= max(0.6, sp / 1.0)
+    T = float(max(3.0, min(6.0, base_T)))
     # Morphological closing to remove micro-descents
     zc = _morphological_closing_time(t, z2, T)
     # Weak post-smoothing to remove quantization
@@ -1915,14 +1941,37 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
                 grade_med = float(np.median(np.clip(val / 100.0, -1.0, 1.0)))
 
         diag: Dict[str, Any] = {}
+        # Additional diagnostics (speed/grade fractions) similar to _build_timeseries
+        try:
+            d_all = [r.get("dist") for r in session]
+            t_all = [times[i] for i in range(len(session))]
+            if any(d is not None for d in d_all):
+                d_arr = np.asarray([float(d) if d is not None else np.nan for d in d_all], dtype=np.float64)
+                t_arr = np.asarray(t_all, dtype=np.float64)
+                dt = np.diff(t_arr)
+                dd = np.diff(d_arr)
+                mask = (~np.isnan(dd)) & (dt > 1e-6)
+                if np.any(mask):
+                    v = dd[mask] / dt[mask]
+                    dtm = dt[mask]
+                    low = dtm[v < 0.5].sum() if np.any(v < 0.5) else 0.0
+                    diag["speed_low_time_pct"] = float(low / dtm.sum()) if dtm.sum() > 0 else 0.0
+            inc_all = [r.get("inc") for r in session]
+            if any(i is not None for i in inc_all):
+                inc_arr = np.asarray([float(x) if x is not None else np.nan for x in inc_all], dtype=np.float64)
+                steep = np.count_nonzero(inc_arr > 10.0)
+                total = np.count_nonzero(~np.isnan(inc_arr))
+                diag["grade_steep_sample_pct"] = float(steep / total) if total > 0 else 0.0
+        except Exception:
+            pass
         alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med, diag)
-        eps_gain = 0.05
+        eps_gain = 0.02
         cum_series = _cum_ascent_from_alt(alt_eff, eps_gain, mode="uprun", diag=diag)
         # Log diagnostics at DEBUG level
         try:
             logging.debug(
                 "Altitude ascent diagnostics: n=%d net=%.1fm peak(start->max)=%.1fm range=%.1fm gross_noeps=%.1fm gross_eps=%.1fm eps_loss=%.1fm(%.0f%%) "
-                "up_runs=%d pos_steps=%d eps_mode=%s neg_pre=%.1fm neg_post=%.1fm spikes=%d hampel=%d T=%.2fs speed_med=%.2f m/s grade_med=%.2f%%",
+                "up_runs=%d pos_steps=%d eps_mode=%s neg_pre=%.1fm neg_post=%.1fm spikes=%d hampel=%d T=%.2fs speed_med=%.2f m/s grade_med=%.2f%% speed<0.5=%.0f%% grade>10=%.0f%%",
                 diag.get("n_alt", 0),
                 diag.get("net_gain_m", float('nan')),
                 diag.get("peak_gain_from_start_m", float('nan')),
@@ -1941,6 +1990,8 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
                 diag.get("closing_T_s", float('nan')),
                 diag.get("speed_med_mps", float('nan')),
                 100.0 * diag.get("grade_med_frac", float('nan')),
+                100.0 * diag.get("speed_low_time_pct", 0.0),
+                100.0 * diag.get("grade_steep_sample_pct", 0.0),
             )
         except Exception:
             pass
