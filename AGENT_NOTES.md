@@ -27,6 +27,7 @@ Curve Algorithm
 - Complexity stays linear in samples per duration even for multi-day spans, and the dense short-duration behaviour is unaffected.
 - Optional Numba engine jit-compiles the exhaustive sweep (parallel `prange`, pointer-based envelope lookups, gap skipping) and drops wall-clock by another ~5×; a stride engine reuses uniform 1 Hz cumulative sums when available.
 - Parsing can fan out across threads via `--parse-workers` (fitparse releases the GIL); use `--profile` to log parse/merge/curve/plot timings when chasing regressions.
+- Parsed FIT files are cached under `.cache/parsed_fit` keyed by mtime/size so repeated runs skip base decoding; remove that directory to invalidate the cache.
 
 Diagnostics
 -----------

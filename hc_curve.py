@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple, Dict, Any, Set, NamedTuple, Union, Literal
 import json
+import pickle
 
 import numpy as np
 try:
@@ -53,6 +54,11 @@ if "XDG_CACHE_HOME" not in os.environ:
     except Exception:
         pass
 
+_PARSED_FIT_CACHE_DIR = os.path.join(_BASE_DIR, ".cache", "parsed_fit")
+
+_MATPLOTLIB_STYLE_READY = False
+
+
 
 # -----------------
 # Data structures
@@ -78,6 +84,16 @@ class _StageProfiler:
         now = time.perf_counter()
         logging.info("Profile %-18s %.3fs", label, now - self._last)
         self._last = now
+
+
+def _ensure_matplotlib_style(plt) -> None:
+    global _MATPLOTLIB_STYLE_READY
+    if not _MATPLOTLIB_STYLE_READY:
+        try:
+            plt.style.use("ggplot")
+        except Exception:
+            pass
+        _MATPLOTLIB_STYLE_READY = True
 
 
 SOURCE_NAME_MAP = {
@@ -176,7 +192,80 @@ def _pick_total_gain_key(sample_values: dict) -> Optional[str]:
     return candidates[0] if candidates else None
 
 
+def _fit_cache_paths(fit_path: str) -> Tuple[Optional[str], Optional[str], Optional[os.stat_result]]:
+    try:
+        st = os.stat(fit_path)
+    except OSError:
+        return None, None, None
+    os.makedirs(_PARSED_FIT_CACHE_DIR, exist_ok=True)
+    base = os.path.basename(fit_path)
+    cache_name = f"{base}.{st.st_mtime_ns}.{st.st_size}.pkl"
+    cache_path = os.path.join(_PARSED_FIT_CACHE_DIR, cache_name)
+    prefix = os.path.join(_PARSED_FIT_CACHE_DIR, base + ".")
+    return cache_path, prefix, st
+
+
+def _load_fit_cache(fit_path: str) -> Optional[List[Dict[str, Any]]]:
+    cache_path, _, st = _fit_cache_paths(fit_path)
+    if cache_path is None or st is None:
+        return None
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "rb") as fh:
+            data = pickle.load(fh)
+    except Exception:
+        return None
+    meta = data.get("meta") if isinstance(data, dict) else None
+    if not isinstance(meta, dict):
+        return None
+    if meta.get("mtime_ns") != st.st_mtime_ns or meta.get("size") != st.st_size:
+        return None
+    records = data.get("records")
+    if isinstance(records, list):
+        return records
+    return None
+
+
+def _save_fit_cache(fit_path: str, records: List[Dict[str, Any]]) -> None:
+    cache_path, prefix, st = _fit_cache_paths(fit_path)
+    if cache_path is None or st is None or prefix is None:
+        return
+    payload = {
+        "meta": {"mtime_ns": st.st_mtime_ns, "size": st.st_size},
+        "records": records,
+    }
+    tmp_path = cache_path + ".tmp"
+    try:
+        with open(tmp_path, "wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, cache_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return
+    base = os.path.basename(fit_path)
+    try:
+        for fname in os.listdir(_PARSED_FIT_CACHE_DIR):
+            if not fname.startswith(base + ".") or not fname.endswith(".pkl"):
+                continue
+            if fname == os.path.basename(cache_path):
+                continue
+            try:
+                os.remove(os.path.join(_PARSED_FIT_CACHE_DIR, fname))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _parse_single_fit_records(fit_path: str, file_id: int) -> List[Dict[str, Any]]:
+    cached = _load_fit_cache(fit_path)
+    if cached is not None:
+        return [dict(rec, file_id=file_id) for rec in cached]
     _require_dependency(FitFile, "fitparse", "pip install fitparse")
     fit = FitFile(fit_path)
     fit.parse()
@@ -294,6 +383,22 @@ def _parse_single_fit_records(fit_path: str, file_id: int) -> List[Dict[str, Any
             "dist": dist_val,
             "dist_prio": dist_prio,
         })
+    try:
+        records_for_cache = [
+            {
+                "t": rec["t"],
+                "file_id": rec.get("file_id", 0),
+                "alt": rec.get("alt"),
+                "tg": rec.get("tg"),
+                "inc": rec.get("inc"),
+                "dist": rec.get("dist"),
+                "dist_prio": rec.get("dist_prio", 0),
+            }
+            for rec in out
+        ]
+        _save_fit_cache(fit_path, records_for_cache)
+    except Exception:
+        pass
     return out
 
 
@@ -2776,6 +2881,8 @@ def _plot_curve(
     except Exception as e:  # pragma: no cover
         raise RuntimeError("matplotlib is required for plotting. Install with: pip install matplotlib") from e
 
+    _ensure_matplotlib_style(plt)
+
     durs = [cp.duration_s for cp in curve]
     rates = [cp.climb_rate_m_per_hr for cp in curve]
     climbs = [cp.max_climb_m for cp in curve]
@@ -2787,7 +2894,7 @@ def _plot_curve(
         return False
     dense = len(curve) > 100
 
-    plt.style.use("ggplot")
+    _ensure_matplotlib_style(plt)
     fig, ax = plt.subplots(figsize=(12, 7))
 
     ax.plot(durs, rates, marker="" if dense else "o", linewidth=1.8, color=USER_COLOR, label="Climb rate (m/h)")
@@ -2977,8 +3084,11 @@ def _plot_curve(
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax.legend(lines + lines2, labels + labels2, loc="upper right")
 
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=200)
+    if fast_plot:
+        fig.savefig(out_png, dpi=150)
+    else:
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=200)
     plt.close(fig)
 
 
@@ -3010,6 +3120,8 @@ def _plot_split(
     except Exception as e:  # pragma: no cover
         raise RuntimeError("matplotlib is required for plotting. Install with: pip install matplotlib") from e
 
+    _ensure_matplotlib_style(plt)
+
     durs = [cp.duration_s for cp in curve]
     rates = [cp.climb_rate_m_per_hr for cp in curve]
     climbs = [cp.max_climb_m for cp in curve]
@@ -3034,7 +3146,6 @@ def _plot_split(
     axis_durations, xmin, xmax = _prepare_duration_axis_values(durs, full_span_seconds, extra_durations)
 
     # Rate plot
-    plt.style.use("ggplot")
     fig1, ax1 = plt.subplots(figsize=(12, 7))
 
     ax1.plot(durs, rates, marker="" if dense else "o", linewidth=1.8, color=USER_COLOR, label="Climb rate (m/h)")
@@ -3194,9 +3305,12 @@ def _plot_split(
 
     ax1.set_title(f"Ascent Rate Curve — {source_label}")
     ax1.legend(loc="upper right")
-    fig1.tight_layout()
     rate_path = out_png_base.replace('.png', '_rate.png') if out_png_base.endswith('.png') else out_png_base + '_rate.png'
-    fig1.savefig(rate_path, dpi=200)
+    if fast_plot:
+        fig1.savefig(rate_path, dpi=150)
+    else:
+        fig1.tight_layout()
+        fig1.savefig(rate_path, dpi=200)
     plt.close(fig1)
 
     # Climb plot
@@ -3344,9 +3458,12 @@ def _plot_split(
     axc.set_ylim(top=ymax * 1.15 if ymax > 0 else axc.get_ylim()[1])
 
     axc.legend(loc="lower right")
-    fig2.tight_layout()
     climb_path = out_png_base.replace('.png', '_climb.png') if out_png_base.endswith('.png') else out_png_base + '_climb.png'
-    fig2.savefig(climb_path, dpi=200)
+    if fast_plot:
+        fig2.savefig(climb_path, dpi=150)
+    else:
+        fig2.tight_layout()
+        fig2.savefig(climb_path, dpi=200)
     plt.close(fig2)
 
 DEFAULT_DURATIONS = [60, 120, 300, 600, 1200, 1800, 3600]

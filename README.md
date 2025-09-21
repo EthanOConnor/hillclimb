@@ -74,6 +74,7 @@ Notes
 - Install `numba` to enable the just-in-time engine that brings another ~5× speedup for exhaustive grids (`pip install numba`).
 - `--parse-workers` lets you overlap FIT decoding across files; `--profile` logs parse/merge/curve/plot timings so you can spot slow stages quickly.
 - Keep `--fast-plot` enabled for day-to-day use; disable it when you need the detailed annotations on the PNGs.
+- Parsed FIT records are cached under `.cache/parsed_fit`; delete the cache if you want to force a re-parse after editing source files.
 - If developer total gain is present in any file (e.g., NPE Runn), it is preferred and stitched across files, handling counter resets at file boundaries.
 - If no total gain is present but treadmill `incline` and `distance` exist (e.g., `inclineRunn` + `distance`), ascent is derived by integrating positive vertical: `delta_vertical = max(incline,0)% * delta_distance`.
 - Otherwise altitude-derived ascent is computed as the sum of positive elevation deltas.
