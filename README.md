@@ -45,7 +45,7 @@ Options:
 - `--output, -o`: Output CSV path (default: `curve.csv`).
 - `--durations, -d`: Durations in seconds (default: 60, 120, 300, 600, 1200, 1800, 3600).
 - `--all`: Exact per-second curve across the whole activity (recommended).
-- `--exhaustive`: Evaluate a grid of durations (use `--step`).
+- `--exhaustive`: Evaluate a multi-resolution duration grid (dense 1s up to ~2h, geometric above; tweak short-range density with `--step`).
 - `--step`: Step size in seconds for exhaustive durations (default 1s).
 - `--max-duration`: Limit maximum duration (seconds) when using `--exhaustive`.
 - `--source`: `auto` (default), `runn`, or `altitude`.
@@ -65,6 +65,7 @@ CSV columns
 Notes
 -----
 - You can pass multiple FIT files; timelines are merged by timestamp. If files overlap, windows extend across files as one continuous activity.
+- `--exhaustive` caches cumulative gain samples, prunes gap-only windows, and uses the multi-resolution grid so multi-day sweeps finish quickly without changing results.
 - If developer total gain is present in any file (e.g., NPE Runn), it is preferred and stitched across files, handling counter resets at file boundaries.
 - If no total gain is present but treadmill `incline` and `distance` exist (e.g., `inclineRunn` + `distance`), ascent is derived by integrating positive vertical: `delta_vertical = max(incline,0)% * delta_distance`.
 - Otherwise altitude-derived ascent is computed as the sum of positive elevation deltas.
@@ -75,7 +76,7 @@ Common developer-named fields are auto-detected when present, including:
 - `total_ascent`, `total_gain`, and variants (treated as cumulative ascent)
 - `total_distance` (preferred distance source, used over `enhanced_distance`/`distance` when present)
 - `inclineRunn` (incline percent)
-- The algorithm uses a two-pointer sweep with interpolation at window end for efficiency (O(n) per duration). For the provided seven durations, this is plenty fast for typical activities.
+- The curve search vectorizes start/end-aligned windows with cached envelope lookups (NumPy `searchsorted`) and gap-aware skipping, keeping per-duration work linear even on multi-day spans.
 
 Version discovery
 -----------------

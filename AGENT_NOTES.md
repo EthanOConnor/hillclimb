@@ -20,9 +20,11 @@ Merging
 
 Curve Algorithm
 ---------------
-- Build monotonically non-decreasing cumulative gain series G(t).
-- For each duration D, slide over sample starts i; binary-advance j pointer to the first t[j] ≥ t[i]+D; linearly interpolate G at window end; track max G_end - G_start.
-- Complexity: O(n) per duration; fast for typical activities.
+- Build monotonically non-decreasing cumulative gain series G(t) and store it as piecewise-linear segments (ex, ey, slope).
+- Precompute U(times[i]) once, then vectorize start- and end-aligned windows while evaluating the opposite boundary via NumPy `searchsorted` interpolation.
+- Skip end-aligned candidates that fall wholly inside inactivity gaps when D is shorter than the gap, keeping scans focused on real activity.
+- Durations use a multi-resolution grid: 1s steps to 2h, then ~1% geometric increments rounded to “nice” minutes/hours/days plus curated anchors (3h, 4h, daily, weekly, etc.).
+- Complexity stays linear in samples per duration even for multi-day spans, and the dense short-duration behaviour is unaffected.
 
 Diagnostics
 -----------
@@ -37,4 +39,3 @@ Potential Next Steps
 - Add JSON export with metadata (files, selected source, sampling stats).
 - Optional smoothing/interpolation for prettier curves on sparse data.
 - Unit tests for parser and curve math using synthetic FIT-like inputs.
-

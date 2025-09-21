@@ -6,7 +6,7 @@ import logging
 import math
 import copy
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple, Dict, Any, Set, NamedTuple
+from typing import Iterable, List, Optional, Tuple, Dict, Any, Set, NamedTuple, Union
 import json
 
 import numpy as np
@@ -535,6 +535,43 @@ def _interp_cum_gain(
     return g1 + frac * (g2 - g1)
 
 
+def U_eval_many(
+    ex: np.ndarray, ey: np.ndarray, slopes: np.ndarray, t: Union[np.ndarray, float]
+) -> np.ndarray:
+    """Vectorized evaluation of the cumulative gain envelope at times ``t``.
+
+    Outside the knot domain the value is clamped to the endpoint gains to match the
+    behaviour of the legacy interpolator.
+    """
+
+    if ex.size == 0:
+        return np.zeros_like(np.asarray(t, dtype=np.float64))
+
+    t_arr = np.asarray(t, dtype=np.float64)
+    j = np.searchsorted(ex, t_arr, side="left")
+
+    result = np.empty_like(t_arr, dtype=np.float64)
+
+    mask_low = j <= 0
+    mask_high = j >= ex.size
+    mask_core = (~mask_low) & (~mask_high)
+
+    if np.any(mask_low):
+        result[mask_low] = ey[0]
+    if np.any(mask_high):
+        result[mask_high] = ey[-1]
+    if np.any(mask_core):
+        core_indices = j[mask_core]
+        k = core_indices - 1
+        result[mask_core] = ey[k] + slopes[k] * (t_arr[mask_core] - ex[k])
+
+    return result
+
+
+def U_eval_np(ex: np.ndarray, ey: np.ndarray, slopes: np.ndarray, t: float) -> float:
+    return float(U_eval_many(ex, ey, slopes, np.asarray([t], dtype=np.float64))[0])
+
+
 class Gap(NamedTuple):
     start: float
     end: float
@@ -613,132 +650,113 @@ def compute_curve(
     n = len(times)
     if n == 0:
         return results
+
+    times_np = np.asarray(times, dtype=np.float64)
+    gains_np = np.asarray(cumulative_gain, dtype=np.float64)
+    if times_np.shape != gains_np.shape:
+        raise ValueError("times and cumulative_gain must have the same length")
+
+    ex = times_np
+    ey = gains_np
+
+    if ex.size >= 2:
+        dt = np.diff(ex)
+        dg = np.diff(ey)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            slopes = np.divide(
+                dg,
+                dt,
+                out=np.zeros_like(dg),
+                where=np.abs(dt) > 1e-12,
+            )
+    else:
+        slopes = np.zeros(1, dtype=np.float64)
+
+    U_at_sample = U_eval_many(ex, ey, slopes, times_np)
+
+    gaps_list = gaps or []
+    start_time_min = float(ex[0])
+    end_time_max = float(ex[-1])
+
+    eps = 1e-9
+
     for D in durations:
         D = int(D)
-        if D <= 0 or times[0] + D > times[-1] + 1e-9:
-            results.append(CurvePoint(D, 0.0, 0.0, 0.0, 0.0))
+        if D <= 0 or start_time_min + D > end_time_max + eps:
+            results.append(CurvePoint(D, 0.0, 0.0, start_time_min, start_time_min))
             continue
 
-        t_min = times[0]
-        t_max = times[-1] - D
+        best_gain = -math.inf
+        best_start = start_time_min
 
-        # Pointers for interpolation at start (p) and end (q)
-        # p: smallest index with times[p] >= t
-        # q: smallest index with times[q] >= t + D
-        # Initialize indices
-        # ai: index into start-candidate list S = times
-        # k: index into end-candidate list E where e = times[k] - D
-        # Start ai at first S >= t_min; k at first times[k] >= t_min + D
-        import bisect
-        ai = bisect.bisect_left(times, t_min)
-        k = bisect.bisect_left(times, t_min + D)
-        p = ai
-        q = k
+        # Start-aligned windows (t = times_np)
+        t_plus = times_np + D
+        valid_start = t_plus <= end_time_max + eps
+        if np.any(valid_start):
+            starts = times_np[valid_start]
+            u_start = U_at_sample[valid_start]
+            u_end = U_eval_many(ex, ey, slopes, t_plus[valid_start])
+            gains_start = u_end - u_start
+            if gains_start.size:
+                idx = int(np.argmax(gains_start))
+                gain_val = float(gains_start[idx])
+                if gain_val > best_gain:
+                    best_gain = gain_val
+                    best_start = float(starts[idx])
 
-        best_gain = -1.0
-        best_t = t_min
+        # End-aligned windows (t + D = times_np)
+        t_minus = times_np - D
+        valid_end = t_minus >= start_time_min - eps
+        if np.any(valid_end):
+            ends = times_np[valid_end]
+            starts_end = t_minus[valid_end]
+            u_end = U_at_sample[valid_end]
+            u_start = U_eval_many(ex, ey, slopes, starts_end)
+            gains_end = u_end - u_start
 
-        def next_s():
-            return times[ai] if ai < n else float("inf")
+            if gaps_list and gains_end.size:
+                invalid = np.zeros_like(gains_end, dtype=bool)
+                for gap in gaps_list:
+                    if D <= gap.length + eps:
+                        gap_lo = gap.start
+                        gap_hi = gap.end - D
+                        if gap_hi < gap_lo:
+                            continue
+                        mask = (starts_end >= gap_lo - eps) & (starts_end <= gap_hi + eps)
+                        if np.any(mask):
+                            invalid |= mask
+                if np.any(invalid):
+                    keep = ~invalid
+                    gains_end = gains_end[keep]
+                    starts_end = starts_end[keep]
+            if gains_end.size:
+                idx = int(np.argmax(gains_end))
+                gain_val = float(gains_end[idx])
+                if gain_val > best_gain:
+                    best_gain = gain_val
+                    best_start = float(starts_end[idx])
 
-        def next_e():
-            return (times[k] - D) if k < n else float("inf")
-
-        dead_k_ranges: List[Tuple[int, int]] = []
-        if gaps:
-            import bisect as _bis
-
-            for g in gaps:
-                if D <= g.length:
-                    k_lo = _bis.bisect_left(times, g.start + D)
-                    k_hi = _bis.bisect_right(times, g.end)
-                    if k_lo < k_hi:
-                        dead_k_ranges.append((k_lo, k_hi))
-            if dead_k_ranges:
-                dead_k_ranges.sort()
-                merged: List[Tuple[int, int]] = []
-                for lo, hi in dead_k_ranges:
-                    if not merged or lo > merged[-1][1]:
-                        merged.append((lo, hi))
-                    else:
-                        merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
-                dead_k_ranges = merged
-        skipped_candidates = 0
-        if dead_k_ranges:
-            skipped_candidates = sum(max(0, min(n, hi) - lo) for lo, hi in dead_k_ranges)
-            if skipped_candidates and D in (60, 600, 3600):
-                logging.info(
-                    "Gap skip: D=%ss skipped %d end candidates across %d gaps",
-                    D,
-                    skipped_candidates,
-                    len(dead_k_ranges),
-                )
-
-        dead_idx = 0
-
-        def _skip_dead_k(curr_k: int) -> int:
-            nonlocal dead_idx
-            if not dead_k_ranges:
-                return curr_k
-            while dead_idx < len(dead_k_ranges):
-                lo, hi = dead_k_ranges[dead_idx]
-                if curr_k < lo:
-                    break
-                if lo <= curr_k < hi:
-                    curr_k = hi
-                    continue
-                dead_idx += 1
-            return curr_k
-
-        while True:
-            k = _skip_dead_k(k)
-            ts = next_s()
-            te = next_e()
-            t = ts if ts <= te else te
-            if dead_k_ranges and gaps:
-                for g in gaps:
-                    if D <= g.length:
-                        interior_start = g.start + 1e-6
-                        interior_end = g.end - D - 1e-6
-                        if interior_start <= interior_end and interior_start < t < interior_end:
-                            raise AssertionError(
-                                f"Gap skip failed for D={D}s inside gap {g.start}-{g.end}"
-                            )
-            if t > t_max + 1e-12:
-                break
-            # Advance candidate indices if consumed
-            if ts <= te:
-                ai += 1
-            if te <= ts:
-                k += 1
-
-            # Advance p so that times[p] >= t
-            while p < n and times[p] < t:
-                p += 1
-            # Advance q so that times[q] >= t + D
-            t_end = t + D
-            while q < n and times[q] < t_end:
-                q += 1
-
-            G_start = _interp_cum_gain(t, times, cumulative_gain, p)
-            G_end = _interp_cum_gain(t_end, times, cumulative_gain, q)
-            gain = G_end - G_start
-            if gain > best_gain:
-                best_gain = gain
-                best_t = t
-
-        if best_gain < 0:
+        if not math.isfinite(best_gain) or best_gain < 0:
             best_gain = 0.0
+            best_start = start_time_min
+
+        window_start_cap = max(start_time_min, end_time_max - D)
+        if window_start_cap < start_time_min:
+            window_start_cap = start_time_min
+        best_start = min(max(best_start, start_time_min), window_start_cap)
+
+        end_offset = best_start + D
         rate_m_per_hr = best_gain / D * 3600.0 if D > 0 else 0.0
         results.append(
             CurvePoint(
                 duration_s=D,
                 max_climb_m=best_gain,
                 climb_rate_m_per_hr=rate_m_per_hr,
-                start_offset_s=best_t,
-                end_offset_s=best_t + D,
+                start_offset_s=best_start,
+                end_offset_s=end_offset,
             )
         )
+
     return results
 
 

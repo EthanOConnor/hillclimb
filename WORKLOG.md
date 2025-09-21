@@ -18,6 +18,12 @@ Visualization
 -------------
 - Added matplotlib plot generation (PNG) alongside CSV with dual-axis design.
 
+Performance Improvements
+------------------------
+- Reworked `compute_curve` to cache cumulative gain values per sample, vectorize start/end window gains via NumPy `searchsorted`, and skip end-aligned windows that live entirely inside inactivity gaps.
+- Added a multi-resolution duration grid (dense seconds up to ~2h, geometric above with curated anchors) so the `--exhaustive` sweep remains exact where it matters but scales to multi-day spans.
+- Documented the new behaviour in `README.md` and `AGENT_NOTES.md` for future maintainers.
+
 Repo Setup
 ----------
 - To be initialized as a git repository with initial commit including docs.
