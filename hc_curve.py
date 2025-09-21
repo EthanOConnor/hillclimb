@@ -649,14 +649,23 @@ def _build_timeseries(
         # Diagnostics
         try:
             dz3 = np.diff(alt_eff)
+            gross_noeps = float(np.sum(np.maximum(0.0, dz3))) if dz3.size else 0.0
             gross_eps = float(np.sum(np.maximum(0.0, dz3 - eps_gain))) if dz3.size else 0.0
+            eps_loss = max(0.0, gross_noeps - gross_eps)
+            diag["gross_eps_m"] = gross_eps
+            diag["eps_loss_m"] = eps_loss
+            diag["eps_loss_pct"] = (eps_loss / gross_noeps) if gross_noeps > 1e-9 else 0.0
             logging.debug(
-                "Altitude ascent diagnostics: n=%d net=%.1fm gross_noeps=%.1fm gross_eps=%.1fm "
+                "Altitude ascent diagnostics: n=%d net=%.1fm peak(start->max)=%.1fm range=%.1fm gross_noeps=%.1fm gross_eps=%.1fm eps_loss=%.1fm(%.0f%%) "
                 "neg_pre=%.1fm neg_post=%.1fm spikes=%d hampel=%d T=%.2fs speed_med=%.2f m/s grade_med=%.2f%%",
                 diag.get("n_alt", 0),
                 diag.get("net_gain_m", float('nan')),
+                diag.get("peak_gain_from_start_m", float('nan')),
+                diag.get("range_max_min_m", float('nan')),
                 diag.get("gross_noeps_m", float('nan')),
                 gross_eps,
+                eps_loss,
+                100.0 * diag.get("eps_loss_pct", 0.0),
                 diag.get("neg_sum_pre_close_m", float('nan')),
                 diag.get("neg_sum_post_m", float('nan')),
                 diag.get("spike_count", 0),
@@ -980,7 +989,26 @@ def _effective_altitude_path(
             diag["neg_sum_pre_close_m"] = neg_pre
             diag["neg_sum_post_m"] = neg_post
             diag["gross_noeps_m"] = gross_post
-            diag["net_gain_m"] = float(z3[-1] - z3[0]) if z3.size else 0.0
+            start_alt = float(z3[0]) if z3.size else 0.0
+            max_alt = float(np.max(z3)) if z3.size else start_alt
+            min_alt = float(np.min(z3)) if z3.size else start_alt
+            end_alt = float(z3[-1]) if z3.size else start_alt
+            diag["start_alt_m"] = start_alt
+            diag["end_alt_m"] = end_alt
+            diag["max_alt_m"] = max_alt
+            diag["min_alt_m"] = min_alt
+            diag["net_gain_m"] = end_alt - start_alt
+            diag["range_max_min_m"] = max_alt - min_alt
+            diag["peak_gain_from_start_m"] = max_alt - start_alt
+            # Up-run count and pos step stats
+            if dz_s3.size:
+                pos_mask = dz_s3 > 0
+                up_runs = int(np.sum((~pos_mask[:-1]) & pos_mask[1:])) + (1 if pos_mask[0] else 0)
+                diag["up_runs"] = up_runs
+                diag["pos_steps"] = int(np.count_nonzero(pos_mask))
+            else:
+                diag["up_runs"] = 0
+                diag["pos_steps"] = 0
         except Exception:
             pass
     return z3
@@ -1846,14 +1874,23 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
         # Log diagnostics at DEBUG level
         try:
             dz3 = np.diff(alt_eff)
+            gross_noeps = float(np.sum(np.maximum(0.0, dz3))) if dz3.size else 0.0
             gross_eps = float(np.sum(np.maximum(0.0, dz3 - eps_gain))) if dz3.size else 0.0
+            eps_loss = max(0.0, gross_noeps - gross_eps)
+            diag["gross_eps_m"] = gross_eps
+            diag["eps_loss_m"] = eps_loss
+            diag["eps_loss_pct"] = (eps_loss / gross_noeps) if gross_noeps > 1e-9 else 0.0
             logging.debug(
-                "Altitude ascent diagnostics: n=%d net=%.1fm gross_noeps=%.1fm gross_eps=%.1fm "
+                "Altitude ascent diagnostics: n=%d net=%.1fm peak(start->max)=%.1fm range=%.1fm gross_noeps=%.1fm gross_eps=%.1fm eps_loss=%.1fm(%.0f%%) "
                 "neg_pre=%.1fm neg_post=%.1fm spikes=%d hampel=%d T=%.2fs speed_med=%.2f m/s grade_med=%.2f%%",
                 diag.get("n_alt", 0),
                 diag.get("net_gain_m", float('nan')),
+                diag.get("peak_gain_from_start_m", float('nan')),
+                diag.get("range_max_min_m", float('nan')),
                 diag.get("gross_noeps_m", float('nan')),
                 gross_eps,
+                eps_loss,
+                100.0 * diag.get("eps_loss_pct", 0.0),
                 diag.get("neg_sum_pre_close_m", float('nan')),
                 diag.get("neg_sum_post_m", float('nan')),
                 diag.get("spike_count", 0),
