@@ -632,7 +632,8 @@ def _build_timeseries(
             val = inc_arr[~np.isnan(inc_arr)]
             if val.size:
                 grade_med = float(np.median(np.clip(val / 100.0, -1.0, 1.0)))
-        alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med)
+        diag: Dict[str, Any] = {}
+        alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med, diag)
         # Cumulative ascent
         eps_gain = 0.1
         cum = 0.0
@@ -645,6 +646,27 @@ def _build_timeseries(
                 last_z = float(alt_eff[i])
             times.append(float(t_alt[i]))
             G.append(cum)
+        # Diagnostics
+        try:
+            dz3 = np.diff(alt_eff)
+            gross_eps = float(np.sum(np.maximum(0.0, dz3 - eps_gain))) if dz3.size else 0.0
+            logging.debug(
+                "Altitude ascent diagnostics: n=%d net=%.1fm gross_noeps=%.1fm gross_eps=%.1fm "
+                "neg_pre=%.1fm neg_post=%.1fm spikes=%d hampel=%d T=%.2fs speed_med=%.2f m/s grade_med=%.2f%%",
+                diag.get("n_alt", 0),
+                diag.get("net_gain_m", float('nan')),
+                diag.get("gross_noeps_m", float('nan')),
+                gross_eps,
+                diag.get("neg_sum_pre_close_m", float('nan')),
+                diag.get("neg_sum_post_m", float('nan')),
+                diag.get("spike_count", 0),
+                diag.get("hampel_count", 0),
+                diag.get("closing_T_s", float('nan')),
+                diag.get("speed_med_mps", float('nan')),
+                100.0 * diag.get("grade_med_frac", float('nan')),
+            )
+        except Exception:
+            pass
 
     if len(times) < 2:
         raise RuntimeError("Insufficient data to compute curve after merging.")
@@ -897,6 +919,7 @@ def _effective_altitude_path(
     z: np.ndarray,
     speed_med: float = 1.5,
     grade_med: float = 0.0,
+    diag: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     if z.size <= 2:
         return z.copy()
@@ -929,6 +952,37 @@ def _effective_altitude_path(
     zc = _morphological_closing_time(t, z2, T)
     # Weak post-smoothing to remove quantization
     z3 = _local_poly_smooth(t, zc, min_span_s=0.8, max_points=9, poly=2)
+    # Diagnostics (optional)
+    if diag is not None:
+        try:
+            diag["n_alt"] = int(z.size)
+            diag["spike_count"] = int(np.count_nonzero(spike))
+            diag["hampel_count"] = int(np.count_nonzero(hamp))
+            diag["speed_med_mps"] = float(speed_med)
+            diag["grade_med_frac"] = float(grade_med)
+            diag["closing_T_s"] = float(T)
+            # Quantization proxy: MAD of dz before and after smoothing
+            dz_raw = np.diff(z)
+            dz_s2 = np.diff(z2)
+            dz_s3 = np.diff(z3)
+            for key, arr in (("dz_raw", dz_raw), ("dz_preclose", dz_s2), ("dz_post", dz_s3)):
+                if arr.size:
+                    med = float(np.median(arr))
+                    mad = float(np.median(np.abs(arr - med)))
+                else:
+                    med = 0.0; mad = 0.0
+                diag[key+"_med"] = med
+                diag[key+"_mad"] = mad
+            # Negative sums before/after closing
+            neg_pre = float(np.sum(np.maximum(0.0, -dz_s2))) if dz_s2.size else 0.0
+            neg_post = float(np.sum(np.maximum(0.0, -dz_s3))) if dz_s3.size else 0.0
+            gross_post = float(np.sum(np.maximum(0.0, dz_s3))) if dz_s3.size else 0.0
+            diag["neg_sum_pre_close_m"] = neg_pre
+            diag["neg_sum_post_m"] = neg_post
+            diag["gross_noeps_m"] = gross_post
+            diag["net_gain_m"] = float(z3[-1] - z3[0]) if z3.size else 0.0
+        except Exception:
+            pass
     return z3
 
 def _prepare_envelope_arrays(
@@ -1777,7 +1831,8 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
             if val.size:
                 grade_med = float(np.median(np.clip(val / 100.0, -1.0, 1.0)))
 
-        alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med)
+        diag: Dict[str, Any] = {}
+        alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med, diag)
         eps_gain = 0.1
         cum = 0.0
         last_z = float(alt_eff[0]) if alt_eff.size else 0.0
@@ -1788,6 +1843,27 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
                 cum += max(0.0, dv - eps_gain)
             last_z = float(val)
             cum_series.append(cum)
+        # Log diagnostics at DEBUG level
+        try:
+            dz3 = np.diff(alt_eff)
+            gross_eps = float(np.sum(np.maximum(0.0, dz3 - eps_gain))) if dz3.size else 0.0
+            logging.debug(
+                "Altitude ascent diagnostics: n=%d net=%.1fm gross_noeps=%.1fm gross_eps=%.1fm "
+                "neg_pre=%.1fm neg_post=%.1fm spikes=%d hampel=%d T=%.2fs speed_med=%.2f m/s grade_med=%.2f%%",
+                diag.get("n_alt", 0),
+                diag.get("net_gain_m", float('nan')),
+                diag.get("gross_noeps_m", float('nan')),
+                gross_eps,
+                diag.get("neg_sum_pre_close_m", float('nan')),
+                diag.get("neg_sum_post_m", float('nan')),
+                diag.get("spike_count", 0),
+                diag.get("hampel_count", 0),
+                diag.get("closing_T_s", float('nan')),
+                diag.get("speed_med_mps", float('nan')),
+                100.0 * diag.get("grade_med_frac", float('nan')),
+            )
+        except Exception:
+            pass
         for j, idx in enumerate(alt_raw_idx):
             alt_cum[idx] = cum_series[j]
     # Ensure monotone in-place
