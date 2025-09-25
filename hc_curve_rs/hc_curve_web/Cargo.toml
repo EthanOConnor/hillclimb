@@ -1,0 +1,36 @@
+[package]
+name = "hc_curve_web"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+console_error_panic_hook = { version = "0.1", optional = true }
+hc_curve = { path = "../hc_curve", features = ["wasm"], default-features = false }
+leptos = { version = "0.6", default-features = false, features = ["csr"] }
+serde.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen = { version = "0.6", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "File",
+    "FileList",
+    "HtmlElement",
+    "HtmlInputElement",
+    "Window",
+    "Document",
+    "EventTarget",
+] }
+plotly = { version = "0.9", optional = true }
+plotters = { version = "0.3.7", optional = true, default-features = false, features = ["svg_backend"] }
+plotters-canvas = { version = "0.3.1", optional = true }
+anyhow.workspace = true
+wasm-bindgen-futures = { version = "0.4", optional = true }
+
+[features]
+default = ["chart_plotly"]
+chart_plotly = ["plotly", "serde-wasm-bindgen", "wasm-bindgen", "web-sys", "console_error_panic_hook", "wasm-bindgen-futures"]
+chart_plotters = ["plotters", "plotters-canvas", "web-sys", "console_error_panic_hook", "wasm-bindgen"]
+dev_mode = []
+parallel = []

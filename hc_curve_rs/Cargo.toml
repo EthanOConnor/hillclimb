@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "hc_curve",
+    "hc_curve_cli",
+    "hc_curve_web",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+authors = ["Hillclimb Team"]
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+rayon = "1"
+ndarray = { version = "0.15", features = ["rayon"] }
+ndarray-stats = "0.6"
+fitparser = "0.7"
+gpx = { version = "0.9", features = ["serde"] }
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "std", "env-filter"] }
+ordered-float = { version = "4", features = ["serde"] }
+
+[workspace.metadata]
+description = "Hillclimb curve computation in Rust"
+repository = "https://example.com"
