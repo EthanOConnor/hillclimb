@@ -1,0 +1,28 @@
+[package]
+name = "hc_curve"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Hillclimb curve computation core library"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rayon = { workspace = true, optional = true }
+ndarray.workspace = true
+ndarray-stats.workspace = true
+fitparser.workspace = true
+gpx.workspace = true
+log.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ordered-float.workspace = true
+
+[features]
+default = ["parallel"]
+parallel = ["rayon", "ndarray/rayon"]
+wasm = []
