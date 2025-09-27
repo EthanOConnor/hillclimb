@@ -87,8 +87,3 @@ Common developer-named fields are auto-detected when present, including:
 - `inclineRunn` (incline percent)
 - The curve search vectorizes start/end-aligned windows with cached envelope lookups (NumPy `searchsorted`) and gap-aware skipping, keeping per-duration work linear even on multi-day spans.
 
-Version discovery
------------------
-If you want me to discover and pin exact library versions, I can run a package query. Alternatively, use this query with a web-enabled agent:
-
-"Find current stable PyPI versions and install instructions for: python-fitparse (aka fitparse), Typer, and any recommended progress/logging helpers for Python CLIs in 2025. Include notes on Python 3.10+ compatibility."
