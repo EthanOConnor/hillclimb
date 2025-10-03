@@ -11,7 +11,12 @@ clap = { version = "4", features = ["derive"] }
 csv = "1"
 hc_curve = { path = "../hc_curve", features = ["parallel"], default-features = false }
 ndarray.workspace = true
-plotters = { version = "0.3.7", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "svg_backend", "line_series"] }
+plotters = { version = "0.3.7", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "svg_backend", "line_series", "ttf"] }
+plotters-backend = "0.3.7"
 serde.workspace = true
 serde_json.workspace = true
 tracing-subscriber.workspace = true
+fitparser.workspace = true
+ordered-float.workspace = true
+chrono.workspace = true
+tracing.workspace = true
