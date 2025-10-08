@@ -1069,6 +1069,7 @@ dependencies = [
  "ordered-float",
  "plotters",
  "plotters-backend",
+ "rayon",
  "serde",
  "serde_json",
  "tracing",

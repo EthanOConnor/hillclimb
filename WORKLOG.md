@@ -26,6 +26,14 @@ Performance Improvements
 - Added engine selection with a parallel Numba kernel (pointer-based envelope sweep) and a stride mode for 1 Hz data; auto-detect falls back to NumPy when Numba is unavailable.
 - Reduced pipeline overhead with threaded FIT parsing, parsed-FIT disk caching, per-stage profiling, cached WR envelopes, and a fast-plot mode that trims heavy annotations.
 
+Rust CLI Parity & Enhancements (2025-10-08)
+-------------------------------------------
+- Brought the Rust workspace (`hc_curve_rs`) to feature parity with the Python CLI: canonical mixed-source stitching, engine semantics (Auto/Numpy/Stride), WR envelope modelling, scoring overlays, and Plotters-based combined/split charts.
+- Added disk-backed FIT/GPX cache keyed by path, size, and mtime; cache hits now remix `file_id` so reordered runs stay correct.
+- Parallelised FIT parsing with Rayon and surfaced end-to-end stage timings via the new `--profile` flag.
+- Restored the default combined PNG output (split plots remain opt-in via `--split-plots`) and clamped log-scale minima so flat activities render safely when `--ylog-rate` or `--ylog-climb` is requested.
+- Updated top-level documentation (`README.md`, `hc_curve_rs/README.md`) to describe the Rust CLI workflow, caching behaviour, profiling flag, and split-plot defaults.
+
 Repo Setup
 ----------
 - To be initialized as a git repository with initial commit including docs.

@@ -10,6 +10,9 @@ use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod wr;
+use wr::build_wr_envelope;
+
 const DEFAULT_DURATIONS: &[u64] = &[60, 120, 300, 600, 1_200, 1_800, 3_600];
 
 const DEFAULT_MAGIC_TOKENS: &[&str] = &[
@@ -474,6 +477,7 @@ enum SourceKind {
     RunnTotalGain,
     RunnIncline,
     Altitude,
+    Mixed,
 }
 
 #[derive(Clone, Debug)]
@@ -484,6 +488,7 @@ struct Timeseries {
     gaps: Vec<Gap>,
     inactivity_gaps: Vec<(f64, f64)>,
     span: f64,
+    used_sources: BTreeSet<String>,
 }
 
 impl Timeseries {
@@ -572,32 +577,37 @@ pub fn compute_curves(
         None
     };
 
-    let wr_curve = params
-        .wr_anchors_path
-        .as_ref()
-        .and_then(|path| load_wr_curve(path).ok());
-    let (wr_rates, wr_gains_interp) =
-        wr_curve
-            .as_ref()
-            .map_or((None, None), |(wr_durs, wr_gains)| {
-                let wr_durs_f64: Vec<f64> = wr_durs.iter().map(|&d| d as f64).collect();
-                let interp: Vec<f64> = base_durations
+    let mut wr_curve: Option<(Vec<u64>, Vec<f64>)> = None;
+    let mut wr_rates: Option<Vec<f64>> = None;
+    let mut wr_gains_interp: Option<Vec<f64>> = None;
+
+    match build_wr_envelope(
+        &params.wr_profile.to_lowercase(),
+        params.wr_min_seconds,
+        params.wr_anchors_path.as_ref().map(|p| p.as_path()),
+        &params.wr_short_cap,
+    ) {
+        Ok(env) => {
+            if !env.cap_info.is_empty() {
+                if let Some(v_cap) = env.cap_info.get("v_cap") {
+                    tracing::info!("WR cap {:.3} m/s", v_cap);
+                }
+            }
+            let (dur_u64, climbs_dedup, rates_dedup) =
+                quantize_wr_samples(&env.durations, &env.climbs, &env.rates_avg);
+            wr_curve = Some((dur_u64, climbs_dedup));
+            wr_rates = Some(rates_dedup);
+            wr_gains_interp = Some(
+                base_durations
                     .iter()
-                    .map(|&d| interpolate_wr_value(d as f64, &wr_durs_f64, wr_gains))
-                    .collect();
-                let rates = base_durations
-                    .iter()
-                    .zip(interp.iter())
-                    .map(|(&d, &g)| {
-                        if d == 0 {
-                            0.0
-                        } else {
-                            g.max(0.0) * 3600.0 / d as f64
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                (Some(rates), Some(interp))
-            });
+                    .map(|&d| env.model.evaluate(d as f64))
+                    .collect(),
+            );
+        }
+        Err(err) => {
+            tracing::warn!("WR envelope unavailable: {}", err);
+        }
+    }
 
     let envelope_curve = envelope
         .as_ref()
@@ -606,12 +616,22 @@ pub fn compute_curves(
     let (personal_curve, goal_curve, magic_rows) =
         build_scoring_overlays(&points, &base_durations, params, wr_gains_interp.as_deref());
 
-    let selected_source = match timeseries.source {
-        SourceKind::RunnTotalGain => "runn_total_gain",
-        SourceKind::RunnIncline => "runn_incline",
-        SourceKind::Altitude => "altitude",
-    }
-    .to_string();
+    let selected_source = if timeseries.used_sources.is_empty() {
+        match params.source {
+            Source::Auto => "mixed".to_string(),
+            Source::Runn => "runn".to_string(),
+            Source::Altitude => "altitude".to_string(),
+        }
+    } else if timeseries.used_sources.len() == 1 {
+        timeseries
+            .used_sources
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "mixed".to_string())
+    } else {
+        "mixed".to_string()
+    };
 
     Ok(Curves {
         points,
@@ -624,33 +644,6 @@ pub fn compute_curves(
         selected_source,
         magic_rows,
     })
-}
-
-fn interpolate_wr_value(target: f64, durations: &[f64], gains: &[f64]) -> f64 {
-    if durations.is_empty() || gains.is_empty() {
-        return 0.0;
-    }
-    let len = durations.len().min(gains.len());
-    let xs = &durations[..len];
-    let ys = &gains[..len];
-
-    if target <= xs[0] {
-        return ys[0];
-    }
-    for i in 1..xs.len() {
-        if target <= xs[i] {
-            let x0 = xs[i - 1];
-            let x1 = xs[i];
-            let y0 = ys[i - 1];
-            let y1 = ys[i];
-            if (x1 - x0).abs() < f64::EPSILON {
-                return y1.max(y0);
-            }
-            let frac = ((target - x0) / (x1 - x0)).clamp(0.0, 1.0);
-            return y0 + (y1 - y0) * frac;
-        }
-    }
-    ys.last().copied().unwrap_or(0.0)
 }
 
 fn interpolate_curve_value(target: f64, durations: &[f64], gains: &[f64]) -> f64 {
@@ -677,6 +670,39 @@ fn interpolate_curve_value(target: f64, durations: &[f64], gains: &[f64]) -> f64
     gains[len - 1]
 }
 
+fn quantize_wr_samples(
+    durations: &[f64],
+    climbs: &[f64],
+    rates_avg: &[f64],
+) -> (Vec<u64>, Vec<f64>, Vec<f64>) {
+    let len = durations.len().min(climbs.len()).min(rates_avg.len());
+    let mut out_durations: Vec<u64> = Vec::with_capacity(len);
+    let mut out_climbs: Vec<f64> = Vec::with_capacity(len);
+    let mut out_rates: Vec<f64> = Vec::with_capacity(len);
+    let mut last_duration: Option<u64> = None;
+    for idx in 0..len {
+        let mut sec = durations[idx].round();
+        if sec < 1.0 {
+            sec = 1.0;
+        }
+        let duration_u = sec as u64;
+        if Some(duration_u) == last_duration {
+            if let Some(last_climb) = out_climbs.last_mut() {
+                *last_climb = (*last_climb).max(climbs[idx]);
+            }
+            if let Some(last_rate) = out_rates.last_mut() {
+                *last_rate = (*last_rate).max(rates_avg[idx]);
+            }
+        } else {
+            out_durations.push(duration_u);
+            out_climbs.push(climbs[idx]);
+            out_rates.push(rates_avg[idx]);
+            last_duration = Some(duration_u);
+        }
+    }
+    (out_durations, out_climbs, out_rates)
+}
+
 fn interpolate_monotone(target: f64, durations: &[u64], gains: &[f64]) -> f64 {
     if durations.is_empty() || gains.is_empty() {
         return 0.0;
@@ -700,6 +726,33 @@ fn interpolate_monotone(target: f64, durations: &[u64], gains: &[f64]) -> f64 {
         }
     }
     gains[len - 1]
+}
+
+fn can_use_stride(series: &Timeseries, durations: &[u64]) -> bool {
+    if series.times.len() < 2 {
+        return false;
+    }
+    let dt = series.times[1] - series.times[0];
+    if dt <= 0.0 {
+        return false;
+    }
+    if !series
+        .times
+        .windows(2)
+        .all(|w| (w[1] - w[0] - dt).abs() <= 1e-6)
+    {
+        return false;
+    }
+    for &d in durations {
+        if d == 0 {
+            continue;
+        }
+        let ratio = (d as f64) / dt;
+        if (ratio.round() - ratio).abs() > 1e-6 {
+            return false;
+        }
+    }
+    true
 }
 
 fn build_scoring_overlays(
@@ -1056,60 +1109,91 @@ fn build_timeseries(records: &[MergedRecord], params: &Params) -> Result<Timeser
     }
 
     let t0 = records.first().map(|r| r.time_s).unwrap_or(0.0);
-    let any_tg = records.iter().any(|r| r.tg.is_some());
-    let any_incline_dist = records.iter().any(|r| r.inc.is_some() && r.dist.is_some());
-    let any_alt = records.iter().any(|r| r.alt.is_some());
 
-    let source_kind = match params.source {
+    let mut used_sources: BTreeSet<String> = BTreeSet::new();
+    let (mut times, mut gains, mut inactivity_gaps): (Vec<f64>, Vec<f64>, Vec<(f64, f64)>);
+    let source_kind: SourceKind;
+
+    match params.source {
+        Source::Auto => {
+            let canonical = build_canonical_timeseries(records, params, t0)?;
+            times = canonical.times;
+            gains = canonical.gain;
+            inactivity_gaps = canonical.inactivity_gaps;
+            used_sources = canonical.used_sources;
+            source_kind = determine_source_kind(&used_sources);
+        }
         Source::Runn => {
+            let any_tg = records.iter().any(|r| r.tg.is_some());
+            let any_incline = records.iter().any(|r| r.inc.is_some() && r.dist.is_some());
             if any_tg {
-                SourceKind::RunnTotalGain
-            } else if any_incline_dist {
-                SourceKind::RunnIncline
+                let (t, g) = build_timeseries_from_tg(records, t0);
+                times = t;
+                gains = g;
+                inactivity_gaps = Vec::new();
+                used_sources.insert("runn_total_gain".to_string());
+                source_kind = SourceKind::RunnTotalGain;
+            } else if any_incline {
+                let (t, g) = build_timeseries_from_incline(records, t0);
+                times = t;
+                gains = g;
+                inactivity_gaps = Vec::new();
+                used_sources.insert("runn_incline".to_string());
+                source_kind = SourceKind::RunnIncline;
             } else {
                 return Err(HcError::InsufficientData);
             }
         }
         Source::Altitude => {
-            if any_alt {
-                SourceKind::Altitude
-            } else {
+            let any_alt = records.iter().any(|r| r.alt.is_some());
+            if !any_alt {
                 return Err(HcError::InsufficientData);
             }
+            let (t, g, gaps_alt) = build_timeseries_from_altitude(records, t0, params)?;
+            times = t;
+            gains = g;
+            inactivity_gaps = gaps_alt;
+            used_sources.insert("altitude".to_string());
+            source_kind = SourceKind::Altitude;
         }
-        Source::Auto => {
-            if any_tg {
-                SourceKind::RunnTotalGain
-            } else if any_incline_dist {
-                SourceKind::RunnIncline
-            } else if any_alt {
-                SourceKind::Altitude
-            } else {
-                return Err(HcError::InsufficientData);
-            }
-        }
-    };
-
-    let (mut times, mut gains, inactivity_gaps) = match source_kind {
-        SourceKind::RunnTotalGain => {
-            let (t, g) = build_timeseries_from_tg(records, t0);
-            (t, g, Vec::new())
-        }
-        SourceKind::RunnIncline => {
-            let (t, g) = build_timeseries_from_incline(records, t0);
-            (t, g, Vec::new())
-        }
-        SourceKind::Altitude => build_timeseries_from_altitude(records, t0, params)?,
-    };
+    }
 
     if times.len() < 2 {
         return Err(HcError::InsufficientData);
     }
 
+    let offset = times.first().copied().unwrap_or(0.0);
     normalize_timeseries(&mut times, &mut gains, None);
 
+    if offset != 0.0 && !inactivity_gaps.is_empty() {
+        for gap in inactivity_gaps.iter_mut() {
+            gap.0 = (gap.0 - offset).max(0.0);
+            gap.1 = (gap.1 - offset).max(gap.0);
+        }
+    }
+
     let span = times.last().copied().unwrap_or(0.0);
-    let gaps = detect_gaps(&times, params.session_gap_sec);
+    let mut gaps = detect_gaps(&times, params.session_gap_sec);
+
+    // Merge inactivity gaps inferred from canonical stitching with session gaps when needed
+    if !inactivity_gaps.is_empty() {
+        inactivity_gaps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        inactivity_gaps.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6);
+    }
+
+    if gaps.is_empty() && params.source == Source::Auto {
+        // Recompute gaps from inactivity segments when canonically inferred gaps exist
+        if !inactivity_gaps.is_empty() {
+            gaps = inactivity_gaps
+                .iter()
+                .map(|(start, end)| Gap {
+                    start: *start,
+                    end: *end,
+                    length: (end - start).max(0.0),
+                })
+                .collect();
+        }
+    }
 
     Ok(Timeseries {
         times,
@@ -1118,7 +1202,309 @@ fn build_timeseries(records: &[MergedRecord], params: &Params) -> Result<Timeser
         gaps,
         inactivity_gaps,
         span,
+        used_sources,
     })
+}
+
+#[derive(Default)]
+struct CanonicalTimeseries {
+    times: Vec<f64>,
+    gain: Vec<f64>,
+    inactivity_gaps: Vec<(f64, f64)>,
+    used_sources: BTreeSet<String>,
+}
+
+struct PerSourceCumulative {
+    times: Vec<f64>,
+    tg: Vec<Option<f64>>,
+    incline: Vec<Option<f64>>,
+    altitude: Vec<Option<f64>>,
+    inactivity_gaps: Vec<(f64, f64)>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum CanonicalSource {
+    Tg,
+    Incline,
+    Altitude,
+}
+
+fn canonical_source_rank(src: CanonicalSource) -> i32 {
+    match src {
+        CanonicalSource::Tg => 3,
+        CanonicalSource::Incline => 2,
+        CanonicalSource::Altitude => 1,
+    }
+}
+
+fn canonical_source_label(src: CanonicalSource) -> &'static str {
+    match src {
+        CanonicalSource::Tg => "runn_total_gain",
+        CanonicalSource::Incline => "runn_incline",
+        CanonicalSource::Altitude => "altitude",
+    }
+}
+
+fn determine_source_kind(used: &BTreeSet<String>) -> SourceKind {
+    if used.len() == 1 {
+        match used.iter().next().map(String::as_str) {
+            Some("runn_total_gain") => SourceKind::RunnTotalGain,
+            Some("runn_incline") => SourceKind::RunnIncline,
+            Some("altitude") => SourceKind::Altitude,
+            _ => SourceKind::Mixed,
+        }
+    } else if used.is_empty() {
+        SourceKind::Mixed
+    } else {
+        SourceKind::Mixed
+    }
+}
+
+fn enforce_optional_monotone(values: &mut [Option<f64>]) {
+    let mut last = None;
+    for entry in values.iter_mut() {
+        if let Some(val) = entry {
+            if let Some(prev) = last {
+                if *val < prev {
+                    *val = prev;
+                }
+            }
+            last = Some(*val);
+        }
+    }
+}
+
+fn build_canonical_timeseries(
+    records: &[MergedRecord],
+    params: &Params,
+    t0: f64,
+) -> Result<CanonicalTimeseries, HcError> {
+    let per_source = build_per_source_cumulative(records, params, t0);
+    if per_source.times.len() < 2 {
+        return Err(HcError::InsufficientData);
+    }
+
+    let dwell_sec = 5.0;
+    let gap_threshold = params.session_gap_sec.max(0.0);
+
+    let mut canonical = Vec::with_capacity(per_source.times.len());
+    let mut used_sources: BTreeSet<String> = BTreeSet::new();
+    let mut current_source: Option<CanonicalSource> = None;
+    let mut base = 0.0;
+    let mut last_value: Option<f64> = None;
+    let mut last_switch: Option<f64> = None;
+    let mut inferred_gaps: Vec<(f64, f64)> = per_source.inactivity_gaps;
+
+    let mut last_time = per_source.times[0];
+    for (idx, &time) in per_source.times.iter().enumerate() {
+        if idx > 0 {
+            let delta = time - last_time;
+            if delta > gap_threshold {
+                inferred_gaps.push((last_time, time));
+            }
+            last_time = time;
+        }
+
+        let mut avail: Vec<(CanonicalSource, f64)> = Vec::with_capacity(3);
+        if let Some(v) = per_source.tg[idx] {
+            avail.push((CanonicalSource::Tg, v));
+        }
+        if let Some(v) = per_source.incline[idx] {
+            avail.push((CanonicalSource::Incline, v));
+        }
+        if let Some(v) = per_source.altitude[idx] {
+            avail.push((CanonicalSource::Altitude, v));
+        }
+
+        if avail.is_empty() {
+            if let Some(last) = canonical.last().copied() {
+                canonical.push(last);
+            } else {
+                canonical.push(0.0);
+            }
+            continue;
+        }
+
+        let preferred = avail
+            .iter()
+            .max_by_key(|(src, _)| canonical_source_rank(*src))
+            .map(|(src, _)| *src)
+            .unwrap_or(CanonicalSource::Altitude);
+
+        let active_available = current_source.filter(|src| avail.iter().any(|(s, _)| s == src));
+
+        if active_available.is_none() {
+            current_source = Some(preferred);
+            let value = avail
+                .iter()
+                .find(|(src, _)| *src == preferred)
+                .map(|(_, v)| *v)
+                .unwrap_or(0.0);
+            let last_val = canonical.last().copied().unwrap_or(0.0);
+            base = last_val - value;
+            last_switch = Some(time);
+        } else if let Some(active) = active_available {
+            if preferred != active {
+                let rank_improved =
+                    canonical_source_rank(preferred) > canonical_source_rank(active);
+                let dwell_elapsed = last_switch.map(|sw| time - sw >= dwell_sec).unwrap_or(true);
+                if rank_improved || dwell_elapsed {
+                    current_source = Some(preferred);
+                    let value = avail
+                        .iter()
+                        .find(|(src, _)| *src == preferred)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0);
+                    let last_val = canonical.last().copied().unwrap_or(0.0);
+                    base = last_val - value;
+                    last_switch = Some(time);
+                }
+            }
+        }
+
+        let active_source = current_source.unwrap_or(preferred);
+        let value = avail
+            .iter()
+            .find(|(src, _)| *src == active_source)
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0);
+        let mut cumulative = base + value;
+        if let Some(last) = last_value {
+            if cumulative < last {
+                cumulative = last;
+            }
+        }
+        canonical.push(cumulative);
+        last_value = Some(cumulative);
+        used_sources.insert(canonical_source_label(active_source).to_string());
+    }
+
+    if !inferred_gaps.is_empty() {
+        inferred_gaps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        inferred_gaps.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6);
+    }
+
+    Ok(CanonicalTimeseries {
+        times: per_source.times,
+        gain: canonical,
+        inactivity_gaps: inferred_gaps,
+        used_sources,
+    })
+}
+
+fn build_per_source_cumulative(
+    records: &[MergedRecord],
+    params: &Params,
+    t0: f64,
+) -> PerSourceCumulative {
+    let mut times = Vec::new();
+    let mut tg_cum: Vec<Option<f64>> = Vec::new();
+    let mut inc_cum: Vec<Option<f64>> = Vec::new();
+    let mut alt_cum: Vec<Option<f64>> = Vec::new();
+
+    let mut base_tg = 0.0;
+    let mut last_tg: Option<f64> = None;
+    let mut last_file: Option<usize> = None;
+    let mut stitched: HashSet<(usize, usize)> = HashSet::new();
+
+    let mut cum_inc = 0.0;
+    let mut last_dist: Option<f64> = None;
+    let mut last_inc: Option<f64> = None;
+
+    let mut alt_raw_t: Vec<f64> = Vec::new();
+    let mut alt_raw_v: Vec<f64> = Vec::new();
+    let mut alt_raw_idx: Vec<usize> = Vec::new();
+
+    for (idx, record) in records.iter().enumerate() {
+        let time = record.time_s - t0;
+        times.push(time);
+
+        if let Some(tg_val) = record.tg {
+            if let Some(prev) = last_tg {
+                if tg_val + 1.0 < prev {
+                    let prev_file = last_file.unwrap_or(record.file_id);
+                    let key = (prev_file, record.file_id);
+                    if prev_file == record.file_id {
+                        base_tg += prev;
+                    } else if !stitched.contains(&key) {
+                        base_tg += prev;
+                        stitched.insert(key);
+                    }
+                }
+            }
+            last_tg = Some(tg_val);
+            last_file = Some(record.file_id);
+            let mut cumulative = base_tg + tg_val;
+            if let Some(prev) = tg_cum.iter().rev().find_map(|v| *v) {
+                if cumulative < prev {
+                    cumulative = prev;
+                }
+            }
+            tg_cum.push(Some(cumulative.max(0.0)));
+        } else {
+            tg_cum.push(None);
+        }
+
+        if let Some(dist) = record.dist {
+            if let Some(prev_dist) = last_dist {
+                let mut delta = dist - prev_dist;
+                if delta < 0.0 {
+                    delta = 0.0;
+                }
+                if let Some(inc) = record.inc.or(last_inc) {
+                    if inc > 0.0 {
+                        cum_inc += delta * (inc / 100.0);
+                    }
+                }
+            }
+            last_dist = Some(dist);
+        }
+        if record.inc.is_some() {
+            last_inc = record.inc;
+        }
+        let incline_available = last_dist.is_some() && last_inc.is_some();
+        if incline_available {
+            inc_cum.push(Some(cum_inc.max(0.0)));
+        } else {
+            inc_cum.push(None);
+        }
+
+        if let Some(alt) = record.alt {
+            alt_raw_t.push(time);
+            alt_raw_v.push(alt);
+            alt_raw_idx.push(idx);
+        }
+        alt_cum.push(None);
+    }
+
+    enforce_optional_monotone(&mut tg_cum);
+    enforce_optional_monotone(&mut inc_cum);
+
+    let mut inactivity_gaps = Vec::new();
+    if alt_raw_t.len() >= 2 {
+        let speed_med = estimate_session_speed(records, t0);
+        let grade_med = estimate_session_grade(records);
+        let altitude_eff = effective_altitude_path(&alt_raw_t, &alt_raw_v, speed_med, grade_med);
+        let (altitude_adj, moving_mask, idle_mask) =
+            apply_idle_detection(records, t0, &alt_raw_t, &altitude_eff);
+        inactivity_gaps = compute_inactivity_gaps(&alt_raw_t, &idle_mask);
+        let gain_series =
+            cumulative_ascent_from_altitude(&altitude_adj, params.gain_eps_m, &moving_mask);
+        for (series_idx, value) in alt_raw_idx.iter().zip(gain_series.iter()) {
+            if let Some(entry) = alt_cum.get_mut(*series_idx) {
+                *entry = Some(value.max(0.0));
+            }
+        }
+        enforce_optional_monotone(&mut alt_cum);
+    }
+
+    PerSourceCumulative {
+        times,
+        tg: tg_cum,
+        incline: inc_cum,
+        altitude: alt_cum,
+        inactivity_gaps,
+    }
 }
 
 fn build_timeseries_from_tg(records: &[MergedRecord], t0: f64) -> (Vec<f64>, Vec<f64>) {
@@ -2572,8 +2958,26 @@ fn compute_curve_points(
     durations: &[u64],
     params: &Params,
 ) -> Vec<CurvePoint> {
-    let _ = params; // reserved for future options
-    compute_curve_numpy(&series.times, &series.gain, durations, &series.gaps)
+    let engine = match params.engine {
+        Engine::Auto => {
+            if can_use_stride(series, durations) {
+                Engine::Stride
+            } else {
+                Engine::NumpyStyle
+            }
+        }
+        other => other,
+    };
+
+    match engine {
+        Engine::Stride => {
+            compute_curve_stride(&series.times, &series.gain, durations, &series.gaps)
+        }
+        Engine::NumbaStyle | Engine::NumpyStyle => {
+            compute_curve_numpy(&series.times, &series.gain, durations, &series.gaps)
+        }
+        Engine::Auto => compute_curve_numpy(&series.times, &series.gain, durations, &series.gaps),
+    }
 }
 
 fn compute_curve_all_windows(times: &[f64], gains: &[f64], step: u64) -> Vec<CurvePoint> {
@@ -2750,6 +3154,101 @@ fn compute_curve_numpy(
     results
 }
 
+fn compute_curve_stride(
+    times: &[f64],
+    gains: &[f64],
+    durations: &[u64],
+    gaps: &[Gap],
+) -> Vec<CurvePoint> {
+    let n = times.len().min(gains.len());
+    if n < 2 {
+        let start = times.first().copied().unwrap_or(0.0);
+        return durations
+            .iter()
+            .map(|&d| CurvePoint {
+                duration_s: d,
+                max_climb_m: 0.0,
+                climb_rate_m_per_hr: 0.0,
+                start_offset_s: start,
+                end_offset_s: start,
+            })
+            .collect();
+    }
+
+    let base_dt = times[1] - times[0];
+    if base_dt <= 0.0 {
+        return Vec::new();
+    }
+    if !times
+        .windows(2)
+        .all(|w| (w[1] - w[0] - base_dt).abs() <= 1e-6)
+    {
+        return compute_curve_numpy(times, gains, durations, gaps);
+    }
+
+    let start_time_min = times[0];
+    let end_time_max = times[n - 1];
+    let mut results = Vec::with_capacity(durations.len());
+
+    for &duration in durations {
+        let d = duration as f64;
+        if d <= 0.0 || start_time_min + d > end_time_max + 1e-9 {
+            results.push(CurvePoint {
+                duration_s: duration,
+                max_climb_m: 0.0,
+                climb_rate_m_per_hr: 0.0,
+                start_offset_s: start_time_min,
+                end_offset_s: start_time_min,
+            });
+            continue;
+        }
+
+        let stride = ((d / base_dt).round() as usize).clamp(1, n - 1);
+        if stride == 0 || stride >= n {
+            results.push(CurvePoint {
+                duration_s: duration,
+                max_climb_m: 0.0,
+                climb_rate_m_per_hr: 0.0,
+                start_offset_s: start_time_min,
+                end_offset_s: start_time_min,
+            });
+            continue;
+        }
+
+        let mut best_gain = f64::NEG_INFINITY;
+        let mut best_idx = 0usize;
+        for i in 0..(n - stride) {
+            let start = times[i];
+            let end = times[i + stride];
+            if spans_gap(start, end, d, gaps) {
+                continue;
+            }
+            let gain = gains[i + stride] - gains[i];
+            if gain > best_gain {
+                best_gain = gain;
+                best_idx = i;
+            }
+        }
+
+        if !best_gain.is_finite() || best_gain < 0.0 {
+            best_gain = 0.0;
+        }
+
+        let start = times[best_idx];
+        let end = (start + d).min(end_time_max);
+        let rate = if d > 0.0 { best_gain * 3600.0 / d } else { 0.0 };
+        results.push(CurvePoint {
+            duration_s: duration,
+            max_climb_m: best_gain.max(0.0),
+            climb_rate_m_per_hr: rate.max(0.0),
+            start_offset_s: start,
+            end_offset_s: end,
+        });
+    }
+
+    results
+}
+
 fn prepare_envelope_arrays(
     times: &[f64],
     gains: &[f64],
@@ -2844,6 +3343,7 @@ fn compute_session_curves(
             gaps: Vec::new(),
             inactivity_gaps: Vec::new(),
             span,
+            used_sources: series.used_sources.clone(),
         };
         seg_series.gaps = detect_gaps(&seg_series.times, params.session_gap_sec);
 
@@ -3076,80 +3576,6 @@ fn build_envelope(points: &[CurvePoint]) -> (Vec<u64>, Vec<f64>) {
     (durations_sorted, envelope)
 }
 
-fn load_wr_curve(path: &PathBuf) -> Result<(Vec<u64>, Vec<f64>), HcError> {
-    #[cfg(feature = "wasm")]
-    {
-        let _ = path;
-        Err(HcError::MissingWorldRecord)
-    }
-    #[cfg(not(feature = "wasm"))]
-    {
-        use std::fs;
-        let data = fs::read_to_string(path).map_err(|_| HcError::MissingWorldRecord)?;
-        let json: serde_json::Value =
-            serde_json::from_str(&data).map_err(|_| HcError::MissingWorldRecord)?;
-
-        let anchor_values = match json {
-            serde_json::Value::Array(items) => items,
-            serde_json::Value::Object(map) => {
-                if let Some(serde_json::Value::Array(items)) = map.get("anchors") {
-                    items.clone()
-                } else if let Some(serde_json::Value::Array(items)) = map.get("points") {
-                    items.clone()
-                } else {
-                    return Err(HcError::MissingWorldRecord);
-                }
-            }
-            _ => return Err(HcError::MissingWorldRecord),
-        };
-
-        let mut pairs: Vec<(u64, f64)> = Vec::new();
-        for item in anchor_values {
-            match item {
-                serde_json::Value::Object(obj) => {
-                    if let (Some(duration), Some(gain)) = (
-                        obj.get("w_s").or_else(|| obj.get("seconds")),
-                        obj.get("gain_m").or_else(|| obj.get("gain")),
-                    ) {
-                        if let (Some(d), Some(g)) = (duration.as_f64(), gain.as_f64()) {
-                            if d.is_sign_positive() && g.is_finite() {
-                                pairs.push((d.round() as u64, g));
-                            }
-                        }
-                    }
-                }
-                serde_json::Value::Array(arr) => {
-                    if arr.len() >= 2 {
-                        if let (Some(d), Some(g)) = (arr[0].as_f64(), arr[1].as_f64()) {
-                            if d.is_sign_positive() && g.is_finite() {
-                                pairs.push((d.round() as u64, g));
-                            }
-                        }
-                    }
-                }
-                serde_json::Value::Number(num) => {
-                    if let Some(d) = num.as_u64() {
-                        pairs.push((d, 0.0));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        pairs.sort_by_key(|(d, _)| *d);
-        pairs.dedup_by(|a, b| {
-            if a.0 == b.0 {
-                b.1 = b.1.max(a.1);
-                true
-            } else {
-                false
-            }
-        });
-        let (durations, gains): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-        Ok((durations, gains))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3162,6 +3588,8 @@ mod tests {
 
     #[test]
     fn test_compute_curve_points_simple() {
+        let mut used_sources = BTreeSet::new();
+        used_sources.insert("altitude".to_string());
         let series = Timeseries {
             times: vec![0.0, 1.0, 2.0, 3.0],
             gain: vec![0.0, 20.0, 30.0, 35.0],
@@ -3169,6 +3597,7 @@ mod tests {
             gaps: Vec::new(),
             inactivity_gaps: Vec::new(),
             span: 3.0,
+            used_sources,
         };
         let params = Params::default();
         let durations = vec![1, 2];

@@ -20,3 +20,4 @@ fitparser.workspace = true
 ordered-float.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+rayon.workspace = true

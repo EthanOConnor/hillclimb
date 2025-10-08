@@ -24,9 +24,29 @@ cargo build
 
 ### Running the CLI
 
+Basic usage:
+
 ```
-cargo run -p hc_curve_cli -- Tracklogs/*.fit --output curve.csv --png curve.png
+cargo run -p hc_curve_cli -- curve Tracklogs/Treadmill/*.fit -o outputs/curve.csv --png outputs/curve.png
 ```
+
+Key flags:
+
+- `--split-plots` to write separate `_rate` and `_climb` figures (combined PNG remains the default)
+- `--fast-plot` to render a lightweight chart (default)
+- `--ylog-rate` or `--ylog-climb` for log-scaled axes on split plots
+- `--plot-wr` to overlay the world‑record envelope
+- `--durations 60,300,600` or `--all --step 1` to control evaluation grid
+- `--source auto|runn|altitude` to select data source preference
+- `--raw-sampling` to skip 1 Hz resampling
+- `--no-qc` to disable QC censoring; `--qc-spec path.json` to override limits
+- `--score-output outputs/scores.csv` to write the scoring table
+- `--profile` to log timings for parse/compute/CSV/plot stages
+
+Performance features:
+
+- Parsed FIT records are cached under `.cache/parsed_fit/` keyed by path + mtime + size
+- FIT/GPX files are parsed in parallel when multiple inputs are supplied
 
 ### Web (Trunk)
 

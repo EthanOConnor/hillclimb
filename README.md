@@ -51,13 +51,24 @@ Options:
 - `--max-duration`: Limit maximum duration (seconds) when using `--exhaustive`.
 - `--source`: `auto` (default), `runn`, or `altitude`.
 - `--verbose, -v`: Verbose logging.
-- Plotting defaults: split plots on; WR overlay off; goal curve hidden below 120s. Use `--plot-wr` to show WR.
+- Plotting defaults: split plots on for the Python CLI; WR overlay off; goal curve hidden below 120s. Use `--plot-wr` to show WR. The Rust CLI keeps a single combined PNG by default—use `--split-plots` there to opt in.
 - `--goal-min-seconds`: Hide goal curve/labels below this duration (default 120s).
 - `--personal-min-seconds`: Anchor personal curve scaling at best relative point ≥ this duration (default 60s).
 - `--engine`: Curve engine `auto|numpy|numba|stride` (auto prefers the Numba kernel when available; `stride` expects resampled 1 Hz data).
 - `--parse-workers`: Thread pool size for FIT parsing (0 = auto, 1 = serial).
 - `--fast-plot/--no-fast-plot`: Skip heavy annotations on plots for faster rendering (default fast).
 - `--profile`: Emit per-stage timing to the log for quick performance investigations.
+
+Rust CLI (hc_curve_rs)
+----------------------
+The Rust rewrite (`hc_curve_rs/hc_curve_cli`) mirrors the Python features while adding a few defaults tailored to the new Plotters-based renderer:
+
+- Build with `cargo build` (workspace root) and run via `cargo run -p hc_curve_cli -- curve …`.
+- Combined PNG output remains the default; add `--split-plots` (or `--split-plots/--no-split-plots`) to write separate `_rate`/`_climb` images. When split plots are requested, the CLI still honours the explicit `--png` path for the combined figure.
+- `--ylog-rate` / `--ylog-climb` now clamp the lower bound so flat sessions (zero or negative ascent) render without errors.
+- FIT/GPX inputs are parsed in parallel and cached on disk under `.cache/parsed_fit/`, keyed by path, size, and mtime; cached entries are re-keyed to the current file ordering so multi-run workflows stay correct.
+- `--profile` emits parse/compute/CSV/plot timing just like the Python CLI. Combine with `--verbose` for more granular tracing.
+- All other flags mirror the Python names; see `hc_curve_rs/README.md` for a concise summary of the Rust-specific options and behaviour.
 
 CSV columns
 -----------
@@ -86,4 +97,3 @@ Common developer-named fields are auto-detected when present, including:
 - `total_distance` (preferred distance source, used over `enhanced_distance`/`distance` when present)
 - `inclineRunn` (incline percent)
 - The curve search vectorizes start/end-aligned windows with cached envelope lookups (NumPy `searchsorted`) and gap-aware skipping, keeping per-duration work linear even on multi-day spans.
-
