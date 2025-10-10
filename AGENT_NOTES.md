@@ -42,3 +42,43 @@ Potential Next Steps
 - Add JSON export with metadata (files, selected source, sampling stats).
 - Optional smoothing/interpolation for prettier curves on sparse data.
 - Unit tests for parser and curve math using synthetic FIT-like inputs.
+
+Roadmap (Post-Export + Gain-Time)
+---------------------------------
+This roadmap aligns with the requested sequence: CLI polish → Performance/Robustness → Reference tooling → Documentation.
+
+1) CLI Polish
+- Accept comma-separated gain tokens in Python: allow `-g 50,100,200` in addition to space-separated forms. Implementation sketch: split tokens on commas before `_parse_gain_list` in `_run_gain_time`, mirroring Rust’s `value_delimiter=','`.
+- Add `--gains-from <path>`: read one token per line (supports `m|ft` suffix); merge with `--gains`. Fail fast on unreadable file. Update README examples accordingly.
+- Improve error messages for empty/invalid targets: if no positive gains after parsing, print a clear hint and show default set fallback.
+- Keep parity with Rust flags and behavior for `time`/`export-series`.
+
+2) Performance & Robustness
+- Optional numba acceleration for `min_time_for_gains` (two-pointer sweep): guard behind `--engine numba` (already wired) or auto-detect. Target large inputs or many targets (K). Ensure identical results to numpy path.
+- Early exits and guards: if total ascent ≤ 0 after QC, exit with a concise message (both `time` and `curve`).
+- QC invariants: expose an internal debug mode to assert monotonicity of cumulative ascent, and record censored windows in logs when `--verbose`.
+- Memory and stride: re-use 1 Hz cumulative buffers where available; avoid resampling twice.
+
+3) Reference Tooling Improvements
+- Mathematica (`docs/mathematica_gain_time.wl`): add a small plotting helper and `VerificationTest` examples based on synthetic datasets. Provide `CompareWithCsv[data, csvPath]` to diff results from CLI `gain_time.csv`.
+- Add a lightweight Python verification script under `docs/` to compare Python CLI vs Rust CLI gain-time outputs for given inputs, producing a CSV diff and summary stats (max delta seconds/rate).
+- Author `docs/verification.md` with a repeatable procedure (commands + expected outputs, treadmill/outdoor samples).
+
+4) Documentation
+- README: add a complete treadmill example (commands + embedded PNG thumbnails) and a short outdoor example; document `export-series` → Mathematica loop.
+- Add `docs/usage_recipes.md` for common tasks (WR overlays, unit toggles, session gap interpretation).
+- Ensure artifacts go under `outputs/` and are excluded from commits; advise cleaning before PRs.
+
+Dev Notes for Next Agent
+------------------------
+- Respect existing options and naming; keep Python/Rust feature parity.
+- When adding flags: update both CLIs and reflect changes in README and `hc_curve_rs/README.md`.
+- Avoid breaking the exported CSV schemas; add columns only with versioning or clear documentation.
+- Validate changes via the sample commands in AGENTS.md and record deltas in `outputs/` during review.
+
+Acceptance Checklist
+--------------------
+- `time` accepts `-g 50 100,200 500ft` and `--gains-from` simultaneously; README examples run without errors.
+- Numba path produces identical windows to the numpy path on provided samples (within 1s tolerance) and is faster on large inputs.
+- Mathematica helpers can reproduce CLI `gain_time.csv` within 1s for several targets; `docs/verification.md` steps pass.
+- README and docs updated; new content is concise and actionable.
