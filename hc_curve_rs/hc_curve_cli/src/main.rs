@@ -12,7 +12,8 @@ use fitparser::de::from_bytes;
 use fitparser::profile::MesgNum;
 use fitparser::Value as FitValue;
 use hc_curve::{
-    compute_curves, parse_duration_token, parse_records, Curves, Engine, Params, Source,
+    compute_curves, compute_gain_time, compute_timeseries_export, parse_duration_token,
+    parse_records, Curves, Engine, GainTimePoint, GainTimeResult, Params, Source, TimeseriesExport,
 };
 use ordered_float::OrderedFloat;
 use plotters::prelude::IntoLogRange;
@@ -30,6 +31,11 @@ use std::time::Instant;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+const GAIN_TIME_ISO_RATES: &[f64] = &[800.0, 1_000.0, 1_200.0, 1_500.0, 2_000.0, 2_500.0];
+const DEFAULT_MAGIC_GAIN_TOKENS: &[&str] = &[
+    "50m", "100m", "150m", "200m", "300m", "500m", "750m", "1000m",
+];
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Hillclimb curve computation CLI", long_about = None)]
 struct Cli {
@@ -43,6 +49,10 @@ enum Command {
     Curve(CurveArgs),
     /// Inspect FIT files for available record keys and ascent candidates
     Diagnose(DiagnoseArgs),
+    /// Compute gain-centric report: minimum time for target gains
+    GainTime(GainTimeArgs),
+    /// Export canonical cumulative gain series for external tooling
+    ExportSeries(ExportSeriesArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -223,6 +233,212 @@ struct DiagnoseArgs {
     verbose: bool,
 }
 
+#[derive(Parser, Debug)]
+struct GainTimeArgs {
+    /// FIT/GPX files to ingest
+    #[arg(required = true, value_hint = ValueHint::FilePath)]
+    inputs: Vec<PathBuf>,
+
+    /// Output CSV path (`-` for stdout)
+    #[arg(short, long, default_value = "gain_time.csv", value_hint = ValueHint::FilePath)]
+    output: PathBuf,
+
+    /// Output PNG figure path (defaults next to CSV)
+    #[arg(long, value_hint = ValueHint::FilePath)]
+    png: Option<PathBuf>,
+
+    /// Disable plot generation
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_plot: bool,
+
+    /// Gain targets (meters by default, accepts suffix m|ft, comma separated)
+    #[arg(short = 'g', long = "gains", value_delimiter = ',', num_args = 1..)]
+    gains: Vec<String>,
+
+    /// Read gain targets from file (one per line, supports m|ft suffix)
+    #[arg(long = "gains-from", value_hint = ValueHint::FilePath)]
+    gains_from: Option<PathBuf>,
+
+    /// Evaluate exhaustive multi-resolution grid
+    #[arg(long, action = ArgAction::SetTrue)]
+    exhaustive: bool,
+
+    /// Compute per-second windows via all-windows sweep
+    #[arg(long, action = ArgAction::SetTrue)]
+    all: bool,
+
+    /// Step size in seconds for exhaustive/`--all`
+    #[arg(long, default_value_t = 1)]
+    step: u64,
+
+    /// Maximum duration in seconds
+    #[arg(long)]
+    max_duration: Option<u64>,
+
+    /// Data source preference
+    #[arg(long, value_enum, default_value_t = SourceOpt::Auto)]
+    source: SourceOpt,
+
+    /// Gap threshold (seconds) for session segmentation
+    #[arg(long, default_value_t = 600.0)]
+    session_gap: f64,
+
+    /// Timestamp merge tolerance (seconds)
+    #[arg(long, default_value_t = 0.5)]
+    merge_eps: f64,
+
+    /// Overlap precedence policy for total gain
+    #[arg(long, default_value = "file:last")]
+    overlap_policy: String,
+
+    /// Keep native sampling (skip 1 Hz resample)
+    #[arg(long, action = ArgAction::SetTrue)]
+    raw_sampling: bool,
+
+    /// Disable QC censoring
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_qc: bool,
+
+    /// Optional QC override JSON path
+    #[arg(long, value_hint = ValueHint::FilePath)]
+    qc_spec: Option<PathBuf>,
+
+    /// Altitude hysteresis (meters)
+    #[arg(long, default_value_t = 0.5)]
+    gain_eps: f64,
+
+    /// Optional WR anchors JSON
+    #[arg(long, value_hint = ValueHint::FilePath)]
+    wr_anchors: Option<PathBuf>,
+
+    /// WR profile identifier
+    #[arg(long, default_value = "overall")]
+    wr_profile: String,
+
+    /// Minimum duration for WR envelope (seconds)
+    #[arg(long, default_value_t = 30.0)]
+    wr_min_seconds: f64,
+
+    /// Short-duration WR cap profile (conservative|standard|aggressive)
+    #[arg(long, default_value = "standard")]
+    wr_short_cap: String,
+
+    /// Plot WR overlay
+    #[arg(long, action = ArgAction::SetTrue)]
+    plot_wr: bool,
+
+    /// Disable personal overlay on plots
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_personal: bool,
+
+    /// Generate separate time/rate plots
+    #[arg(long = "split-plots", action = ArgAction::SetTrue)]
+    split_plots: bool,
+
+    /// Disable split plot output
+    #[arg(long = "no-split-plots", action = ArgAction::SetTrue)]
+    no_split_plots: bool,
+
+    /// Enable lightweight plotting (default)
+    #[arg(long = "fast-plot", action = ArgAction::SetTrue)]
+    fast_plot: bool,
+
+    /// Disable lightweight plotting
+    #[arg(long = "no-fast-plot", action = ArgAction::SetTrue)]
+    no_fast_plot: bool,
+
+    /// Use logarithmic scale on time axis
+    #[arg(long = "ylog-time", action = ArgAction::SetTrue)]
+    ylog_time: bool,
+
+    /// Gain units for parsing/display
+    #[arg(long = "gain-units", value_enum, default_value_t = GainUnitOpt::Meters)]
+    gain_units: GainUnitOpt,
+
+    /// Magic gains for annotations (comma separated, accepts m|ft suffix)
+    #[arg(long = "magic-gains")]
+    magic_gains: Option<String>,
+
+    /// Disable concave envelope smoothing
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_concave_envelope: bool,
+
+    /// Curve engine (auto|numpy|numba|stride)
+    #[arg(long, value_enum, default_value_t = EngineOpt::Auto)]
+    engine: EngineOpt,
+
+    /// Altitude smoothing window (seconds)
+    #[arg(long, default_value_t = 0.0)]
+    smooth: f64,
+
+    /// Profile major stages with timings
+    #[arg(long, action = ArgAction::SetTrue)]
+    profile: bool,
+
+    /// Verbose logging
+    #[arg(long, action = ArgAction::SetTrue)]
+    verbose: bool,
+}
+
+#[derive(Parser, Debug)]
+struct ExportSeriesArgs {
+    /// FIT/GPX files to ingest
+    #[arg(required = true, value_hint = ValueHint::FilePath)]
+    inputs: Vec<PathBuf>,
+
+    /// Output CSV path (`-` for stdout)
+    #[arg(short, long, default_value = "timeseries.csv", value_hint = ValueHint::FilePath)]
+    output: PathBuf,
+
+    /// Data source preference
+    #[arg(long, value_enum, default_value_t = SourceOpt::Auto)]
+    source: SourceOpt,
+
+    /// Keep native sampling (skip 1 Hz resample)
+    #[arg(long, action = ArgAction::SetTrue)]
+    raw_sampling: bool,
+
+    /// Disable QC censoring
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_qc: bool,
+
+    /// Optional QC override JSON path
+    #[arg(long, value_hint = ValueHint::FilePath)]
+    qc_spec: Option<PathBuf>,
+
+    /// Altitude hysteresis (meters)
+    #[arg(long, default_value_t = 0.5)]
+    gain_eps: f64,
+
+    /// Altitude smoothing window (seconds)
+    #[arg(long, default_value_t = 0.0)]
+    smooth: f64,
+
+    /// Gap threshold (seconds) for session segmentation
+    #[arg(long, default_value_t = 600.0)]
+    session_gap: f64,
+
+    /// Timestamp merge tolerance (seconds)
+    #[arg(long, default_value_t = 0.5)]
+    merge_eps: f64,
+
+    /// Overlap precedence policy for total gain
+    #[arg(long, default_value = "file:last")]
+    overlap_policy: String,
+
+    /// Verbose logging
+    #[arg(long, action = ArgAction::SetTrue)]
+    verbose: bool,
+
+    /// Profile major stages with timings
+    #[arg(long, action = ArgAction::SetTrue)]
+    profile: bool,
+
+    /// Optional log file
+    #[arg(long, value_hint = ValueHint::FilePath)]
+    log_file: Option<PathBuf>,
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum SourceOpt {
     Auto,
@@ -246,6 +462,14 @@ enum EngineOpt {
     Numpy,
     Numba,
     Stride,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum GainUnitOpt {
+    #[clap(alias = "m")]
+    Meters,
+    #[clap(alias = "ft")]
+    Feet,
 }
 
 impl From<EngineOpt> for Engine {
@@ -276,6 +500,20 @@ fn main() -> Result<()> {
                 "info"
             }
         }
+        Command::GainTime(args) => {
+            if args.verbose {
+                "debug"
+            } else {
+                "info"
+            }
+        }
+        Command::ExportSeries(args) => {
+            if args.verbose {
+                "debug"
+            } else {
+                "info"
+            }
+        }
     };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
@@ -287,6 +525,8 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Curve(args) => handle_curve(args),
         Command::Diagnose(args) => handle_diagnose(args),
+        Command::GainTime(args) => handle_gain_time(args),
+        Command::ExportSeries(args) => handle_export_series(args),
     }
 }
 
@@ -495,6 +735,272 @@ fn handle_curve(args: CurveArgs) -> Result<()> {
                 info!("Wrote plot: {}", path.display());
             }
         }
+    }
+
+    Ok(())
+}
+
+fn handle_gain_time(args: GainTimeArgs) -> Result<()> {
+    if args.inputs.is_empty() {
+        return Err(anyhow!("no input files supplied"));
+    }
+
+    let mut params = Params::default();
+    params.gain_eps_m = args.gain_eps;
+    params.smooth_sec = args.smooth;
+    params.session_gap_sec = args.session_gap;
+    params.merge_eps_sec = args.merge_eps;
+    params.overlap_policy = args.overlap_policy.clone();
+    params.resample_1hz = !args.raw_sampling;
+    params.qc_enabled = !args.no_qc;
+    params.exhaustive = args.exhaustive;
+    params.all_windows = args.all;
+    params.step_s = args.step.max(1);
+    params.max_duration_s = args.max_duration;
+    params.source = args.source.into();
+    params.wr_profile = args.wr_profile.clone();
+    params.wr_anchors_path = args.wr_anchors.clone();
+    params.wr_min_seconds = args.wr_min_seconds;
+    params.wr_short_cap = args.wr_short_cap.clone();
+    params.concave_envelope = !args.no_concave_envelope;
+    params.engine = args.engine.into();
+    params.magic = None;
+
+    if let Some(spec_path) = args.qc_spec.as_ref() {
+        params.qc_spec = Some(load_qc_spec(spec_path)?);
+    }
+
+    let gain_unit = args.gain_units;
+    let mut gain_tokens = args.gains.clone();
+    if let Some(path) = args.gains_from.as_ref() {
+        let from_file = read_gain_tokens_from_file(path)?;
+        gain_tokens.extend(from_file);
+    }
+    let gain_targets = parse_gain_value_list(&gain_tokens, gain_unit);
+    if !gain_tokens.is_empty() && gain_targets.is_empty() {
+        warn!("No valid gain targets parsed from --gains/--gains-from; falling back to defaults.");
+    }
+    let mut magic_gain_targets = parse_magic_gain_tokens(args.magic_gains.as_deref(), gain_unit);
+    if magic_gain_targets.is_empty() {
+        magic_gain_targets = DEFAULT_MAGIC_GAIN_TOKENS
+            .iter()
+            .filter_map(|token| parse_gain_token(token, GainUnitOpt::Meters))
+            .collect();
+    }
+
+    let cache_dir = PathBuf::from(".cache").join("parsed_fit");
+    let _ = fs::create_dir_all(&cache_dir);
+
+    let t_parse = Instant::now();
+    let inputs: Vec<(usize, PathBuf)> = args.inputs.iter().cloned().enumerate().collect();
+
+    let mut records: Vec<(usize, Vec<hc_curve::FitRecord>)> = inputs
+        .par_iter()
+        .map(
+            |(file_id, path)| -> Result<(usize, Vec<hc_curve::FitRecord>)> {
+                let key = cache_key(path)?;
+                if let Some(mut cached) = read_cache(&cache_dir, &key) {
+                    for record in &mut cached {
+                        record.file_id = *file_id;
+                    }
+                    return Ok((*file_id, cached));
+                }
+                let data =
+                    fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+                let hint = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("fit");
+                let parsed = parse_records(&data, *file_id, hint)
+                    .with_context(|| format!("failed to parse {}", path.display()))?;
+                let _ = write_cache(&cache_dir, &key, &parsed);
+                Ok((*file_id, parsed))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+
+    records.sort_by_key(|(id, _)| *id);
+    let records: Vec<Vec<hc_curve::FitRecord>> = records.into_iter().map(|(_, r)| r).collect();
+
+    if args.profile || args.verbose {
+        info!(
+            "Parse stage: {:.1} ms",
+            t_parse.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    let t_compute = Instant::now();
+    let result = compute_gain_time(records, &params, &gain_targets)?;
+    if args.profile || args.verbose {
+        info!(
+            "Compute stage: {:.1} ms ({} curve points)",
+            t_compute.elapsed().as_secs_f64() * 1000.0,
+            result.curve.len()
+        );
+    }
+    info!(
+        "Gain-time computed: {} targets, source {}",
+        result.targets.len(),
+        result.selected_source
+    );
+
+    print_gain_time_summary(&result, gain_unit);
+
+    if args.output.as_os_str() == "-" {
+        write_gain_time_stdout(&result)?;
+    } else {
+        let t_csv = Instant::now();
+        write_gain_time_csv(&result, &args.output)?;
+        if args.profile || args.verbose {
+            info!(
+                "CSV stage: {:.1} ms ({} rows)",
+                t_csv.elapsed().as_secs_f64() * 1000.0,
+                result.targets.len()
+            );
+        }
+        info!("Wrote gain-time CSV: {}", args.output.display());
+    }
+
+    if !args.no_plot {
+        let split_plots = if args.no_split_plots {
+            false
+        } else if args.split_plots {
+            true
+        } else {
+            false
+        };
+
+        let fast_plot = if args.no_fast_plot {
+            false
+        } else if args.fast_plot {
+            true
+        } else {
+            true
+        };
+
+        let plot_opts = GainTimePlotOptions {
+            split_plots,
+            fast_plot,
+            show_wr: args.plot_wr,
+            show_personal: !args.no_personal,
+            ylog_time: args.ylog_time,
+            unit: gain_unit,
+            magic_gains: magic_gain_targets.clone(),
+        };
+
+        if let Some(path) = args.png.as_ref() {
+            if let Err(err) = render_gain_time_guard(&result, path, ChartKind::Png, &plot_opts) {
+                warn!("Skipping PNG render ({}): {}", path.display(), err);
+            } else if plot_opts.split_plots {
+                info!("Wrote plots: {} (_time/_rate)", path.display());
+            } else {
+                info!("Wrote plot: {}", path.display());
+            }
+        } else if args.output.as_os_str() != "-" {
+            let mut png_path = args.output.clone();
+            png_path.set_extension("png");
+            let t_plot = Instant::now();
+            if let Err(err) = render_gain_time_guard(&result, &png_path, ChartKind::Png, &plot_opts)
+            {
+                warn!("Skipping PNG render ({}): {}", png_path.display(), err);
+            } else if plot_opts.split_plots {
+                info!("Wrote plots: {} (_time/_rate)", png_path.display());
+            } else {
+                info!("Wrote plot: {}", png_path.display());
+            }
+            if args.profile || args.verbose {
+                info!(
+                    "Plot stage: {:.1} ms",
+                    t_plot.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_export_series(args: ExportSeriesArgs) -> Result<()> {
+    if args.inputs.is_empty() {
+        return Err(anyhow!("no input files supplied"));
+    }
+
+    let mut params = Params::default();
+    params.gain_eps_m = args.gain_eps;
+    params.smooth_sec = args.smooth;
+    params.session_gap_sec = args.session_gap;
+    params.merge_eps_sec = args.merge_eps;
+    params.overlap_policy = args.overlap_policy.clone();
+    params.resample_1hz = !args.raw_sampling;
+    params.qc_enabled = !args.no_qc;
+    params.source = args.source.into();
+    params.all_windows = false;
+    params.exhaustive = false;
+    params.step_s = 1;
+    params.max_duration_s = None;
+
+    if let Some(spec_path) = args.qc_spec.as_ref() {
+        params.qc_spec = Some(load_qc_spec(spec_path)?);
+    }
+
+    let cache_dir = PathBuf::from(".cache").join("parsed_fit");
+    let _ = fs::create_dir_all(&cache_dir);
+
+    let inputs: Vec<(usize, PathBuf)> = args.inputs.iter().cloned().enumerate().collect();
+
+    let t_parse = Instant::now();
+    let mut records: Vec<(usize, Vec<hc_curve::FitRecord>)> = inputs
+        .par_iter()
+        .map(
+            |(file_id, path)| -> Result<(usize, Vec<hc_curve::FitRecord>)> {
+                let key = cache_key(path)?;
+                if let Some(mut cached) = read_cache(&cache_dir, &key) {
+                    for record in &mut cached {
+                        record.file_id = *file_id;
+                    }
+                    return Ok((*file_id, cached));
+                }
+                let data =
+                    fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+                let hint = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("fit");
+                let parsed = parse_records(&data, *file_id, hint)
+                    .with_context(|| format!("failed to parse {}", path.display()))?;
+                let _ = write_cache(&cache_dir, &key, &parsed);
+                Ok((*file_id, parsed))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+
+    records.sort_by_key(|(id, _)| *id);
+    let records: Vec<Vec<hc_curve::FitRecord>> = records.into_iter().map(|(_, r)| r).collect();
+
+    if args.profile || args.verbose {
+        info!(
+            "Parse stage: {:.1} ms",
+            t_parse.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    let t_compute = Instant::now();
+    let series = compute_timeseries_export(records, &params)?;
+    if args.profile || args.verbose {
+        info!(
+            "Compute stage: {:.1} ms ({} samples)",
+            t_compute.elapsed().as_secs_f64() * 1000.0,
+            series.times.len()
+        );
+    }
+    info!("Timeseries computed: {} samples", series.times.len());
+
+    if args.output.as_os_str() == "-" {
+        write_timeseries_stdout(&series)?;
+        info!("Wrote timeseries CSV to stdout");
+    } else {
+        write_timeseries_csv(&series, &args.output)?;
+        info!("Wrote timeseries CSV: {}", args.output.display());
     }
 
     Ok(())
@@ -801,6 +1307,234 @@ fn write_score_output(curves: &Curves, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn parse_gain_value_list(values: &[String], unit: GainUnitOpt) -> Vec<f64> {
+    let mut out = Vec::new();
+    for token in values {
+        for part in token.split(|c: char| c == ',' || c.is_whitespace()) {
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(value) = parse_gain_token(part, unit) {
+                out.push(value);
+            }
+        }
+    }
+    out
+}
+
+fn read_gain_tokens_from_file(path: &Path) -> Result<Vec<String>> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut tokens = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        tokens.push(trimmed.to_string());
+    }
+    Ok(tokens)
+}
+
+fn parse_magic_gain_tokens(input: Option<&str>, unit: GainUnitOpt) -> Vec<f64> {
+    let mut out = Vec::new();
+    if let Some(text) = input {
+        for part in text.split(|c: char| c == ',' || c.is_whitespace()) {
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(value) = parse_gain_token(part, unit) {
+                out.push(value);
+            }
+        }
+    }
+    out
+}
+
+fn parse_gain_token(token: &str, default_unit: GainUnitOpt) -> Option<f64> {
+    let trimmed = token.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (value_str, unit) = if let Some(stripped) = trimmed.strip_suffix("ft") {
+        (stripped.trim(), GainUnitOpt::Feet)
+    } else if let Some(stripped) = trimmed.strip_suffix('m') {
+        (stripped.trim(), GainUnitOpt::Meters)
+    } else {
+        (trimmed.as_str(), default_unit)
+    };
+    let value: f64 = value_str.parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    match unit {
+        GainUnitOpt::Meters => Some(value),
+        GainUnitOpt::Feet => Some(value * 0.3048),
+    }
+}
+
+fn gain_to_display(value_m: f64, unit: GainUnitOpt) -> f64 {
+    match unit {
+        GainUnitOpt::Meters => value_m,
+        GainUnitOpt::Feet => value_m / 0.3048,
+    }
+}
+
+fn display_gain_label(unit: GainUnitOpt) -> &'static str {
+    match unit {
+        GainUnitOpt::Meters => "m",
+        GainUnitOpt::Feet => "ft",
+    }
+}
+
+fn format_gain_value(value_m: f64, unit: GainUnitOpt) -> String {
+    match unit {
+        GainUnitOpt::Meters => format!("{:.0} m", value_m),
+        GainUnitOpt::Feet => format!("{:.0} ft", value_m / 0.3048),
+    }
+}
+
+fn format_duration_hms(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "--:--".to_string();
+    }
+    let total_seconds = seconds.round() as i64;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let secs = total_seconds % 60;
+    if hours > 0 {
+        format!("{}:{:02}:{:02}", hours, minutes, secs)
+    } else {
+        format!("{}:{:02}", minutes, secs)
+    }
+}
+
+fn approximate_time_from_curve(curve: &[GainTimePoint], gain_m: f64) -> Option<f64> {
+    if curve.is_empty() {
+        return None;
+    }
+    if gain_m <= curve[0].gain_m {
+        return Some(curve[0].min_time_s);
+    }
+    for window in curve.windows(2) {
+        let a = &window[0];
+        let b = &window[1];
+        if gain_m <= b.gain_m {
+            let g0 = a.gain_m;
+            let g1 = b.gain_m;
+            let t0 = a.min_time_s;
+            let t1 = b.min_time_s;
+            if (g1 - g0).abs() < f64::EPSILON {
+                return Some(t1.max(t0));
+            }
+            let frac = ((gain_m - g0) / (g1 - g0)).clamp(0.0, 1.0);
+            return Some(t0 + (t1 - t0) * frac);
+        }
+    }
+    let last = curve.last().unwrap();
+    if gain_m > last.gain_m + 1e-6 {
+        None
+    } else {
+        Some(last.min_time_s)
+    }
+}
+
+fn print_gain_time_summary(result: &GainTimeResult, unit: GainUnitOpt) {
+    println!("Gain Time Report (source: {})", result.selected_source);
+    let max_gain_display = format_gain_value(result.total_gain_m, unit);
+    for point in &result.targets {
+        let gain_label = format_gain_value(point.gain_m, unit);
+        if !point.min_time_s.is_finite() {
+            println!(
+                "- {}: unachievable (max gain {})",
+                gain_label, max_gain_display
+            );
+            continue;
+        }
+        let time_label = format_duration_hms(point.min_time_s);
+        let rate_label = if point.avg_rate_m_per_hr.is_finite() && point.avg_rate_m_per_hr > 0.0 {
+            format!("{:.0} m/h", point.avg_rate_m_per_hr)
+        } else {
+            "--".to_string()
+        };
+        let start_label = point
+            .start_offset_s
+            .map(format_duration_hms)
+            .unwrap_or_else(|| "--:--".to_string());
+        let end_label = point
+            .end_offset_s
+            .map(format_duration_hms)
+            .unwrap_or_else(|| "--:--".to_string());
+        if let Some(note) = point.note.as_deref() {
+            println!(
+                "- {}: {} ({}) window {}–{} [{}]",
+                gain_label, time_label, rate_label, start_label, end_label, note
+            );
+        } else {
+            println!(
+                "- {}: {} ({}) window {}–{}",
+                gain_label, time_label, rate_label, start_label, end_label
+            );
+        }
+    }
+}
+
+fn write_gain_time_stdout(result: &GainTimeResult) -> Result<()> {
+    let mut writer = csv::Writer::from_writer(io::stdout());
+    write_gain_time_records(&mut writer, result)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_gain_time_csv(result: &GainTimeResult, path: &Path) -> Result<()> {
+    let mut writer = csv::Writer::from_path(path)?;
+    write_gain_time_records(&mut writer, result)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_gain_time_records<W: io::Write>(
+    writer: &mut csv::Writer<W>,
+    result: &GainTimeResult,
+) -> Result<()> {
+    writer.write_record([
+        "gain_m",
+        "min_time_s",
+        "avg_rate_m_per_hr",
+        "start_offset_s",
+        "end_offset_s",
+        "source",
+        "note",
+    ])?;
+
+    for point in &result.targets {
+        writer.write_record([
+            format!("{:.3}", point.gain_m),
+            if point.min_time_s.is_finite() {
+                format!("{:.3}", point.min_time_s)
+            } else {
+                String::new()
+            },
+            if point.avg_rate_m_per_hr.is_finite() {
+                format!("{:.3}", point.avg_rate_m_per_hr)
+            } else {
+                String::new()
+            },
+            point
+                .start_offset_s
+                .map(|v| format!("{:.3}", v))
+                .unwrap_or_default(),
+            point
+                .end_offset_s
+                .map(|v| format!("{:.3}", v))
+                .unwrap_or_default(),
+            result.selected_source.clone(),
+            point.note.clone().unwrap_or_default(),
+        ])?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct ChartSeries<'a> {
     label: &'a str,
@@ -817,6 +1551,433 @@ struct PlotOptions {
     show_personal: bool,
     ylog_rate: bool,
     ylog_climb: bool,
+}
+
+#[derive(Clone, Debug)]
+struct GainTimePlotOptions {
+    split_plots: bool,
+    fast_plot: bool,
+    show_wr: bool,
+    show_personal: bool,
+    ylog_time: bool,
+    unit: GainUnitOpt,
+    magic_gains: Vec<f64>,
+}
+
+fn render_gain_time_guard(
+    result: &GainTimeResult,
+    path: &Path,
+    kind: ChartKind,
+    opts: &GainTimePlotOptions,
+) -> Result<(), String> {
+    let render = || -> Result<(), String> {
+        if opts.split_plots {
+            render_gain_time_split(result, path, kind, opts)
+        } else {
+            render_gain_time_combined(result, path, kind, opts)
+                .map_err(|e| format!("plotting error: {}", e))
+        }
+    };
+
+    panic::catch_unwind(panic::AssertUnwindSafe(render))
+        .map_err(|_| "plotting backend panicked".to_string())?
+        .map_err(|err| err)
+}
+
+fn render_gain_time_combined(
+    result: &GainTimeResult,
+    path: &Path,
+    kind: ChartKind,
+    opts: &GainTimePlotOptions,
+) -> Result<()> {
+    if result.curve.is_empty() {
+        return Ok(());
+    }
+
+    match kind {
+        ChartKind::Png => {
+            let backend = BitMapBackend::new(path, (1280, 720));
+            let root = FontSafeBackend::new(backend).into_drawing_area();
+            draw_gain_time_chart(root, result, opts)?;
+        }
+        ChartKind::Svg => {
+            let backend = SVGBackend::new(path, (1280, 720));
+            let root = FontSafeBackend::new(backend).into_drawing_area();
+            draw_gain_time_chart(root, result, opts)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn render_gain_time_split(
+    result: &GainTimeResult,
+    base_path: &Path,
+    kind: ChartKind,
+    opts: &GainTimePlotOptions,
+) -> Result<(), String> {
+    if result.curve.is_empty() {
+        return Ok(());
+    }
+
+    let (time_path, rate_path) = derive_gain_time_paths(base_path);
+
+    match kind {
+        ChartKind::Png => {
+            let backend_time = BitMapBackend::new(&time_path, (1280, 720));
+            let root_time = FontSafeBackend::new(backend_time).into_drawing_area();
+            draw_gain_time_chart(root_time, result, opts)
+                .map_err(|e| format!("plotting error: {}", e))?;
+
+            let backend_rate = BitMapBackend::new(&rate_path, (1280, 720));
+            let root_rate = FontSafeBackend::new(backend_rate).into_drawing_area();
+            draw_gain_rate_chart(root_rate, result, opts)
+                .map_err(|e| format!("plotting error: {}", e))?;
+        }
+        ChartKind::Svg => {
+            let backend_time = SVGBackend::new(&time_path, (1280, 720));
+            let root_time = FontSafeBackend::new(backend_time).into_drawing_area();
+            draw_gain_time_chart(root_time, result, opts)
+                .map_err(|e| format!("plotting error: {}", e))?;
+
+            let backend_rate = SVGBackend::new(&rate_path, (1280, 720));
+            let root_rate = FontSafeBackend::new(backend_rate).into_drawing_area();
+            draw_gain_rate_chart(root_rate, result, opts)
+                .map_err(|e| format!("plotting error: {}", e))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn derive_gain_time_paths(base: &Path) -> (PathBuf, PathBuf) {
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("gain_time");
+    let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("png");
+    let time_name = format!("{}_time.{}", stem, ext);
+    let rate_name = format!("{}_rate.{}", stem, ext);
+    let time_path = base.with_file_name(time_name);
+    let rate_path = base.with_file_name(rate_name);
+    (time_path, rate_path)
+}
+
+fn draw_gain_time_chart<DB>(
+    root: DrawingArea<DB, plotters::coord::Shift>,
+    result: &GainTimeResult,
+    opts: &GainTimePlotOptions,
+) -> Result<()>
+where
+    DB: DrawingBackend,
+    DB::ErrorType: 'static,
+{
+    let mut area = root;
+    area.fill(&WHITE)?;
+
+    let gains_display: Vec<f64> = result
+        .curve
+        .iter()
+        .map(|p| gain_to_display(p.gain_m, opts.unit))
+        .collect();
+    let times_min: Vec<f64> = result.curve.iter().map(|p| p.min_time_s / 60.0).collect();
+    let max_gain_display = gains_display
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let max_gain_m = result
+        .curve
+        .iter()
+        .map(|p| p.gain_m)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let mut max_time = times_min.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+    if !max_time.is_finite() || max_time <= 0.0 {
+        max_time = 1.0;
+    }
+
+    macro_rules! draw_body {
+        ($chart:ident) => {{
+            let iso_color = RGBColor(180, 180, 180);
+            for &rate in GAIN_TIME_ISO_RATES {
+                if rate <= 0.0 {
+                    continue;
+                }
+                let mut series: Vec<(f64, f64)> = Vec::new();
+                let steps = 64;
+                for idx in 0..=steps {
+                    let gain_m = max_gain_m * idx as f64 / steps as f64;
+                    let gain_disp = gain_to_display(gain_m, opts.unit);
+                    let time_min = (gain_m / rate) * 60.0;
+                    series.push((gain_disp, time_min));
+                }
+                $chart.draw_series(LineSeries::new(series.clone(), &iso_color.mix(0.4)))?;
+                if let Some(last) = series.last() {
+                    let text_style = FontDesc::new(FontFamily::SansSerif, 14.0, FontStyle::Italic)
+                        .color(&iso_color);
+                    $chart.draw_series(std::iter::once(Text::new(
+                        format!("{:.0} m/h", rate),
+                        *last,
+                        text_style,
+                    )))?;
+                }
+            }
+
+            $chart
+                .draw_series(LineSeries::new(
+                    gains_display
+                        .iter()
+                        .zip(times_min.iter())
+                        .map(|(&g, &t)| (g, t)),
+                    &RGBColor(0, 114, 178),
+                ))?
+                .label("Min time")
+                .legend(|(x, y)| {
+                    PathElement::new(vec![(x, y), (x + 20, y)], RGBColor(0, 114, 178))
+                });
+
+            if opts.show_wr {
+                if let Some(curve) = result.wr_curve.as_ref() {
+                    $chart
+                        .draw_series(LineSeries::new(
+                            curve.iter().map(|pt| {
+                                (gain_to_display(pt.gain_m, opts.unit), pt.min_time_s / 60.0)
+                            }),
+                            &RGBColor(90, 90, 90),
+                        ))?
+                        .label("WR")
+                        .legend(|(x, y)| {
+                            PathElement::new(vec![(x, y), (x + 20, y)], RGBColor(90, 90, 90))
+                        });
+                }
+            }
+
+            if opts.show_personal {
+                if let Some(curve) = result.personal_curve.as_ref() {
+                    $chart
+                        .draw_series(LineSeries::new(
+                            curve.iter().map(|pt| {
+                                (gain_to_display(pt.gain_m, opts.unit), pt.min_time_s / 60.0)
+                            }),
+                            &RGBColor(30, 144, 255),
+                        ))?
+                        .label("Personal")
+                        .legend(|(x, y)| {
+                            PathElement::new(vec![(x, y), (x + 20, y)], RGBColor(30, 144, 255))
+                        });
+                }
+            }
+
+            $chart.draw_series(result.targets.iter().filter_map(|pt| {
+                if !pt.min_time_s.is_finite() {
+                    return None;
+                }
+                let gain_disp = gain_to_display(pt.gain_m, opts.unit);
+                let time_min = pt.min_time_s / 60.0;
+                Some(Circle::new(
+                    (gain_disp, time_min),
+                    4,
+                    RGBColor(0, 114, 178).filled(),
+                ))
+            }))?;
+
+            if !opts.fast_plot {
+                for point in &result.targets {
+                    if !point.min_time_s.is_finite() {
+                        continue;
+                    }
+                    let text_style =
+                        FontDesc::new(FontFamily::SansSerif, 14.0, FontStyle::Normal).color(&BLACK);
+                    $chart.draw_series(std::iter::once(Text::new(
+                        format_duration_hms(point.min_time_s),
+                        (
+                            gain_to_display(point.gain_m, opts.unit),
+                            point.min_time_s / 60.0,
+                        ),
+                        text_style,
+                    )))?;
+                }
+            }
+
+            if !opts.magic_gains.is_empty() {
+                for gain_m in &opts.magic_gains {
+                    if let Some(time_s) = approximate_time_from_curve(&result.curve, *gain_m) {
+                        let gain_disp = gain_to_display(*gain_m, opts.unit);
+                        let time_min = time_s / 60.0;
+                        $chart.draw_series(std::iter::once(TriangleMarker::new(
+                            (gain_disp, time_min),
+                            6,
+                            RGBColor(34, 139, 34).filled(),
+                        )))?;
+                    }
+                }
+            }
+
+            $chart
+                .configure_series_labels()
+                .background_style(&WHITE.mix(0.8))
+                .border_style(&BLACK)
+                .draw()?;
+        }};
+    }
+
+    if opts.ylog_time {
+        let min_positive = times_min
+            .iter()
+            .copied()
+            .filter(|v| *v > 0.0)
+            .fold(f64::INFINITY, f64::min)
+            .max(1e-2);
+        let mut chart = ChartBuilder::on(&area)
+            .margin(25)
+            .set_label_area_size(LabelAreaPosition::Left, 60)
+            .set_label_area_size(LabelAreaPosition::Bottom, 50)
+            .build_cartesian_2d(
+                0.0..(max_gain_display * 1.05),
+                (min_positive..(max_time * 1.1)).log_scale(),
+            )?;
+        chart
+            .configure_mesh()
+            .x_desc(format!("Gain ({})", display_gain_label(opts.unit)))
+            .y_desc("Time (min)")
+            .x_label_formatter(&|v| format!("{:.0}", v))
+            .y_label_formatter(&|v| format!("{:.1}", v))
+            .label_style(FontDesc::new(
+                FontFamily::SansSerif,
+                16.0,
+                FontStyle::Normal,
+            ))
+            .draw()?;
+        draw_body!(chart);
+    } else {
+        let mut chart = ChartBuilder::on(&area)
+            .margin(25)
+            .set_label_area_size(LabelAreaPosition::Left, 60)
+            .set_label_area_size(LabelAreaPosition::Bottom, 50)
+            .build_cartesian_2d(0.0..(max_gain_display * 1.05), 0.0..(max_time * 1.1))?;
+        chart
+            .configure_mesh()
+            .x_desc(format!("Gain ({})", display_gain_label(opts.unit)))
+            .y_desc("Time (min)")
+            .x_label_formatter(&|v| format!("{:.0}", v))
+            .y_label_formatter(&|v| format!("{:.0}", v))
+            .label_style(FontDesc::new(
+                FontFamily::SansSerif,
+                16.0,
+                FontStyle::Normal,
+            ))
+            .draw()?;
+        draw_body!(chart);
+    }
+
+    Ok(())
+}
+
+fn draw_gain_rate_chart<DB>(
+    root: DrawingArea<DB, plotters::coord::Shift>,
+    result: &GainTimeResult,
+    opts: &GainTimePlotOptions,
+) -> Result<()>
+where
+    DB: DrawingBackend,
+    DB::ErrorType: 'static,
+{
+    let mut area = root;
+    area.fill(&WHITE)?;
+
+    let gains_display: Vec<f64> = result
+        .curve
+        .iter()
+        .map(|pt| gain_to_display(pt.gain_m, opts.unit))
+        .collect();
+    let rates: Vec<f64> = result.curve.iter().map(|pt| pt.avg_rate_m_per_hr).collect();
+
+    let x_max = gains_display.iter().copied().fold(0.0, f64::max).max(1.0);
+    let mut y_max = rates.iter().copied().fold(0.0, f64::max).max(1.0);
+    if !y_max.is_finite() || y_max <= 0.0 {
+        y_max = 1.0;
+    }
+
+    let mut chart = ChartBuilder::on(&area)
+        .margin(25)
+        .set_label_area_size(LabelAreaPosition::Left, 60)
+        .set_label_area_size(LabelAreaPosition::Bottom, 50)
+        .build_cartesian_2d(0.0..(x_max * 1.05), 0.0..(y_max * 1.1))?;
+
+    chart
+        .configure_mesh()
+        .x_desc(format!("Gain ({})", display_gain_label(opts.unit)))
+        .y_desc("Average rate (m/h)")
+        .x_label_formatter(&|v| format!("{:.0}", v))
+        .y_label_formatter(&|v| format!("{:.0}", v))
+        .label_style(FontDesc::new(
+            FontFamily::SansSerif,
+            16.0,
+            FontStyle::Normal,
+        ))
+        .draw()?;
+
+    chart
+        .draw_series(LineSeries::new(
+            gains_display
+                .iter()
+                .zip(rates.iter())
+                .map(|(&g, &r)| (g, r)),
+            &RGBColor(0, 114, 178),
+        ))?
+        .label("Average rate")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RGBColor(0, 114, 178)));
+
+    if opts.show_wr {
+        if let Some(curve) = result.wr_curve.as_ref() {
+            chart
+                .draw_series(LineSeries::new(
+                    curve
+                        .iter()
+                        .map(|pt| (gain_to_display(pt.gain_m, opts.unit), pt.avg_rate_m_per_hr)),
+                    &RGBColor(90, 90, 90),
+                ))?
+                .label("WR rate")
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RGBColor(90, 90, 90)));
+        }
+    }
+
+    if opts.show_personal {
+        if let Some(curve) = result.personal_curve.as_ref() {
+            chart
+                .draw_series(LineSeries::new(
+                    curve
+                        .iter()
+                        .map(|pt| (gain_to_display(pt.gain_m, opts.unit), pt.avg_rate_m_per_hr)),
+                    &RGBColor(30, 144, 255),
+                ))?
+                .label("Personal rate")
+                .legend(|(x, y)| {
+                    PathElement::new(vec![(x, y), (x + 20, y)], RGBColor(30, 144, 255))
+                });
+        }
+    }
+
+    chart.draw_series(result.targets.iter().filter_map(|pt| {
+        if !pt.avg_rate_m_per_hr.is_finite() {
+            return None;
+        }
+        let gain_disp = gain_to_display(pt.gain_m, opts.unit);
+        Some(Circle::new(
+            (gain_disp, pt.avg_rate_m_per_hr),
+            4,
+            RGBColor(0, 114, 178).filled(),
+        ))
+    }))?;
+
+    chart
+        .configure_series_labels()
+        .background_style(&WHITE.mix(0.8))
+        .border_style(&BLACK)
+        .draw()?;
+
+    Ok(())
 }
 
 #[derive(Clone, Debug)]

@@ -15,6 +15,8 @@ use wr::build_wr_envelope;
 
 const DEFAULT_DURATIONS: &[u64] = &[60, 120, 300, 600, 1_200, 1_800, 3_600];
 
+const DEFAULT_GAIN_TARGETS: &[f64] = &[50.0, 100.0, 150.0, 200.0, 300.0, 500.0, 750.0, 1_000.0];
+
 const DEFAULT_MAGIC_TOKENS: &[&str] = &[
     "60s", "300s", "600s", "1800s", "3600s", "0.481h", "7200s", "21600s", "43200s",
 ];
@@ -178,6 +180,27 @@ pub struct SessionCurve {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GainTimePoint {
+    pub gain_m: f64,
+    pub min_time_s: f64,
+    pub avg_rate_m_per_hr: f64,
+    pub start_offset_s: Option<f64>,
+    pub end_offset_s: Option<f64>,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GainTimeResult {
+    pub curve: Vec<GainTimePoint>,
+    pub targets: Vec<GainTimePoint>,
+    pub wr_curve: Option<Vec<GainTimePoint>>,
+    pub personal_curve: Option<Vec<GainTimePoint>>,
+    pub selected_source: String,
+    pub total_span_s: f64,
+    pub total_gain_m: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Curves {
     pub points: Vec<CurvePoint>,
     pub wr_curve: Option<(Vec<u64>, Vec<f64>)>,
@@ -188,6 +211,13 @@ pub struct Curves {
     pub session_curves: Vec<SessionCurve>,
     pub selected_source: String,
     pub magic_rows: Option<Vec<HashMap<String, f64>>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TimeseriesExport {
+    pub times: Vec<f64>,
+    pub gain: Vec<f64>,
+    pub selected_source: String,
 }
 
 impl Default for Curves {
@@ -497,6 +527,74 @@ impl Timeseries {
     }
 }
 
+pub fn compute_timeseries_export(
+    records_by_file: Vec<Vec<FitRecord>>,
+    params: &Params,
+) -> Result<TimeseriesExport, HcError> {
+    if records_by_file.is_empty() {
+        return Err(HcError::InsufficientData);
+    }
+
+    let merged = merge_records(
+        &records_by_file,
+        params.merge_eps_sec,
+        &params.overlap_policy,
+    );
+    if merged.is_empty() {
+        return Err(HcError::InsufficientData);
+    }
+
+    let mut timeseries = build_timeseries(&merged, params)?;
+    if timeseries.len() < 2 {
+        return Err(HcError::InsufficientData);
+    }
+
+    if params.qc_enabled {
+        apply_qc(&mut timeseries, params);
+    }
+
+    let (times_out, gain_out) = if params.resample_1hz {
+        let samples: Vec<(f64, f64)> = timeseries
+            .times
+            .iter()
+            .zip(timeseries.gain.iter())
+            .map(|(&t, &g)| (t, g))
+            .collect();
+        let (mut t_resampled, mut g_resampled) = resample_1hz(&samples);
+        normalize_timeseries(
+            &mut t_resampled,
+            &mut g_resampled,
+            Option::<&mut Vec<bool>>::None,
+        );
+        (t_resampled, g_resampled)
+    } else {
+        (timeseries.times.clone(), timeseries.gain.clone())
+    };
+
+    let selected_source = if timeseries.used_sources.is_empty() {
+        match params.source {
+            Source::Auto => "mixed".to_string(),
+            Source::Runn => "runn".to_string(),
+            Source::Altitude => "altitude".to_string(),
+        }
+    } else if timeseries.used_sources.len() == 1 {
+        timeseries
+            .used_sources
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "mixed".to_string())
+    } else {
+        "mixed".to_string()
+    };
+
+    Ok(TimeseriesExport {
+        times: times_out,
+        gain: gain_out,
+        selected_source,
+    })
+}
+
 /// Compute hillclimb curves from per-file FIT/GPX records.
 pub fn compute_curves(
     records_by_file: Vec<Vec<FitRecord>>,
@@ -522,6 +620,18 @@ pub fn compute_curves(
 
     if params.qc_enabled {
         apply_qc(&mut timeseries, params);
+    }
+
+    let total_gain =
+        if let (Some(first), Some(last)) = (timeseries.gain.first(), timeseries.gain.last()) {
+            last - first
+        } else {
+            0.0
+        };
+    if total_gain <= 0.01 {
+        return Err(HcError::InvalidParameter(
+            "no positive ascent recorded after preprocessing".into(),
+        ));
     }
 
     let mut points: Vec<CurvePoint>;
@@ -643,6 +753,200 @@ pub fn compute_curves(
         session_curves,
         selected_source,
         magic_rows,
+    })
+}
+
+pub fn compute_gain_time(
+    records_by_file: Vec<Vec<FitRecord>>,
+    params: &Params,
+    targets: &[f64],
+) -> Result<GainTimeResult, HcError> {
+    if records_by_file.is_empty() {
+        return Err(HcError::InsufficientData);
+    }
+
+    let merged = merge_records(
+        &records_by_file,
+        params.merge_eps_sec,
+        &params.overlap_policy,
+    );
+    if merged.is_empty() {
+        return Err(HcError::InsufficientData);
+    }
+
+    let mut timeseries = build_timeseries(&merged, params)?;
+    if timeseries.len() < 3 {
+        return Err(HcError::InsufficientData);
+    }
+
+    if params.qc_enabled {
+        apply_qc(&mut timeseries, params);
+    }
+
+    let mut points: Vec<CurvePoint>;
+    let base_durations: Vec<u64>;
+
+    if params.all_windows {
+        let step = params.step_s.max(1);
+        let (series_times, series_gain) = if params.resample_1hz {
+            (timeseries.times.clone(), timeseries.gain.clone())
+        } else {
+            let samples: Vec<(f64, f64)> = timeseries
+                .times
+                .iter()
+                .zip(timeseries.gain.iter())
+                .map(|(&t, &g)| (t, g))
+                .collect();
+            let (mut t_resampled, mut g_resampled) = resample_1hz(&samples);
+            normalize_timeseries(
+                &mut t_resampled,
+                &mut g_resampled,
+                Option::<&mut Vec<bool>>::None,
+            );
+            (t_resampled, g_resampled)
+        };
+
+        ensure_uniform_sampling(&series_times)?;
+
+        points = compute_curve_all_windows(&series_times, &series_gain, step);
+        if points.is_empty() {
+            return Err(HcError::InsufficientData);
+        }
+        base_durations = points.iter().map(|p| p.duration_s).collect();
+    } else {
+        let durations = build_duration_list(timeseries.span, params);
+        if durations.is_empty() {
+            return Err(HcError::InvalidParameter("no durations available".into()));
+        }
+        points = compute_curve_points(&timeseries, &durations, params);
+        base_durations = durations;
+    }
+
+    enforce_curve_shape(
+        &mut points,
+        &timeseries.inactivity_gaps,
+        params.concave_envelope && !params.exhaustive,
+    );
+
+    let mut wr_curve: Option<(Vec<u64>, Vec<f64>)> = None;
+    let mut wr_gains_interp: Option<Vec<f64>> = None;
+
+    match build_wr_envelope(
+        &params.wr_profile.to_lowercase(),
+        params.wr_min_seconds,
+        params.wr_anchors_path.as_ref().map(|p| p.as_path()),
+        &params.wr_short_cap,
+    ) {
+        Ok(env) => {
+            if !env.cap_info.is_empty() {
+                if let Some(v_cap) = env.cap_info.get("v_cap") {
+                    tracing::info!("WR cap {:.3} m/s", v_cap);
+                }
+            }
+            let (dur_u64, climbs_dedup, _) =
+                quantize_wr_samples(&env.durations, &env.climbs, &env.rates_avg);
+            wr_curve = Some((dur_u64, climbs_dedup));
+            wr_gains_interp = Some(
+                base_durations
+                    .iter()
+                    .map(|&d| env.model.evaluate(d as f64))
+                    .collect(),
+            );
+        }
+        Err(err) => {
+            tracing::warn!("WR envelope unavailable: {}", err);
+        }
+    }
+
+    let (personal_curve, _, _) =
+        build_scoring_overlays(&points, &base_durations, params, wr_gains_interp.as_deref());
+
+    let selected_source = if timeseries.used_sources.is_empty() {
+        match params.source {
+            Source::Auto => "mixed".to_string(),
+            Source::Runn => "runn".to_string(),
+            Source::Altitude => "altitude".to_string(),
+        }
+    } else if timeseries.used_sources.len() == 1 {
+        timeseries
+            .used_sources
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "mixed".to_string())
+    } else {
+        "mixed".to_string()
+    };
+
+    let total_gain_m = timeseries.gain.last().copied().unwrap_or(0.0);
+    let total_span_s = timeseries.span;
+
+    let gain_curve = gain_time_curve_from_points(&points);
+    let wr_gain_curve = wr_curve
+        .as_ref()
+        .map(|(durs, gains)| convert_duration_series_to_gain_time(durs, gains));
+    let personal_gain_curve = personal_curve
+        .as_ref()
+        .map(|(durs, gains)| convert_duration_series_to_gain_time(durs, gains));
+
+    let mut target_values: Vec<f64> = targets
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .collect();
+    if target_values.is_empty() {
+        target_values.extend_from_slice(DEFAULT_GAIN_TARGETS);
+    }
+    target_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    target_values.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+
+    let approx_points = invert_curve_targets(&points, &target_values);
+    let direct_points = min_time_for_targets(&timeseries.times, &timeseries.gain, &target_values);
+
+    let targets_points = if direct_points.len() != target_values.len() {
+        tracing::warn!("gain-time refinement failed; falling back to envelope inversion");
+        approx_points
+    } else {
+        let mut merged = Vec::with_capacity(target_values.len());
+        let mut approx_map: HashMap<i64, GainTimePoint> = HashMap::new();
+        for pt in approx_points.into_iter() {
+            let key = (pt.gain_m * 1_000_000.0).round() as i64;
+            approx_map.insert(key, pt);
+        }
+        for (gain_value, direct_pt) in target_values.iter().copied().zip(direct_points.into_iter())
+        {
+            let key = (gain_value * 1_000_000.0).round() as i64;
+            let approx_pt = approx_map.get(&key);
+            let mut note = direct_pt.note.clone();
+            if note.as_deref() != Some("unachievable") {
+                if let Some(approx) = approx_pt {
+                    if approx.note.as_deref() == Some("bounded_by_grid")
+                        || (approx.min_time_s - direct_pt.min_time_s) > 1.5
+                    {
+                        note = Some("bounded_by_grid".to_string());
+                    }
+                }
+            }
+            merged.push(GainTimePoint {
+                gain_m: direct_pt.gain_m,
+                min_time_s: direct_pt.min_time_s,
+                avg_rate_m_per_hr: direct_pt.avg_rate_m_per_hr,
+                start_offset_s: direct_pt.start_offset_s,
+                end_offset_s: direct_pt.end_offset_s,
+                note,
+            });
+        }
+        merged
+    };
+
+    Ok(GainTimeResult {
+        curve: gain_curve,
+        targets: targets_points,
+        wr_curve: wr_gain_curve,
+        personal_curve: personal_gain_curve,
+        selected_source,
+        total_span_s,
+        total_gain_m,
     })
 }
 
@@ -3574,6 +3878,288 @@ fn build_envelope(points: &[CurvePoint]) -> (Vec<u64>, Vec<f64>) {
     }
 
     (durations_sorted, envelope)
+}
+
+fn gain_time_curve_from_points(points: &[CurvePoint]) -> Vec<GainTimePoint> {
+    let mut curve: Vec<GainTimePoint> = points
+        .iter()
+        .map(|cp| {
+            let duration = cp.duration_s as f64;
+            let gain = cp.max_climb_m.max(0.0);
+            let rate = if duration > 0.0 {
+                gain / duration * 3_600.0
+            } else {
+                0.0
+            };
+            GainTimePoint {
+                gain_m: gain,
+                min_time_s: duration,
+                avg_rate_m_per_hr: rate,
+                start_offset_s: Some(cp.start_offset_s),
+                end_offset_s: Some(cp.end_offset_s),
+                note: None,
+            }
+        })
+        .collect();
+
+    curve.sort_by(|a, b| a.gain_m.partial_cmp(&b.gain_m).unwrap_or(Ordering::Equal));
+
+    let mut deduped: Vec<GainTimePoint> = Vec::new();
+    for point in curve.into_iter() {
+        if let Some(last) = deduped.last_mut() {
+            if (point.gain_m - last.gain_m).abs() < 1e-9 {
+                if point.min_time_s < last.min_time_s {
+                    *last = point;
+                }
+            } else {
+                deduped.push(point);
+            }
+        } else {
+            deduped.push(point);
+        }
+    }
+
+    deduped
+}
+
+fn convert_duration_series_to_gain_time(durations: &[u64], gains: &[f64]) -> Vec<GainTimePoint> {
+    let len = durations.len().min(gains.len());
+    if len == 0 {
+        return Vec::new();
+    }
+
+    let mut curve: Vec<GainTimePoint> = durations
+        .iter()
+        .zip(gains.iter())
+        .take(len)
+        .map(|(&duration, &gain)| {
+            let duration_f = duration as f64;
+            let gain_f = gain.max(0.0);
+            let rate = if duration_f > 0.0 {
+                gain_f / duration_f * 3_600.0
+            } else {
+                0.0
+            };
+            GainTimePoint {
+                gain_m: gain_f,
+                min_time_s: duration_f,
+                avg_rate_m_per_hr: rate,
+                start_offset_s: None,
+                end_offset_s: None,
+                note: None,
+            }
+        })
+        .collect();
+
+    curve.sort_by(|a, b| a.gain_m.partial_cmp(&b.gain_m).unwrap_or(Ordering::Equal));
+
+    let mut deduped: Vec<GainTimePoint> = Vec::new();
+    for point in curve.into_iter() {
+        if let Some(last) = deduped.last_mut() {
+            if (point.gain_m - last.gain_m).abs() < 1e-9 {
+                if point.min_time_s < last.min_time_s {
+                    *last = point;
+                }
+            } else {
+                deduped.push(point);
+            }
+        } else {
+            deduped.push(point);
+        }
+    }
+
+    deduped
+}
+
+fn invert_curve_targets(points: &[CurvePoint], targets: &[f64]) -> Vec<GainTimePoint> {
+    let mut out = Vec::with_capacity(targets.len());
+    if points.is_empty() {
+        return out;
+    }
+
+    let mut sorted: Vec<&CurvePoint> = points.iter().collect();
+    sorted.sort_by(|a, b| a.duration_s.cmp(&b.duration_s));
+
+    let mut gains: Vec<f64> = sorted.iter().map(|cp| cp.max_climb_m.max(0.0)).collect();
+    for idx in 1..gains.len() {
+        if gains[idx] < gains[idx - 1] {
+            gains[idx] = gains[idx - 1];
+        }
+    }
+    let max_gain = gains.last().copied().unwrap_or(0.0);
+
+    for &target in targets {
+        if target <= 0.0 {
+            out.push(GainTimePoint {
+                gain_m: target.max(0.0),
+                min_time_s: 0.0,
+                avg_rate_m_per_hr: 0.0,
+                start_offset_s: Some(0.0),
+                end_offset_s: Some(0.0),
+                note: None,
+            });
+            continue;
+        }
+        if target > max_gain + 1e-6 {
+            out.push(GainTimePoint {
+                gain_m: target,
+                min_time_s: f64::INFINITY,
+                avg_rate_m_per_hr: 0.0,
+                start_offset_s: None,
+                end_offset_s: None,
+                note: Some("unachievable".to_string()),
+            });
+            continue;
+        }
+
+        let mut idx = 0usize;
+        while idx < gains.len() && gains[idx] < target - 1e-6 {
+            idx += 1;
+        }
+        if idx >= gains.len() {
+            out.push(GainTimePoint {
+                gain_m: target,
+                min_time_s: f64::INFINITY,
+                avg_rate_m_per_hr: 0.0,
+                start_offset_s: None,
+                end_offset_s: None,
+                note: Some("unachievable".to_string()),
+            });
+            continue;
+        }
+
+        let point = sorted[idx];
+        let duration = point.duration_s as f64;
+        let achieved_gain = gains[idx];
+        let rate = if duration > 0.0 {
+            achieved_gain / duration * 3_600.0
+        } else {
+            0.0
+        };
+        let mut note = None;
+        if achieved_gain - target > 1e-6 && idx > 0 {
+            let prev = sorted[idx - 1];
+            let delta = point.duration_s as f64 - prev.duration_s as f64;
+            if delta.abs() > 1.5 {
+                note = Some("bounded_by_grid".to_string());
+            }
+        }
+
+        out.push(GainTimePoint {
+            gain_m: target,
+            min_time_s: duration,
+            avg_rate_m_per_hr: rate,
+            start_offset_s: Some(point.start_offset_s),
+            end_offset_s: Some(point.end_offset_s),
+            note,
+        });
+    }
+
+    out
+}
+
+fn min_time_for_targets(times: &[f64], gains: &[f64], targets: &[f64]) -> Vec<GainTimePoint> {
+    if times.is_empty() || gains.is_empty() || targets.is_empty() {
+        return Vec::new();
+    }
+
+    let mut gains_monotone = gains.to_vec();
+    for idx in 1..gains_monotone.len() {
+        if gains_monotone[idx] < gains_monotone[idx - 1] {
+            gains_monotone[idx] = gains_monotone[idx - 1];
+        }
+    }
+    let total_gain = gains_monotone.last().copied().unwrap_or(0.0);
+
+    let mut merged: Vec<Option<GainTimePoint>> = vec![None; targets.len()];
+    let mut zero_indices = Vec::new();
+    let mut positives = Vec::new();
+    for (idx, &target) in targets.iter().enumerate() {
+        if !target.is_finite() || target < 0.0 {
+            continue;
+        }
+        if target <= 0.0 {
+            zero_indices.push(idx);
+        } else {
+            positives.push((target, idx));
+        }
+    }
+
+    for idx in zero_indices {
+        merged[idx] = Some(GainTimePoint {
+            gain_m: 0.0,
+            min_time_s: 0.0,
+            avg_rate_m_per_hr: 0.0,
+            start_offset_s: Some(0.0),
+            end_offset_s: Some(0.0),
+            note: None,
+        });
+    }
+
+    if positives.is_empty() {
+        return merged.into_iter().filter_map(|x| x).collect();
+    }
+
+    positives.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    let eps = 1e-9;
+
+    for (target_gain, original_idx) in positives.iter().copied() {
+        if target_gain > total_gain + 1e-6 {
+            merged[original_idx] = Some(GainTimePoint {
+                gain_m: target_gain,
+                min_time_s: f64::INFINITY,
+                avg_rate_m_per_hr: 0.0,
+                start_offset_s: None,
+                end_offset_s: None,
+                note: Some("unachievable".to_string()),
+            });
+            continue;
+        }
+        let mut left = 0usize;
+        let mut best_duration = f64::INFINITY;
+        let mut best_range = None;
+        for right in 0..times.len() {
+            while left < right
+                && (gains_monotone[right] - gains_monotone[left]) >= target_gain - eps
+            {
+                let duration = times[right] - times[left];
+                if duration > 0.0 && duration + eps < best_duration {
+                    best_duration = duration;
+                    best_range = Some((left, right));
+                }
+                left += 1;
+            }
+            if left > right {
+                left = right;
+            }
+        }
+        if let Some((start_idx, end_idx)) = best_range {
+            let avg_rate = if best_duration > 0.0 {
+                target_gain / best_duration * 3_600.0
+            } else {
+                0.0
+            };
+            merged[original_idx] = Some(GainTimePoint {
+                gain_m: target_gain,
+                min_time_s: best_duration,
+                avg_rate_m_per_hr: avg_rate,
+                start_offset_s: Some(times[start_idx]),
+                end_offset_s: Some(times[end_idx]),
+                note: None,
+            });
+        } else {
+            merged[original_idx] = Some(GainTimePoint {
+                gain_m: target_gain,
+                min_time_s: f64::INFINITY,
+                avg_rate_m_per_hr: 0.0,
+                start_offset_s: None,
+                end_offset_s: None,
+                note: Some("unachievable".to_string()),
+            });
+        }
+    }
+
+    merged.into_iter().filter_map(|x| x).collect()
 }
 
 #[cfg(test)]

@@ -35,11 +35,17 @@ Examples (recommended):
 # Diagnostics (summarize fields and candidate gain keys)
 .venv/bin/python hc_curve.py diagnose Tracklogs/Treadmill/*.fit --out fit_diagnostics.txt
 
+# Export canonical time/gain series for external tools
+.venv/bin/python hc_curve.py export-series Tracklogs/Treadmill/20387570593_ACTIVITY.fit -o outputs/timeseries.csv
+
 # Exhaustive curve (every second up to activity length)
 .venv/bin/python hc_curve.py curve activity.fit -o exhaustive_curve.csv --all --resample-1hz --split-plots --goal-min-seconds 120 --personal-min-seconds 60
 
 # Exhaustive up to 2 hours with 5s steps
 .venv/bin/python hc_curve.py curve activity.fit -o exhaustive_curve.csv --exhaustive --max-duration 7200 --step 5 --split-plots --goal-min-seconds 120 --personal-min-seconds 60
+
+# Gain-centric report (best time for target gains)
+.venv/bin/python hc_curve.py time activity.fit -g 50,100 200ft --gains-from docs/targets_example.txt -o gain_time.csv --all --plot-wr --gain-units m --magic-gains 50m,100m,200m
 ```
 
 Options:
@@ -58,6 +64,9 @@ Options:
 - `--parse-workers`: Thread pool size for FIT parsing (0 = auto, 1 = serial).
 - `--fast-plot/--no-fast-plot`: Skip heavy annotations on plots for faster rendering (default fast).
 - `--profile`: Emit per-stage timing to the log for quick performance investigations.
+- `--gains-from`: Load gain targets from a file (one per line, accepts `m|ft` suffix); values merge with `--gains`.
+- `time` command extras: `--gains/-g` (comma and space separated), `--gains-from`, `--gain-units`, `--magic-gains`, `--ylog-time`, and `--split-plots` control the gain-centric report; CSV columns remain meters while plots reflect the requested display units.
+- `export-series` writes the canonical cumulative gain series after QC/resampling; combine with the Mathematica helper in `docs/mathematica_gain_time.wl` for external validation pipelines.
 
 Rust CLI (hc_curve_rs)
 ----------------------
@@ -77,6 +86,7 @@ CSV columns
 - `climb_rate_m_per_hr`: Best average climb rate (m/h) for that duration.
 - `start_offset_s`, `end_offset_s`: Window offsets (seconds) from activity start.
 - `source`: Data source used (`runn_total_gain` or `altitude`).
+- `gain_time.csv` adds `gain_m`, `min_time_s`, `avg_rate_m_per_hr`, `start_offset_s`, `end_offset_s`, `source`, and `note` (e.g., `bounded_by_grid`, `unachievable`).
 
 Notes
 -----
@@ -89,6 +99,7 @@ Notes
 - If developer total gain is present in any file (e.g., NPE Runn), it is preferred and stitched across files, handling counter resets at file boundaries.
 - If no total gain is present but treadmill `incline` and `distance` exist (e.g., `inclineRunn` + `distance`), ascent is derived by integrating positive vertical: `delta_vertical = max(incline,0)% * delta_distance`.
 - Otherwise altitude-derived ascent is computed as the sum of positive elevation deltas.
+- Additional references: `docs/usage_recipes.md` (common CLI scenarios) and `docs/verification.md` (cross-check workflow for Python/Rust/Mathematica).
 
 Developer field names
 ---------------------

@@ -9,6 +9,7 @@ import time
 import heapq
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Optional, Tuple, Dict, Any, Set, NamedTuple, Union, Literal, Sequence
 import json
 import pickle
@@ -218,6 +219,34 @@ def _parse_gain_list(tokens: Sequence[Union[str, float, int]], *, default_unit: 
     return [float(g) for g in unique_sorted]
 
 
+def _expand_gain_tokens(tokens: Sequence[Union[str, float, int]]) -> List[str]:
+    expanded: List[str] = []
+    for tok in tokens:
+        if tok is None:
+            continue
+        text = str(tok).strip()
+        if not text:
+            continue
+        # Treat commas and whitespace as separators.
+        for part in text.replace(",", " ").split():
+            if part:
+                expanded.append(part)
+    return expanded
+
+
+def _load_gain_tokens_from_file(path_str: str) -> List[str]:
+    path = Path(path_str).expanduser()
+    data = path.read_text(encoding="utf-8")
+    lines = data.splitlines()
+    tokens: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        tokens.extend(_expand_gain_tokens([stripped]))
+    return tokens
+
+
 def _fmt_time_hms(seconds: float) -> str:
     if not math.isfinite(seconds) or seconds < 0:
         return "--:--"
@@ -249,8 +278,46 @@ def _token_is_likely_gain(token: str, *, default_unit: str = "m") -> bool:
         return False
     if "*" in token or "?" in token:
         return False
-    parsed = _parse_gain_token(token, default_unit=default_unit)
-    return parsed is not None
+    parts = token.replace(",", " ").split()
+    if not parts:
+        parts = [token]
+    any_valid = False
+    for part in parts:
+        parsed = _parse_gain_token(part, default_unit=default_unit)
+        if parsed is None:
+            return False
+        any_valid = True
+    return any_valid
+
+
+def _assert_monotonic_non_decreasing(values: Sequence[float], *, name: str, tol: float = 1e-6) -> None:
+    if not logging.getLogger().isEnabledFor(logging.DEBUG):
+        return
+    if not values:
+        return
+    prev = float(values[0])
+    for idx in range(1, len(values)):
+        current = float(values[idx])
+        if current + tol < prev:
+            raise AssertionError(
+                f"{name} violates monotonicity at index {idx}: {current:.6f} < {prev:.6f}"
+            )
+        if current > prev:
+            prev = current
+
+
+def _is_uniform_1hz(times: Sequence[float], *, tol: float = 1e-6) -> bool:
+    if len(times) < 2:
+        return False
+    dt = float(times[1]) - float(times[0])
+    if abs(dt - 1.0) > tol:
+        return False
+    for idx in range(2, len(times)):
+        prev = float(times[idx - 1])
+        current = float(times[idx])
+        if abs((current - prev) - 1.0) > tol:
+            return False
+    return True
 
 
 def _format_gain(value_m: float, unit: str = "m") -> str:
@@ -350,6 +417,89 @@ def min_time_for_gains(
             avg_rate_m_per_hr=avg_rate,
             start_offset_s=float(t_arr[best_start]),
             end_offset_s=float(t_arr[best_end]),
+            note=None,
+        )
+
+    return [pt for pt in merged if pt is not None]
+
+
+def min_time_for_gains_numba(
+    times: Sequence[float],
+    cumulative_gain: Sequence[float],
+    targets: Sequence[float],
+) -> List[GainTimePoint]:
+    if not HAVE_NUMBA:
+        raise RuntimeError("Numba is not available")
+    if not times or not cumulative_gain or not targets:
+        return []
+
+    t_arr = np.asarray(times, dtype=np.float64)
+    g_arr = np.asarray(cumulative_gain, dtype=np.float64)
+    if t_arr.shape != g_arr.shape or t_arr.size == 0:
+        return []
+
+    g_arr = np.maximum.accumulate(g_arr)
+    total_gain = float(g_arr[-1])
+
+    merged: List[Optional[GainTimePoint]] = [None] * len(targets)
+    positive: List[Tuple[float, int]] = []
+    for idx, target in enumerate(targets):
+        if not math.isfinite(target) or target < 0.0:
+            continue
+        if target <= 0.0:
+            merged[idx] = GainTimePoint(
+                gain_m=0.0,
+                min_time_s=0.0,
+                avg_rate_m_per_hr=0.0,
+                start_offset_s=0.0,
+                end_offset_s=0.0,
+                note=None,
+            )
+        elif target > total_gain + 1e-6:
+            merged[idx] = GainTimePoint(
+                gain_m=float(target),
+                min_time_s=float("inf"),
+                avg_rate_m_per_hr=0.0,
+                start_offset_s=None,
+                end_offset_s=None,
+                note="unachievable",
+            )
+        else:
+            positive.append((float(target), idx))
+
+    if not positive:
+        return [pt for pt in merged if pt is not None]
+
+    positive.sort(key=lambda x: x[0])
+    sorted_targets = np.ascontiguousarray(np.asarray([val for val, _ in positive], dtype=np.float64))
+    durations, start_idx_arr, end_idx_arr = _numba_min_time_for_gains_kernel(
+        np.ascontiguousarray(t_arr),
+        np.ascontiguousarray(g_arr),
+        sorted_targets,
+        NUMBA_EPS,
+    )
+
+    for pos_idx, (target_gain, original_idx) in enumerate(positive):
+        duration = float(durations[pos_idx])
+        start_idx = int(start_idx_arr[pos_idx])
+        end_idx = int(end_idx_arr[pos_idx])
+        if not math.isfinite(duration) or start_idx < 0 or end_idx < 0:
+            merged[original_idx] = GainTimePoint(
+                gain_m=target_gain,
+                min_time_s=float("inf"),
+                avg_rate_m_per_hr=0.0,
+                start_offset_s=None,
+                end_offset_s=None,
+                note="unachievable",
+            )
+            continue
+        avg_rate = target_gain / duration * 3600.0 if duration > 0.0 else 0.0
+        merged[original_idx] = GainTimePoint(
+            gain_m=target_gain,
+            min_time_s=duration,
+            avg_rate_m_per_hr=avg_rate,
+            start_offset_s=float(t_arr[start_idx]),
+            end_offset_s=float(t_arr[end_idx]),
             note=None,
         )
 
@@ -2239,9 +2389,56 @@ if HAVE_NUMBA:
 
         return gains, starts
 
+    @njit(cache=True, fastmath=True)
+    def _numba_min_time_for_gains_kernel(
+        times: np.ndarray,
+        gains: np.ndarray,
+        targets: np.ndarray,
+        eps: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        m = targets.shape[0]
+        durations = np.empty(m, dtype=np.float64)
+        start_idx = np.full(m, -1, dtype=np.int64)
+        end_idx = np.full(m, -1, dtype=np.int64)
+        n = times.shape[0]
+        if n == 0:
+            return durations, start_idx, end_idx
+        total_gain = gains[n - 1]
+        for ti in range(m):
+            target = targets[ti]
+            if target <= 0.0:
+                durations[ti] = 0.0
+                start_idx[ti] = 0
+                end_idx[ti] = 0
+                continue
+            if target > total_gain + 1e-6:
+                durations[ti] = np.inf
+                continue
+            left = 0
+            best_duration = np.inf
+            best_start = -1
+            best_end = -1
+            for right in range(n):
+                while left < right and gains[right] - gains[left] >= target - eps:
+                    duration = times[right] - times[left]
+                    if duration > 0.0 and duration + eps < best_duration:
+                        best_duration = duration
+                        best_start = left
+                        best_end = right
+                    left += 1
+                if left > right:
+                    left = right
+            durations[ti] = best_duration
+            start_idx[ti] = best_start
+            end_idx[ti] = best_end
+        return durations, start_idx, end_idx
+
 else:  # pragma: no cover - fallback when numba missing
 
     def _numba_curve_kernel(*args, **kwargs):  # type: ignore[misc]
+        raise RuntimeError("Numba engine requested but numba is unavailable")
+
+    def _numba_min_time_for_gains_kernel(*args, **kwargs):  # type: ignore[misc]
         raise RuntimeError("Numba engine requested but numba is unavailable")
 
 def _compute_curve_numba(
@@ -2996,13 +3193,14 @@ def _apply_qc_censor(
     times: List[float],
     values: List[float],
     qc_spec: Dict[float, float],
-) -> Tuple[List[float], int, float]:
+) -> Tuple[List[float], int, float, List[Tuple[float, float, float]]]:
     if not qc_spec:
-        return list(values), 0, 0.0
+        return list(values), 0, 0.0, []
     vals = list(values)
     n = len(vals)
     segments_removed = 0
     gain_removed = 0.0
+    details: List[Tuple[float, float, float]] = []
     eps = 1e-9
     for window_sec, limit_gain in sorted(qc_spec.items(), key=lambda kv: kv[0]):
         if window_sec <= 0 or limit_gain <= 0:
@@ -3026,6 +3224,7 @@ def _apply_qc_censor(
                         vals[k] -= delta
                     segments_removed += 1
                     gain_removed += delta
+                    details.append((times[i], times[j], delta))
                     continue  # Re-evaluate same j with flattened values
                 j += 1
             i += 1
@@ -3036,7 +3235,7 @@ def _apply_qc_censor(
             vals[idx] = last
         else:
             last = vals[idx]
-    return vals, segments_removed, gain_removed
+    return vals, segments_removed, gain_removed, details
 
 
 def _load_activity_series(
@@ -3110,16 +3309,33 @@ def _load_activity_series(
                 logging.warning("Failed to load QC spec %s: %s", qc_spec_path, exc)
 
     if qc_limits:
-        values, qc_segments, qc_removed = _apply_qc_censor(times, values, qc_limits)
+        values, qc_segments, qc_removed, qc_details = _apply_qc_censor(times, values, qc_limits)
         if qc_segments:
             logging.info(
                 "QC censored %d spike segment(s); removed %.1f m of ascent.",
                 qc_segments,
                 qc_removed,
             )
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                base_time = times[0] if times else 0.0
+                preview = qc_details[:5]
+                for start, end, delta in preview:
+                    logging.debug(
+                        "QC window removed %.2f m over %.1f s (start offset %.1f s)",
+                        delta,
+                        end - start,
+                        start - base_time,
+                    )
+                if len(qc_details) > len(preview):
+                    logging.debug(
+                        "QC window log truncated (%d additional removal(s) suppressed)",
+                        len(qc_details) - len(preview),
+                    )
+        _assert_monotonic_non_decreasing(values, name="cumulative gain after QC")
 
     if resample_1hz:
         times, values = _resample_to_1hz(times, values)
+        _assert_monotonic_non_decreasing(values, name="cumulative gain after resample")
 
     session_gap_list = _find_gaps(times, session_gap_sec)
     if session_gap_list:
@@ -3142,6 +3358,7 @@ def _load_activity_series(
     else:
         selected_raw = "mixed"
     selected_label = _normalize_source_label(selected_raw)
+    _assert_monotonic_non_decreasing(values, name="cumulative gain final")
 
     return ActivitySeries(
         times=times,
@@ -5485,12 +5702,28 @@ def _run(
         logging.error(str(e))
         return 2
 
+    if values:
+        total_ascent = float(values[-1]) - float(values[0])
+    else:
+        total_ascent = 0.0
+    if total_ascent <= 0.01:
+        logging.error(
+            "No positive ascent recorded after preprocessing/QC (source=%s); nothing to compute.",
+            selected,
+        )
+        return 3
+
     duration_grid: List[int] = []
 
     if all_windows:
         step_for_all = step_s if step_s > 0 else 1
         if not resample_1hz:
-            times, values = _resample_to_1hz(times, values)
+            if _is_uniform_1hz(times):
+                offset = times[0]
+                if abs(offset) > 1e-9:
+                    times = [float(t - offset) for t in times]
+            else:
+                times, values = _resample_to_1hz(times, values)
         curve = all_windows_curve(times, values, step=step_for_all)
         duration_grid = [cp.duration_s for cp in curve]
         profiler.lap("curve")
@@ -5819,6 +6052,17 @@ def _run_gain_time(
         logging.error("No data available to compute gain-time report after preprocessing.")
         return 2
 
+    if values:
+        total_ascent = float(values[-1]) - float(values[0])
+    else:
+        total_ascent = 0.0
+    if total_ascent <= 0.01:
+        logging.error(
+            "No positive ascent recorded after preprocessing/QC (source=%s); gain-time report is empty.",
+            selected_label,
+        )
+        return 3
+
     if all_windows:
         step_for_all = step_s if step_s > 0 else 1
         if not resample_1hz:
@@ -5924,10 +6168,13 @@ def _run_gain_time(
 
     default_targets = list(DEFAULT_GAIN_TARGETS)
     gain_unit_norm = gain_units.lower()
-    if gains:
-        target_gains = _parse_gain_list(gains, default_unit=gain_unit_norm)
-    else:
-        target_gains = default_targets
+    target_gains = _parse_gain_list(gains, default_unit=gain_unit_norm) if gains else []
+    if gains and not target_gains:
+        logging.warning(
+            "No valid gain tokens parsed from --gains/--gains-from inputs; "
+            "falling back to defaults (%s).",
+            ", ".join(f"{val:.0f}m" for val in default_targets),
+        )
     if not target_gains:
         target_gains = default_targets
     target_gains = [float(val) for val in sorted({round(v, 6) for v in target_gains}) if val > 0]
@@ -5941,7 +6188,16 @@ def _run_gain_time(
         source_label=selected_label,
     )
     approx_map: Dict[float, GainTimePoint] = {round(pt.gain_m, 6): pt for pt in targets_curve.points}
-    direct_points = min_time_for_gains(times, values, target_gains)
+    prefer_numba = HAVE_NUMBA and engine_mode in ("numba", "auto")
+    direct_points: List[GainTimePoint]
+    if prefer_numba and target_gains:
+        try:
+            direct_points = min_time_for_gains_numba(times, values, target_gains)
+        except Exception as exc:  # pragma: no cover - numba runtime fallback
+            logging.debug("Numba min-time sweep failed (%s); falling back to numpy path.", exc)
+            direct_points = min_time_for_gains(times, values, target_gains)
+    else:
+        direct_points = min_time_for_gains(times, values, target_gains)
 
     if len(direct_points) != len(target_gains):
         logging.warning("Failed to refine gain targets; falling back to envelope inversion only.")
@@ -6180,6 +6436,11 @@ def _build_typer_app():  # pragma: no cover
     def time(
         fit_files: List[str] = typer.Argument(..., help="One or more input .fit files"),
         gains: List[str] = typer.Option([], "--gains", "-g", help="Gain targets (accepts suffix m or ft)."),
+        gains_from: Optional[str] = typer.Option(
+            None,
+            "--gains-from",
+            help="Path to a file with gain targets (one per line, supports m|ft suffix).",
+        ),
         output: str = typer.Option(
             "gain_time.csv",
             "--output",
@@ -6227,7 +6488,14 @@ def _build_typer_app():  # pragma: no cover
         units_norm = gain_units.lower()
         if units_norm not in ("m", "ft"):
             raise typer.BadParameter("gain-units must be 'm' or 'ft'")
-        gains_list = list(gains)
+        gains_list: List[str] = _expand_gain_tokens(gains)
+        if gains_from:
+            try:
+                gains_from_tokens = _load_gain_tokens_from_file(gains_from)
+            except OSError as exc:
+                raise typer.BadParameter(f"Unable to read gains-from file '{gains_from}': {exc}") from exc
+            gains_list.extend(gains_from_tokens)
+
         filtered_files: List[str] = []
         for token in fit_files:
             if _token_is_likely_gain(token, default_unit=units_norm):

@@ -28,6 +28,7 @@ Basic usage:
 
 ```
 cargo run -p hc_curve_cli -- curve Tracklogs/Treadmill/*.fit -o outputs/curve.csv --png outputs/curve.png
+cargo run -p hc_curve_cli -- gain-time Tracklogs/Treadmill/*.fit -g 50,100 200ft --gains-from docs/targets_example.txt -o outputs/gain_time.csv --png outputs/gain_time.png
 ```
 
 Key flags:
@@ -42,6 +43,8 @@ Key flags:
 - `--no-qc` to disable QC censoring; `--qc-spec path.json` to override limits
 - `--score-output outputs/scores.csv` to write the scoring table
 - `--profile` to log timings for parse/compute/CSV/plot stages
+- `--gains-from path.txt` to merge gain targets from a file (one per line, accepts `m|ft` suffix)
+- Gain-time command adds: `--gains/-g` (comma and space separated), `--gains-from`, `--gain-units`, `--magic-gains`, `--ylog-time`, and reuses WR/personal plotting toggles. CSV columns mirror the Python CLI (`gain_m`, `min_time_s`, `avg_rate_m_per_hr`, `start_offset_s`, `end_offset_s`, `source`, `note`).
 
 Performance features:
 

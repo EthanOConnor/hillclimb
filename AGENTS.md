@@ -18,6 +18,7 @@
 - Keep functions focused; prefer pure helpers that accept iterables rather than touching globals. Place shared constants near their usage blocks.
 - Log with the standard `logging` module at INFO by default; gate noisy details behind `--verbose` and avoid printing directly.
 - Match file naming to their role (e.g., `curve_<context>.csv`, `diagnostics_<date>.txt`) for artifacts saved under `outputs/`.
+- Maintain feature parity between the Python and Rust CLI implementations; ship new features in both unless explicitly agreed otherwise.
 
 ## Testing Guidelines
 - There is no automated test suite yet; validate changes by replaying the sample commands above against multiple FIT inputs.
