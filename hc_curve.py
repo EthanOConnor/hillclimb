@@ -5342,7 +5342,14 @@ def _plot_gain_time_split(
 
     _ensure_matplotlib_style(plt)
 
-    curve_pts = [p for p in gain_curve.points if math.isfinite(p.avg_rate_m_per_hr) and math.isfinite(p.min_time_s) and p.gain_m >= 0]
+    curve_pts = [
+        p
+        for p in gain_curve.points
+        if math.isfinite(p.avg_rate_m_per_hr)
+        and math.isfinite(p.min_time_s)
+        and p.gain_m > 0
+        and p.avg_rate_m_per_hr > 0
+    ]
     if not curve_pts:
         logging.warning("Gain curve empty; skipping rate plot.")
         return
@@ -5368,7 +5375,13 @@ def _plot_gain_time_split(
             ax.plot(x_p, y_p, linestyle=PERSONAL_STYLE, color=USER_COLOR, alpha=0.6, linewidth=1.2, label="Personal rate")
 
     for pt in target_points:
-        if not math.isfinite(pt.avg_rate_m_per_hr) or pt.note == "unachievable":
+        if (
+            not math.isfinite(pt.avg_rate_m_per_hr)
+            or pt.note == "unachievable"
+            or not math.isfinite(pt.gain_m)
+            or pt.gain_m <= 0
+            or pt.avg_rate_m_per_hr <= 0
+        ):
             continue
         x = _convert_gain(pt.gain_m, unit)
         y = pt.avg_rate_m_per_hr
