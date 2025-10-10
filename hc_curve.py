@@ -9,7 +9,7 @@ import time
 import heapq
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple, Dict, Any, Set, NamedTuple, Union, Literal
+from typing import Iterable, List, Optional, Tuple, Dict, Any, Set, NamedTuple, Union, Literal, Sequence
 import json
 import pickle
 
@@ -74,6 +74,62 @@ class CurvePoint:
     end_offset_s: float
 
 
+@dataclass
+class GainTimePoint:
+    gain_m: float
+    min_time_s: float
+    avg_rate_m_per_hr: float
+    start_offset_s: Optional[float]
+    end_offset_s: Optional[float]
+    note: Optional[str] = None
+
+
+@dataclass
+class GainTimeCurve:
+    points: List[GainTimePoint]
+    source_label: str
+    total_span_s: float
+
+
+@dataclass
+class ActivitySeries:
+    times: List[float]
+    values: List[float]
+    selected_raw: str
+    selected_label: str
+    inactivity_gaps: List[Tuple[float, float]]
+    session_gaps: List['Gap']
+    full_span_seconds: float
+    used_sources: Set[str]
+
+
+@dataclass
+class WREnvelopeResult:
+    wr_curve: Optional[Tuple[List[int], List[float]]]
+    wr_rates: Optional[List[float]]
+    personal_curve: Optional[Tuple[List[int], List[float]]]
+    goal_curve: Optional[Tuple[List[int], List[float]]]
+    magic_rows: Optional[List[Dict[str, Any]]]
+    H_WR_func: Optional[Any]
+    wr_sample_arrays: Optional[Tuple[np.ndarray, np.ndarray]]
+
+
+DEFAULT_GAIN_TARGETS: Tuple[float, ...] = (
+    50.0,
+    100.0,
+    150.0,
+    200.0,
+    300.0,
+    500.0,
+    750.0,
+    1000.0,
+)
+
+DEFAULT_MAGIC_GAINS = "50m,100m,200m,300m,500m,1000m"
+
+ISO_RATE_GUIDES = (800.0, 1000.0, 1200.0, 1500.0, 2000.0, 2500.0)
+
+
 class _StageProfiler:
     def __init__(self, enabled: bool) -> None:
         self.enabled = enabled
@@ -124,6 +180,182 @@ def _normalize_source_label(label: str) -> str:
     return SOURCE_DISPLAY_MAP.get(label, label)
 
 
+def _parse_gain_token(token: Union[str, float, int], *, default_unit: str = "m") -> Optional[float]:
+    if isinstance(token, (int, float)):
+        if math.isnan(float(token)) or float(token) < 0:
+            return None
+        return float(token)
+    s = str(token).strip().lower()
+    if not s:
+        return None
+    unit = default_unit.lower()
+    if s.endswith("ft"):
+        unit = "ft"
+        s = s[:-2]
+    elif s.endswith("m"):
+        s = s[:-1]
+    try:
+        value = float(s)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    if unit == "ft":
+        value *= 0.3048
+    return value
+
+
+def _parse_gain_list(tokens: Sequence[Union[str, float, int]], *, default_unit: str = "m") -> List[float]:
+    gains: List[float] = []
+    for tok in tokens:
+        parsed = _parse_gain_token(tok, default_unit=default_unit)
+        if parsed is None:
+            continue
+        if parsed <= 0:
+            continue
+        gains.append(parsed)
+    unique_sorted = sorted({round(g, 6) for g in gains})
+    return [float(g) for g in unique_sorted]
+
+
+def _fmt_time_hms(seconds: float) -> str:
+    if not math.isfinite(seconds) or seconds < 0:
+        return "--:--"
+    sec_int = int(round(seconds))
+    h, rem = divmod(sec_int, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
+
+
+def _fmt_rate_mph(rate: float) -> str:
+    if not math.isfinite(rate) or rate <= 0:
+        return "--"
+    return f"{rate:.0f} m/h"
+
+
+def _token_is_likely_gain(token: str, *, default_unit: str = "m") -> bool:
+    if not token:
+        return False
+    if token.startswith("-"):
+        return False
+    if os.path.sep in token:
+        return False
+    if os.path.altsep and os.path.altsep in token:
+        return False
+    lowered = token.lower()
+    if lowered.endswith(".fit") or lowered.endswith(".fit.gz"):
+        return False
+    if "*" in token or "?" in token:
+        return False
+    parsed = _parse_gain_token(token, default_unit=default_unit)
+    return parsed is not None
+
+
+def _format_gain(value_m: float, unit: str = "m") -> str:
+    if not math.isfinite(value_m):
+        return "--"
+    if unit.lower() == "ft":
+        feet = value_m / 0.3048
+        return f"{feet:.0f} ft"
+    return f"{value_m:.0f} m"
+
+
+def _convert_gain(value_m: float, unit: str = "m") -> float:
+    if unit.lower() == "ft":
+        return value_m / 0.3048
+    return value_m
+
+
+def min_time_for_gains(
+    times: Sequence[float],
+    cumulative_gain: Sequence[float],
+    targets: Sequence[float],
+) -> List[GainTimePoint]:
+    if not times or not cumulative_gain or not targets:
+        return []
+
+    t_arr = np.asarray(times, dtype=np.float64)
+    g_arr = np.asarray(cumulative_gain, dtype=np.float64)
+    if t_arr.shape != g_arr.shape:
+        raise ValueError("times and cumulative_gain must have same length")
+    if t_arr.size == 0:
+        return []
+
+    g_arr = np.maximum.accumulate(g_arr)
+    total_gain = float(g_arr[-1])
+
+    merged: List[Optional[GainTimePoint]] = [None] * len(targets)
+    positive: List[Tuple[float, int]] = []
+    for idx, target in enumerate(targets):
+        if not math.isfinite(target) or target < 0.0:
+            continue
+        if target <= 0.0:
+            merged[idx] = GainTimePoint(
+                gain_m=0.0,
+                min_time_s=0.0,
+                avg_rate_m_per_hr=0.0,
+                start_offset_s=0.0,
+                end_offset_s=0.0,
+                note=None,
+            )
+        else:
+            positive.append((float(target), idx))
+
+    if not positive:
+        return [pt for pt in merged if pt is not None]
+
+    positive.sort(key=lambda x: x[0])
+    eps = 1e-9
+
+    for target_gain, original_idx in positive:
+        if target_gain > total_gain + 1e-6:
+            merged[original_idx] = GainTimePoint(
+                gain_m=target_gain,
+                min_time_s=float("inf"),
+                avg_rate_m_per_hr=0.0,
+                start_offset_s=None,
+                end_offset_s=None,
+                note="unachievable",
+            )
+            continue
+        left = 0
+        best_duration = float("inf")
+        best_start = 0
+        best_end = 0
+        for right in range(t_arr.size):
+            while left < right and (g_arr[right] - g_arr[left]) >= target_gain - eps:
+                duration = t_arr[right] - t_arr[left]
+                if duration > 0.0 and duration + eps < best_duration:
+                    best_duration = duration
+                    best_start = left
+                    best_end = right
+                left += 1
+        if not math.isfinite(best_duration):
+            merged[original_idx] = GainTimePoint(
+                gain_m=target_gain,
+                min_time_s=float("inf"),
+                avg_rate_m_per_hr=0.0,
+                start_offset_s=None,
+                end_offset_s=None,
+                note="unachievable",
+            )
+            continue
+        duration = best_duration
+        avg_rate = target_gain / duration * 3600.0 if duration > 0.0 else 0.0
+        merged[original_idx] = GainTimePoint(
+            gain_m=target_gain,
+            min_time_s=duration,
+            avg_rate_m_per_hr=avg_rate,
+            start_offset_s=float(t_arr[best_start]),
+            end_offset_s=float(t_arr[best_end]),
+            note=None,
+        )
+
+    return [pt for pt in merged if pt is not None]
+
+
 QC_DEFAULT_SPEC: Dict[float, float] = {
     5.0: 8.0,
     10.0: 12.0,
@@ -134,6 +366,57 @@ QC_DEFAULT_SPEC: Dict[float, float] = {
     1800.0: 500.0,
     3600.0: 900.0,
 }
+
+
+def _export_series_command(
+    fit_files: List[str],
+    output: str,
+    source: str,
+    verbose: bool,
+    resample_1hz: bool,
+    parse_workers: int,
+    gain_eps: float,
+    session_gap_sec: float,
+    qc_enabled: bool,
+    qc_spec_path: Optional[str],
+    merge_eps_sec: float,
+    overlap_policy: str,
+    log_file: Optional[str],
+    profile: bool,
+) -> int:
+    _setup_logging(verbose, log_file=log_file)
+    profiler = _StageProfiler(profile)
+    try:
+        series = _load_activity_series(
+            fit_files,
+            source=source,
+            gain_eps=gain_eps,
+            session_gap_sec=session_gap_sec,
+            qc_enabled=qc_enabled,
+            qc_spec_path=qc_spec_path,
+            resample_1hz=resample_1hz,
+            merge_eps_sec=merge_eps_sec,
+            overlap_policy=overlap_policy,
+            parse_workers=parse_workers,
+            profiler=profiler,
+        )
+    except Exception as exc:
+        logging.error(str(exc))
+        return 2
+
+    try:
+        with open(output, "w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["time_s", "cumulative_gain_m", "source"])
+            for t, g in zip(series.times, series.values):
+                writer.writerow([round(t, 6), round(g, 6), series.selected_raw])
+        logging.info("Wrote: %s", output)
+        profiler.lap("csv")
+    except Exception as exc:
+        logging.error(f"Failed to write export: {exc}")
+        return 2
+
+    return 0
 
 
 def _load_qc_spec(path: str) -> Dict[float, float]:
@@ -2754,6 +3037,122 @@ def _apply_qc_censor(
         else:
             last = vals[idx]
     return vals, segments_removed, gain_removed
+
+
+def _load_activity_series(
+    fit_files: List[str],
+    source: str,
+    gain_eps: float,
+    session_gap_sec: float,
+    qc_enabled: bool,
+    qc_spec_path: Optional[str],
+    resample_1hz: bool,
+    merge_eps_sec: float,
+    overlap_policy: str,
+    parse_workers: int,
+    profiler: Optional[_StageProfiler] = None,
+) -> ActivitySeries:
+    logging.info("Reading %d FIT file(s)...", len(fit_files))
+    records_by_file: List[List[Dict[str, Any]]] = []
+    if parse_workers != 1 and len(fit_files) > 1:
+        max_workers = parse_workers if parse_workers and parse_workers > 0 else min(len(fit_files), max(1, (os.cpu_count() or 1)))
+        records_by_file = [None] * len(fit_files)  # type: ignore[assignment]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {}
+            for idx, path in enumerate(fit_files):
+                logging.info("Parsing: %s", path)
+                future = executor.submit(_parse_single_fit_records, path, idx)
+                future_map[future] = idx
+            for future in as_completed(future_map):
+                i = future_map[future]
+                records_by_file[i] = future.result()  # type: ignore[index]
+        records_by_file = [rec if rec is not None else [] for rec in records_by_file]
+    else:
+        for idx, path in enumerate(fit_files):
+            logging.info("Parsing: %s", path)
+            records_by_file.append(_parse_single_fit_records(path, file_id=idx))
+    if profiler:
+        profiler.lap("parse")
+
+    merged = _merge_records(records_by_file, merge_eps_sec=merge_eps_sec, overlap_policy=overlap_policy)
+    logging.info("Merged samples: %d", len(merged))
+    if profiler:
+        profiler.lap("merge")
+
+    if not merged:
+        raise RuntimeError("No samples found after merging inputs.")
+
+    inactivity_gaps: List[Tuple[float, float]]
+    overall_sources_raw: Set[str]
+    if source == "auto":
+        times, values, used_sources, inactivity_gaps = _build_canonical_timeseries(
+            merged,
+            gain_eps=gain_eps,
+            dwell_sec=5.0,
+            gap_threshold=session_gap_sec,
+        )
+        overall_sources_raw = {SOURCE_NAME_MAP.get(u, u) for u in used_sources if u}
+    else:
+        times, values, label = _build_timeseries(merged, source=source, gain_eps=gain_eps)
+        inactivity_gaps = []
+        overall_sources_raw = {label}
+
+    if not times:
+        raise RuntimeError("No data available to compute curve after merging inputs.")
+
+    qc_limits: Optional[Dict[float, float]] = None
+    if qc_enabled:
+        qc_limits = dict(QC_DEFAULT_SPEC)
+        if qc_spec_path:
+            try:
+                qc_limits.update(_load_qc_spec(qc_spec_path))
+            except Exception as exc:
+                logging.warning("Failed to load QC spec %s: %s", qc_spec_path, exc)
+
+    if qc_limits:
+        values, qc_segments, qc_removed = _apply_qc_censor(times, values, qc_limits)
+        if qc_segments:
+            logging.info(
+                "QC censored %d spike segment(s); removed %.1f m of ascent.",
+                qc_segments,
+                qc_removed,
+            )
+
+    if resample_1hz:
+        times, values = _resample_to_1hz(times, values)
+
+    session_gap_list = _find_gaps(times, session_gap_sec)
+    if session_gap_list:
+        preview = ", ".join(_fmt_duration_label(int(round(g.length))) for g in session_gap_list[:5])
+        if len(session_gap_list) > 5:
+            preview += ", ..."
+        logging.info(
+            "Detected %d gap(s) longer than %.0fs (skip applied): %s",
+            len(session_gap_list),
+            session_gap_sec,
+            preview,
+        )
+
+    full_span_seconds = max(0.0, times[-1] - times[0]) if len(times) > 1 else 0.0
+
+    if not overall_sources_raw:
+        selected_raw = "mixed" if source == "auto" else source
+    elif len(overall_sources_raw) == 1:
+        selected_raw = next(iter(overall_sources_raw))
+    else:
+        selected_raw = "mixed"
+    selected_label = _normalize_source_label(selected_raw)
+
+    return ActivitySeries(
+        times=times,
+        values=values,
+        selected_raw=selected_raw,
+        selected_label=selected_label,
+        inactivity_gaps=inactivity_gaps,
+        session_gaps=session_gap_list,
+        full_span_seconds=full_span_seconds,
+        used_sources=overall_sources_raw,
+    )
 def all_windows_curve(T: List[float], P: List[float], step: int = 1) -> List[CurvePoint]:
     if not T or len(T) < 2:
         return []
@@ -2827,6 +3226,136 @@ def all_windows_curve(T: List[float], P: List[float], step: int = 1) -> List[Cur
             )
     return results
 
+
+# -----------------
+# Gain-centric helpers
+# -----------------
+
+def invert_duration_curve_to_gain_time(
+    curve: List[CurvePoint],
+    targets: Sequence[float],
+    total_span_s: float,
+    source_label: str,
+) -> GainTimeCurve:
+    if not curve:
+        return GainTimeCurve(points=[], source_label=source_label, total_span_s=total_span_s)
+
+    durations = np.asarray([float(cp.duration_s) for cp in curve], dtype=np.float64)
+    gains = np.asarray([float(cp.max_climb_m) for cp in curve], dtype=np.float64)
+    starts = np.asarray([float(cp.start_offset_s) for cp in curve], dtype=np.float64)
+    ends = np.asarray([float(cp.end_offset_s) for cp in curve], dtype=np.float64)
+
+    gains = np.maximum.accumulate(gains)
+
+    cleaned_targets = sorted({float(g) for g in targets if math.isfinite(g) and g >= 0.0})
+    points: List[GainTimePoint] = []
+
+    if not cleaned_targets or cleaned_targets[0] > 0.0:
+        points.append(GainTimePoint(0.0, 0.0, 0.0, 0.0, 0.0, None))
+
+    for gain_target in cleaned_targets:
+        if gain_target <= 0.0:
+            points.append(GainTimePoint(0.0, 0.0, 0.0, 0.0, 0.0, None))
+            continue
+        idx = int(np.searchsorted(gains, gain_target, side="left"))
+        if idx >= gains.size:
+            points.append(
+                GainTimePoint(
+                    gain_m=gain_target,
+                    min_time_s=math.inf,
+                    avg_rate_m_per_hr=0.0,
+                    start_offset_s=None,
+                    end_offset_s=None,
+                    note="unachievable",
+                )
+            )
+            continue
+        duration = float(durations[idx])
+        start = float(starts[idx])
+        end = float(ends[idx])
+        achieved_gain = float(gains[idx])
+        avg_rate = achieved_gain / duration * 3600.0 if duration > 0 else 0.0
+        note: Optional[str] = None
+        if achieved_gain - gain_target > 1e-6 and idx > 0:
+            prev_duration = float(durations[idx - 1])
+            if duration - prev_duration > 1.5:
+                note = "bounded_by_grid"
+        points.append(
+            GainTimePoint(
+                gain_m=gain_target,
+                min_time_s=duration,
+                avg_rate_m_per_hr=avg_rate,
+                start_offset_s=start,
+                end_offset_s=end,
+                note=note,
+            )
+        )
+
+    points_sorted = sorted(points, key=lambda p: p.gain_m)
+    deduped: List[GainTimePoint] = []
+    seen: Set[float] = set()
+    for pt in points_sorted:
+        key = round(pt.gain_m, 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(pt)
+    return GainTimeCurve(points=deduped, source_label=source_label, total_span_s=total_span_s)
+
+
+def build_gain_time_curve(curve: List[CurvePoint], total_span_s: float, source_label: str) -> GainTimeCurve:
+    available_gains = {float(cp.max_climb_m) for cp in curve if cp.max_climb_m > 0}
+    targets = sorted(available_gains)
+    return invert_duration_curve_to_gain_time(curve, targets, total_span_s=total_span_s, source_label=source_label)
+
+
+def convert_samples_to_gain_time_curve(
+    durations: Sequence[float],
+    gains: Sequence[float],
+    source_label: str,
+) -> GainTimeCurve:
+    pts: List[GainTimePoint] = []
+    for d, g in zip(durations, gains):
+        d_sec = float(d)
+        g_m = float(g)
+        avg_rate = g_m / d_sec * 3600.0 if d_sec > 0 else 0.0
+        pts.append(
+            GainTimePoint(
+                gain_m=g_m,
+                min_time_s=d_sec,
+                avg_rate_m_per_hr=avg_rate,
+                start_offset_s=None,
+                end_offset_s=None,
+                note=None,
+            )
+        )
+    total_span = float(durations[-1]) if durations else 0.0
+    return GainTimeCurve(points=pts, source_label=source_label, total_span_s=total_span)
+
+
+def _interpolate_gain_time(points: Sequence[GainTimePoint], gain_m: float) -> Optional[GainTimePoint]:
+    if not points:
+        return None
+    xs = np.asarray([p.gain_m for p in points if math.isfinite(p.min_time_s)], dtype=np.float64)
+    ys = np.asarray([p.min_time_s for p in points if math.isfinite(p.min_time_s)], dtype=np.float64)
+    if xs.size == 0:
+        return None
+    if gain_m <= xs[0]:
+        base = next(p for p in points if p.gain_m == xs[0])
+        return GainTimePoint(gain_m=gain_m, min_time_s=base.min_time_s, avg_rate_m_per_hr=base.avg_rate_m_per_hr, start_offset_s=base.start_offset_s, end_offset_s=base.end_offset_s, note=base.note)
+    if gain_m >= xs[-1]:
+        base = next(p for p in reversed(points) if math.isfinite(p.min_time_s))
+        return GainTimePoint(gain_m=gain_m, min_time_s=base.min_time_s, avg_rate_m_per_hr=base.avg_rate_m_per_hr, start_offset_s=base.start_offset_s, end_offset_s=base.end_offset_s, note=base.note)
+    interp_time = float(np.interp(gain_m, xs, ys))
+    avg_rate = gain_m / interp_time * 3600.0 if interp_time > 0 else 0.0
+    return GainTimePoint(
+        gain_m=gain_m,
+        min_time_s=interp_time,
+        avg_rate_m_per_hr=avg_rate,
+        start_offset_s=None,
+        end_offset_s=None,
+        note=None,
+    )
 
 # -----------------
 # WR envelope, scoring, goals
@@ -3765,6 +4294,159 @@ def _scoring_tables(
     return H_wr, H_pers_arr.tolist(), rows, weakest
 
 
+def _compute_wr_envelope_and_personal(
+    curve: List[CurvePoint],
+    wr_profile: str,
+    wr_anchors_path: Optional[str],
+    wr_min_seconds: float,
+    wr_short_cap: str,
+    magic: Optional[str],
+    personal_min_seconds: float,
+    goals_topk: int,
+    score_output: Optional[str],
+) -> WREnvelopeResult:
+    wr_curve: Optional[Tuple[List[int], List[float]]] = None
+    personal_curve: Optional[Tuple[List[int], List[float]]] = None
+    goal_curve: Optional[Tuple[List[int], List[float]]] = None
+    magic_rows: Optional[List[Dict[str, Any]]] = None
+    H_WR_func: Optional[Any] = None
+    wr_rates_env: Optional[List[float]] = None
+    wr_sample_arrays: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    try:
+        profile_config = _wr_profile_config(wr_profile)
+        H_WR, wr_env = _get_wr_envelope(
+            wr_profile,
+            profile_config,
+            wr_min_seconds=wr_min_seconds,
+            wr_anchors_path=wr_anchors_path,
+            cap_mode=wr_short_cap,
+        )
+        H_WR_func = H_WR
+        cap_info = wr_env.get("cap_info", {})
+        if cap_info:
+            logging.info(
+                "WR cap %.2f m/s (treadmill=%.2f, stairs=%.2f, energy=%.2f)",
+                cap_info.get("v_cap", float("nan")),
+                cap_info.get("treadmill", float("nan")),
+                cap_info.get("stairs", float("nan")),
+                cap_info.get("energy", float("nan")),
+            )
+        anchor_report = []
+        for anchor in wr_env.get("anchors", []):
+            predicted = H_WR(anchor["w_s"])
+            slack = predicted - anchor["gain_m"]
+            anchor_report.append((anchor["w_s"], anchor["gain_m"], slack))
+        if anchor_report:
+            slack_text = ", ".join(
+                f"{w/3600.0:.2f}h: +{slack:.1f} m" for w, _, slack in anchor_report
+            )
+            logging.info("WR anchor slack: %s", slack_text)
+        try:
+            if wr_min_seconds <= 3600.0:
+                wr_1h = H_WR(3600.0)
+                assert 1500.0 < wr_1h < 2600.0, f"WR(1h) sanity failed: {wr_1h}"
+            if wr_min_seconds <= 12 * 3600.0:
+                wr_12h = H_WR(12 * 3600.0)
+                assert 11000.0 < wr_12h < 15000.0, f"WR(12h) sanity failed: {wr_12h}"
+        except AssertionError as err:
+            raise RuntimeError(str(err))
+
+        W_s = [cp.duration_s for cp in curve]
+        H_user = [cp.max_climb_m for cp in curve]
+        wr_durations = wr_env.get("durations", [])
+        wr_climbs = wr_env.get("climbs", [])
+        wr_rates_env = wr_env.get("rates") if isinstance(wr_env.get("rates"), list) else None
+        if wr_durations and wr_climbs:
+            wr_curve = (wr_durations, wr_climbs)
+            start_label = _fmt_duration_label(max(int(round(wr_durations[0])), 1))
+            end_label = _fmt_duration_label(max(int(round(wr_durations[-1])), 1))
+            logging.info(
+                "WR envelope sample span: %s→%s (%d points)",
+                start_label,
+                end_label,
+                len(wr_durations),
+            )
+        else:
+            wr_curve = None
+            logging.warning("WR envelope returned no sample points; disabling WR overlay.")
+
+        wr_indices = [idx for idx, w in enumerate(W_s) if w >= wr_min_seconds]
+        W_wr = [W_s[idx] for idx in wr_indices]
+        parsed_magic = [ _parse_duration_token(t) for t in (magic.split(',') if magic else []) ] if magic else []
+        magic_ws = [int(w) for w in parsed_magic if w >= wr_min_seconds]
+        if wr_curve and wr_curve[0] and wr_curve[1]:
+            wr_sample_arrays = (
+                np.asarray(wr_curve[0], dtype=np.float64),
+                np.asarray(wr_curve[1], dtype=np.float64),
+            )
+        elif isinstance(wr_env.get("durations"), list) and isinstance(wr_env.get("climbs"), list):
+            wr_sample_arrays = (
+                np.asarray(wr_env.get("durations"), dtype=np.float64),
+                np.asarray(wr_env.get("climbs"), dtype=np.float64),
+            )
+
+        H_wr_arr, H_pers_arr, rows, weakest = _scoring_tables(
+            W_s,
+            H_user,
+            H_WR,
+            magic_ws,
+            min_anchor_s=personal_min_seconds,
+            topk=goals_topk,
+            wr_curve_sample=wr_sample_arrays,
+        )
+        personal_curve = (W_wr, [H_pers_arr[idx] for idx in wr_indices]) if W_wr else None
+        H_goal_full = [u + (2.0/3.0) * (p - u) for u, p in zip(H_user, H_pers_arr)]
+        goal_curve = (W_s, H_goal_full)
+        magic_rows = rows
+        if rows:
+            checkpoint_logs: List[str] = []
+            for row in rows:
+                w_val = row.get("duration_s")
+                wr_gain = row.get("wr_gain_m")
+                user_gain = row.get("user_gain_m")
+                score_pct = row.get("score_pct")
+                if not isinstance(w_val, (int, float)) or not isinstance(wr_gain, (int, float)):
+                    continue
+                if w_val <= 0:
+                    continue
+                wr_rate = wr_gain / w_val * 3600.0
+                label = _fmt_duration_label(int(round(w_val)))
+                if isinstance(user_gain, (int, float)):
+                    user_rate = user_gain / w_val * 3600.0
+                    if isinstance(score_pct, (int, float)):
+                        checkpoint_logs.append(
+                            f"{label}: WR {wr_gain:.0f} m ({wr_rate:.0f} m/h), user {user_gain:.0f} m ({user_rate:.0f} m/h, {score_pct:.0f}%)"
+                        )
+                    else:
+                        checkpoint_logs.append(
+                            f"{label}: WR {wr_gain:.0f} m ({wr_rate:.0f} m/h), user {user_gain:.0f} m ({user_rate:.0f} m/h)"
+                        )
+                else:
+                    checkpoint_logs.append(
+                        f"{label}: WR {wr_gain:.0f} m ({wr_rate:.0f} m/h)"
+                    )
+            if checkpoint_logs:
+                logging.info("WR checkpoints: %s", "; ".join(checkpoint_logs))
+        if score_output:
+            with open(score_output, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=["duration_s","user_gain_m","wr_gain_m","score_pct","personal_gain_m","goal_gain_m"])
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+    except Exception as exc:
+        logging.warning(f"WR/scoring computation failed: {exc}")
+
+    return WREnvelopeResult(
+        wr_curve=wr_curve,
+        wr_rates=wr_rates_env,
+        personal_curve=personal_curve,
+        goal_curve=goal_curve,
+        magic_rows=magic_rows,
+        H_WR_func=H_WR_func,
+        wr_sample_arrays=wr_sample_arrays,
+    )
+
+
 # -----------------
 # CLI
 # -----------------
@@ -4478,6 +5160,243 @@ def _plot_split(
         fig2.savefig(climb_path, dpi=200)
     plt.close(fig2)
 
+
+def _plot_gain_time(
+    gain_curve: GainTimeCurve,
+    out_png: str,
+    source_label: str,
+    target_points: Sequence[GainTimePoint],
+    wr_curve: Optional[GainTimeCurve] = None,
+    personal_curve: Optional[GainTimeCurve] = None,
+    magic_gains: Sequence[float] = (),
+    show_wr: bool = True,
+    show_personal: bool = True,
+    unit: str = "m",
+    fast_plot: bool = True,
+    iso_rates: Sequence[float] = ISO_RATE_GUIDES,
+    ylog_time: bool = False,
+) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("matplotlib is required for plotting. Install with: pip install matplotlib") from exc
+
+    _ensure_matplotlib_style(plt)
+
+    curve_pts = [p for p in gain_curve.points if math.isfinite(p.min_time_s) and p.gain_m >= 0]
+    if not curve_pts:
+        logging.warning("Gain curve empty; skipping plot generation.")
+        return
+
+    gains_m = np.asarray([p.gain_m for p in curve_pts], dtype=np.float64)
+    gains_display = np.asarray([_convert_gain(p.gain_m, unit) for p in curve_pts], dtype=np.float64)
+    times_minutes = np.asarray([p.min_time_s / 60.0 for p in curve_pts], dtype=np.float64)
+
+    if gains_m.size == 0 or np.max(gains_m) <= 0:
+        logging.warning("Gain curve lacks positive ascent; skipping plot generation.")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    max_gain_m = float(np.max(gains_m))
+    max_gain_disp = float(np.max(gains_display)) if gains_display.size else 1.0
+    max_time_min = float(np.max(times_minutes)) if times_minutes.size else 1.0
+
+    x_iso = np.linspace(0.0, max_gain_m, 200)
+    for rate in iso_rates:
+        if rate <= 0:
+            continue
+        y_iso_min = (x_iso / rate) * 60.0
+        x_iso_disp = np.asarray([_convert_gain(val, unit) for val in x_iso], dtype=np.float64)
+        ax.plot(x_iso_disp, y_iso_min, linestyle=(0, (2, 4)), linewidth=0.8, color="0.85")
+        if x_iso_disp.size:
+            ax.text(
+                x_iso_disp[-1],
+                y_iso_min[-1],
+                f"{int(rate)} m/h",
+                fontsize=8,
+                color="0.6",
+                ha="right",
+                va="bottom",
+            )
+
+    ax.plot(gains_display, times_minutes, color=USER_COLOR, linewidth=1.8, label="Min time")
+
+    if show_wr and wr_curve and wr_curve.points:
+        wr_pts = [p for p in wr_curve.points if math.isfinite(p.min_time_s)]
+        if wr_pts:
+            x_wr = np.asarray([_convert_gain(p.gain_m, unit) for p in wr_pts], dtype=np.float64)
+            y_wr = np.asarray([p.min_time_s / 60.0 for p in wr_pts], dtype=np.float64)
+            ax.plot(x_wr, y_wr, linestyle=WR_STYLE, color="0.3", alpha=0.9, label="WR time")
+
+    if show_personal and personal_curve and personal_curve.points:
+        p_pts = [p for p in personal_curve.points if math.isfinite(p.min_time_s)]
+        if p_pts:
+            x_p = np.asarray([_convert_gain(p.gain_m, unit) for p in p_pts], dtype=np.float64)
+            y_p = np.asarray([p.min_time_s / 60.0 for p in p_pts], dtype=np.float64)
+            ax.plot(x_p, y_p, linestyle=PERSONAL_STYLE, color=USER_COLOR, alpha=0.6, linewidth=1.2, label="Personal time")
+
+    for pt in target_points:
+        if not math.isfinite(pt.min_time_s) or not math.isfinite(pt.gain_m):
+            continue
+        if pt.note == "unachievable":
+            continue
+        x = _convert_gain(pt.gain_m, unit)
+        y = pt.min_time_s / 60.0
+        ax.scatter([x], [y], color=USER_COLOR, marker="o", zorder=3)
+        if not fast_plot:
+            label = f"{_format_gain(pt.gain_m, unit)} • {_fmt_time_hms(pt.min_time_s)}"
+            ax.annotate(
+                label,
+                (x, y),
+                textcoords="offset points",
+                xytext=(0, -14),
+                ha="center",
+                fontsize=8,
+                color="black",
+            )
+
+    for mg in magic_gains:
+        interp = _interpolate_gain_time(gain_curve.points, mg)
+        if interp is None or not math.isfinite(interp.min_time_s):
+            continue
+        x = _convert_gain(mg, unit)
+        y = interp.min_time_s / 60.0
+        ax.scatter([x], [y], color=GOAL_COLOR, marker="^", zorder=3)
+        if not fast_plot:
+            ax.annotate(
+                _format_gain(mg, unit),
+                (x, y),
+                textcoords="offset points",
+                xytext=(0, 12),
+                ha="center",
+                fontsize=8,
+                color=GOAL_COLOR,
+            )
+
+    gain_label = "ft" if unit.lower() == "ft" else "m"
+    ax.set_xlabel(f"Gain ({gain_label})")
+    ax.set_ylabel("Time (min)")
+    if ylog_time:
+        positive = times_minutes[times_minutes > 0]
+        ymin = max(positive.min() * 0.8 if positive.size else 1e-3, 1e-3)
+        ax.set_yscale("log")
+        ax.set_ylim(bottom=ymin)
+    margin_x = max_gain_disp * 0.05 if max_gain_disp > 0 else 1.0
+    margin_y = max_time_min * 0.05 if max_time_min > 0 else 1.0
+    ax.set_xlim(0, max_gain_disp + margin_x)
+    ax.set_ylim(0, max_time_min + margin_y)
+    ax.set_title(f"Gain-Time Curve — {source_label}")
+    ax.legend(loc="upper left")
+
+    if fast_plot:
+        fig.savefig(out_png, dpi=150)
+    else:
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+
+
+def _plot_gain_time_split(
+    gain_curve: GainTimeCurve,
+    out_png_base: str,
+    source_label: str,
+    target_points: Sequence[GainTimePoint],
+    wr_curve: Optional[GainTimeCurve] = None,
+    personal_curve: Optional[GainTimeCurve] = None,
+    magic_gains: Sequence[float] = (),
+    show_wr: bool = True,
+    show_personal: bool = True,
+    unit: str = "m",
+    fast_plot: bool = True,
+    iso_rates: Sequence[float] = ISO_RATE_GUIDES,
+    ylog_time: bool = False,
+) -> None:
+    time_path = out_png_base.replace('.png', '_time.png') if out_png_base.endswith('.png') else out_png_base + '_time.png'
+    rate_path = out_png_base.replace('.png', '_rate.png') if out_png_base.endswith('.png') else out_png_base + '_rate.png'
+
+    _plot_gain_time(
+        gain_curve,
+        time_path,
+        source_label,
+        target_points,
+        wr_curve=wr_curve,
+        personal_curve=personal_curve,
+        magic_gains=magic_gains,
+        show_wr=show_wr,
+        show_personal=show_personal,
+        unit=unit,
+        fast_plot=fast_plot,
+        iso_rates=iso_rates,
+        ylog_time=ylog_time,
+    )
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("matplotlib is required for plotting. Install with: pip install matplotlib") from exc
+
+    _ensure_matplotlib_style(plt)
+
+    curve_pts = [p for p in gain_curve.points if math.isfinite(p.avg_rate_m_per_hr) and math.isfinite(p.min_time_s) and p.gain_m >= 0]
+    if not curve_pts:
+        logging.warning("Gain curve empty; skipping rate plot.")
+        return
+
+    x_vals = np.asarray([_convert_gain(p.gain_m, unit) for p in curve_pts], dtype=np.float64)
+    rates = np.asarray([p.avg_rate_m_per_hr for p in curve_pts], dtype=np.float64)
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    ax.plot(x_vals, rates, color=USER_COLOR, linewidth=1.8, label="Average rate")
+
+    if show_wr and wr_curve and wr_curve.points:
+        wr_pts = [p for p in wr_curve.points if math.isfinite(p.avg_rate_m_per_hr)]
+        if wr_pts:
+            x_wr = np.asarray([_convert_gain(p.gain_m, unit) for p in wr_pts], dtype=np.float64)
+            y_wr = np.asarray([p.avg_rate_m_per_hr for p in wr_pts], dtype=np.float64)
+            ax.plot(x_wr, y_wr, linestyle=WR_STYLE, color="0.3", alpha=0.9, label="WR rate")
+
+    if show_personal and personal_curve and personal_curve.points:
+        p_pts = [p for p in personal_curve.points if math.isfinite(p.avg_rate_m_per_hr)]
+        if p_pts:
+            x_p = np.asarray([_convert_gain(p.gain_m, unit) for p in p_pts], dtype=np.float64)
+            y_p = np.asarray([p.avg_rate_m_per_hr for p in p_pts], dtype=np.float64)
+            ax.plot(x_p, y_p, linestyle=PERSONAL_STYLE, color=USER_COLOR, alpha=0.6, linewidth=1.2, label="Personal rate")
+
+    for pt in target_points:
+        if not math.isfinite(pt.avg_rate_m_per_hr) or pt.note == "unachievable":
+            continue
+        x = _convert_gain(pt.gain_m, unit)
+        y = pt.avg_rate_m_per_hr
+        ax.scatter([x], [y], color=USER_COLOR, marker="o", zorder=3)
+        if not fast_plot:
+            ax.annotate(
+                f"{_format_gain(pt.gain_m, unit)} • {y:.0f} m/h",
+                (x, y),
+                textcoords="offset points",
+                xytext=(0, -14),
+                ha="center",
+                fontsize=8,
+                color="black",
+            )
+
+    gain_label = "ft" if unit.lower() == "ft" else "m"
+    ax.set_xlabel(f"Gain ({gain_label})")
+    ax.set_ylabel("Average rate (m/h)")
+    ax.set_title(f"Gain-Rate Curve — {source_label}")
+    ax.legend(loc="upper right")
+
+    if fast_plot:
+        fig.savefig(rate_path, dpi=150)
+    else:
+        fig.tight_layout()
+        fig.savefig(rate_path, dpi=200)
+    plt.close(fig)
+
 DEFAULT_DURATIONS = [60, 120, 300, 600, 1200, 1800, 3600]
 
 
@@ -4529,168 +5448,102 @@ def _run(
     profiler = _StageProfiler(profile)
     H_WR_func: Optional[Any] = None
     try:
-        logging.info("Reading %d FIT file(s)...", len(fit_files))
-        if parse_workers != 1 and len(fit_files) > 1:
-            max_workers = parse_workers if parse_workers and parse_workers > 0 else min(len(fit_files), max(1, (os.cpu_count() or 1)))
-            records_by_file = [None] * len(fit_files)
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {}
-                for i, fp in enumerate(fit_files):
-                    logging.info("Parsing: %s", fp)
-                    future = executor.submit(_parse_single_fit_records, fp, i)
-                    future_map[future] = i
-                for future in as_completed(future_map):
-                    idx = future_map[future]
-                    records_by_file[idx] = future.result()
-            records_by_file = [rec if rec is not None else [] for rec in records_by_file]
-        else:
-            records_by_file = []
-            for i, fp in enumerate(fit_files):
-                logging.info("Parsing: %s", fp)
-                records_by_file.append(_parse_single_fit_records(fp, file_id=i))
-        profiler.lap("parse")
-        merged = _merge_records(records_by_file, merge_eps_sec=merge_eps_sec, overlap_policy=overlap_policy)
-        logging.info("Merged samples: %d", len(merged))
-        profiler.lap("merge")
-        times: List[float]
-        values: List[float]
-        overall_sources_raw: Set[str] = set()
-        inactivity_gaps: List[Tuple[float, float]] = []
-        if source == "auto":
-            times, values, used, gaps = _build_canonical_timeseries(
-                merged,
-                gain_eps=gain_eps,
-                dwell_sec=5.0,
-                gap_threshold=session_gap_sec,
-            )
-            overall_sources_raw = {SOURCE_NAME_MAP.get(u, u) for u in used if u}
-            inactivity_gaps = gaps
-        else:
-            times, values, label = _build_timeseries(merged, source=source, gain_eps=gain_eps)
-            overall_sources_raw = {label}
-
-        if not times:
-            logging.error("No data available to compute curve after merging inputs.")
-            return 2
-
-        qc_limits: Optional[Dict[float, float]] = None
-        if qc_enabled:
-            qc_limits = dict(QC_DEFAULT_SPEC)
-            if qc_spec_path:
-                try:
-                    qc_limits.update(_load_qc_spec(qc_spec_path))
-                except Exception as exc:
-                    logging.warning("Failed to load QC spec %s: %s", qc_spec_path, exc)
-        qc_segments = 0
-        if qc_limits:
-            values, qc_segments, qc_removed = _apply_qc_censor(times, values, qc_limits)
-            if qc_segments:
-                logging.info(
-                    "QC censored %d spike segment(s); removed %.1f m of ascent.",
-                    qc_segments,
-                    qc_removed,
-                )
-
-        if resample_1hz:
-            times, values = _resample_to_1hz(times, values)
-
-        session_gap_list = _find_gaps(times, session_gap_sec)
-        full_span_seconds = max(0.0, times[-1] - times[0]) if len(times) > 1 else 0.0
-        if session_gap_list:
-            gap_preview = ", ".join(
-                _fmt_duration_label(int(round(g.length))) for g in session_gap_list[:5]
-            )
-            if len(session_gap_list) > 5:
-                gap_preview += ", ..."
-            logging.info(
-                "Detected %d gap(s) longer than %.0fs (skip applied): %s",
-                len(session_gap_list),
-                session_gap_sec,
-                gap_preview,
-            )
-
-        duration_grid: List[int] = []
-
-        if all_windows:
-            step_for_all = step_s if step_s > 0 else 1
-            if not resample_1hz:
-                times, values = _resample_to_1hz(times, values)
-            curve = all_windows_curve(times, values, step=step_for_all)
-            duration_grid = [cp.duration_s for cp in curve]
-        else:
-            if exhaustive:
-                total_span = max(0.0, times[-1] - times[0])
-                if max_duration_s is not None:
-                    total_span = min(total_span, float(max_duration_s))
-                span_int = int(math.floor(total_span))
-                if span_int <= 0:
-                    logging.warning("Total span too small for exhaustive sweep (%ss)", total_span)
-                    durs = []
-                else:
-                    fine_until = min(span_int, 2 * 3600)
-                    step_eval = step_s if step_s > 0 else 1
-                    durs = nice_durations_for_span(
-                        total_span_s=span_int,
-                        fine_until_s=fine_until,
-                        fine_step_s=step_eval,
-                        pct_step=0.01,
-                    )
-                    logging.info(
-                        "Exhaustive duration grid: %d candidates up to %s",
-                        len(durs),
-                        _fmt_duration_label(span_int),
-                    )
-            else:
-                base_durations = [int(d) for d in durations if d is not None]
-                if not base_durations:
-                    base_durations = list(DEFAULT_DURATIONS)
-                max_base = max(base_durations) if base_durations else 0
-                durs_set: Set[int] = set(d for d in base_durations if d > 0)
-                target_span = int(math.ceil(full_span_seconds)) if full_span_seconds > 0 else 0
-                if target_span > max_base:
-                    fine_until = min(target_span, max(max_base, 2 * 3600))
-                    step_eval = step_s if step_s > 0 else 60
-                    step_eval = max(60, step_eval)
-                    extra = nice_durations_for_span(
-                        total_span_s=target_span,
-                        fine_until_s=fine_until,
-                        fine_step_s=step_eval,
-                        pct_step=0.02,
-                    )
-                    for d in extra:
-                        if d >= 60:
-                            durs_set.add(int(d))
-                    durs_set.add(target_span)
-                    logging.info(
-                        "Augmented durations with %d additional candidates up to %s",
-                        max(0, len(durs_set) - len(set(base_durations))),
-                        _fmt_duration_label(target_span),
-                    )
-                durs = sorted(durs_set) if durs_set else list(DEFAULT_DURATIONS)
-
-            curve = compute_curve(
-                times,
-                values,
-                durs,
-                gaps=session_gap_list,
-                engine=engine_mode,
-            )
-            duration_grid = list(durs)
-            profiler.lap("curve")
-
-        if not curve:
-            logging.error("Unable to compute curve for requested durations.")
-            return 2
-
-        if not overall_sources_raw:
-            selected_raw = "mixed" if source == "auto" else source
-        elif len(overall_sources_raw) == 1:
-            selected_raw = next(iter(overall_sources_raw))
-        else:
-            selected_raw = "mixed"
-        selected = _normalize_source_label(selected_raw)
+        series = _load_activity_series(
+            fit_files,
+            source=source,
+            gain_eps=gain_eps,
+            session_gap_sec=session_gap_sec,
+            qc_enabled=qc_enabled,
+            qc_spec_path=qc_spec_path,
+            resample_1hz=resample_1hz,
+            merge_eps_sec=merge_eps_sec,
+            overlap_policy=overlap_policy,
+            parse_workers=parse_workers,
+            profiler=profiler,
+        )
+        times = series.times
+        values = series.values
+        inactivity_gaps = series.inactivity_gaps
+        session_gap_list = series.session_gaps
+        full_span_seconds = series.full_span_seconds
+        selected_raw = series.selected_raw
+        selected = series.selected_label
     except Exception as e:
         logging.error(str(e))
+        return 2
+
+    duration_grid: List[int] = []
+
+    if all_windows:
+        step_for_all = step_s if step_s > 0 else 1
+        if not resample_1hz:
+            times, values = _resample_to_1hz(times, values)
+        curve = all_windows_curve(times, values, step=step_for_all)
+        duration_grid = [cp.duration_s for cp in curve]
+        profiler.lap("curve")
+    else:
+        if exhaustive:
+            total_span = max(0.0, times[-1] - times[0])
+            if max_duration_s is not None:
+                total_span = min(total_span, float(max_duration_s))
+            span_int = int(math.floor(total_span))
+            if span_int <= 0:
+                logging.warning("Total span too small for exhaustive sweep (%ss)", total_span)
+                durs = []
+            else:
+                fine_until = min(span_int, 2 * 3600)
+                step_eval = step_s if step_s > 0 else 1
+                durs = nice_durations_for_span(
+                    total_span_s=span_int,
+                    fine_until_s=fine_until,
+                    fine_step_s=step_eval,
+                    pct_step=0.01,
+                )
+                logging.info(
+                    "Exhaustive duration grid: %d candidates up to %s",
+                    len(durs),
+                    _fmt_duration_label(span_int),
+                )
+        else:
+            base_durations = [int(d) for d in durations if d is not None]
+            if not base_durations:
+                base_durations = list(DEFAULT_DURATIONS)
+            max_base = max(base_durations) if base_durations else 0
+            durs_set: Set[int] = set(d for d in base_durations if d > 0)
+            target_span = int(math.ceil(full_span_seconds)) if full_span_seconds > 0 else 0
+            if target_span > max_base:
+                fine_until = min(target_span, max(max_base, 2 * 3600))
+                step_eval = step_s if step_s > 0 else 60
+                step_eval = max(60, step_eval)
+                extra = nice_durations_for_span(
+                    total_span_s=target_span,
+                    fine_until_s=fine_until,
+                    fine_step_s=step_eval,
+                    pct_step=0.02,
+                )
+                for d in extra:
+                    if d >= 60:
+                        durs_set.add(int(d))
+                durs_set.add(target_span)
+                logging.info(
+                    "Augmented durations with %d additional candidates up to %s",
+                    max(0, len(durs_set) - len(set(base_durations))),
+                    _fmt_duration_label(target_span),
+                )
+            durs = sorted(durs_set) if durs_set else list(DEFAULT_DURATIONS)
+
+        curve = compute_curve(
+            times,
+            values,
+            durs,
+            gaps=session_gap_list,
+            engine=engine_mode,
+        )
+        duration_grid = list(durs)
+        profiler.lap("curve")
+
+    if not curve:
+        logging.error("Unable to compute curve for requested durations.")
         return 2
 
     # Enforce monotonic climb and non-increasing rate behaviour
@@ -4710,135 +5563,23 @@ def _run(
     # Diagnose monotonicity issues (should be non-decreasing max climb with duration)
     _diagnose_curve_monotonicity(curve, epsilon=1e-6, inactivity_gaps=inactivity_gaps)
 
-    # Scoring and WR envelope
-    wr_curve: Optional[Tuple[List[int], List[float]]] = None
-    personal_curve: Optional[Tuple[List[int], List[float]]] = None
-    goal_curve: Optional[Tuple[List[int], List[float]]] = None
-    magic_rows: Optional[List[Dict[str, Any]]] = None
-    try:
-        profile_config = _wr_profile_config(wr_profile)
-        H_WR, wr_env = _get_wr_envelope(
-            wr_profile,
-            profile_config,
-            wr_min_seconds=wr_min_seconds,
-            wr_anchors_path=wr_anchors_path,
-            cap_mode=wr_short_cap,
-        )
-        H_WR_func = H_WR
-        cap_info = wr_env.get("cap_info", {})
-        if cap_info:
-            logging.info(
-                "WR cap %.2f m/s (treadmill=%.2f, stairs=%.2f, energy=%.2f)",
-                cap_info.get("v_cap", float("nan")),
-                cap_info.get("treadmill", float("nan")),
-                cap_info.get("stairs", float("nan")),
-                cap_info.get("energy", float("nan")),
-            )
-        anchor_report = []
-        for anchor in wr_env.get("anchors", []):
-            predicted = H_WR(anchor["w_s"])
-            slack = predicted - anchor["gain_m"]
-            anchor_report.append((anchor["w_s"], anchor["gain_m"], slack))
-        if anchor_report:
-            slack_text = ", ".join(
-                f"{w/3600.0:.2f}h: +{slack:.1f} m" for w, _, slack in anchor_report
-            )
-            logging.info("WR anchor slack: %s", slack_text)
-        try:
-            if wr_min_seconds <= 3600.0:
-                wr_1h = H_WR(3600.0)
-                assert 1500.0 < wr_1h < 2600.0, f"WR(1h) sanity failed: {wr_1h}"
-            if wr_min_seconds <= 12 * 3600.0:
-                wr_12h = H_WR(12 * 3600.0)
-                assert 11000.0 < wr_12h < 15000.0, f"WR(12h) sanity failed: {wr_12h}"
-        except AssertionError as err:
-            raise RuntimeError(str(err))
-        W_s = [cp.duration_s for cp in curve]
-        H_user = [cp.max_climb_m for cp in curve]
-        wr_durations = wr_env.get("durations", [])
-        wr_climbs = wr_env.get("climbs", [])
-        wr_rates_env: Optional[List[float]] = wr_env.get("rates") if isinstance(wr_env.get("rates"), list) else None
-        if wr_durations and wr_climbs:
-            wr_curve = (wr_durations, wr_climbs)
-            start_label = _fmt_duration_label(max(int(round(wr_durations[0])), 1))
-            end_label = _fmt_duration_label(max(int(round(wr_durations[-1])), 1))
-            logging.info(
-                "WR envelope sample span: %s→%s (%d points)",
-                start_label,
-                end_label,
-                len(wr_durations),
-            )
-        else:
-            wr_curve = None
-            logging.warning("WR envelope returned no sample points; disabling WR overlay.")
-
-        # Filter WR overlay to w >= wr_min_seconds for scoring/personal scaling
-        wr_indices = [idx for idx, w in enumerate(W_s) if w >= wr_min_seconds]
-        W_wr = [W_s[idx] for idx in wr_indices]
-        parsed_magic = [ _parse_duration_token(t) for t in (magic.split(',') if magic else []) ] if magic else []
-        magic_ws = [int(w) for w in parsed_magic if w >= wr_min_seconds]
-        wr_sample_arrays: Optional[Tuple[np.ndarray, np.ndarray]] = None
-        if wr_curve and wr_curve[0] and wr_curve[1]:
-            wr_sample_arrays = (
-                np.asarray(wr_curve[0], dtype=np.float64),
-                np.asarray(wr_curve[1], dtype=np.float64),
-            )
-        elif isinstance(wr_env.get("durations"), list) and isinstance(wr_env.get("climbs"), list):
-            wr_sample_arrays = (
-                np.asarray(wr_env.get("durations"), dtype=np.float64),
-                np.asarray(wr_env.get("climbs"), dtype=np.float64),
-            )
-        H_wr_arr, H_pers_arr, rows, weakest = _scoring_tables(
-            W_s,
-            H_user,
-            H_WR,
-            magic_ws,
-            min_anchor_s=personal_min_seconds,
-            topk=goals_topk,
-            wr_curve_sample=wr_sample_arrays,
-        )
-        personal_curve = (W_wr, [H_pers_arr[idx] for idx in wr_indices]) if W_wr else None
-        # Goal curve across full grid: user + 2/3*(personal - user)
-        H_goal_full = [u + (2.0/3.0) * (p - u) for u, p in zip(H_user, H_pers_arr)]
-        goal_curve = (W_s, H_goal_full)
-        magic_rows = rows
-        if rows:
-            checkpoint_logs: List[str] = []
-            for row in rows:
-                w_val = row.get("duration_s")
-                wr_gain = row.get("wr_gain_m")
-                user_gain = row.get("user_gain_m")
-                score_pct = row.get("score_pct")
-                if not isinstance(w_val, (int, float)) or not isinstance(wr_gain, (int, float)):
-                    continue
-                if w_val <= 0:
-                    continue
-                wr_rate = wr_gain / w_val * 3600.0
-                label = _fmt_duration_label(int(round(w_val)))
-                if isinstance(user_gain, (int, float)):
-                    user_rate = user_gain / w_val * 3600.0
-                    if isinstance(score_pct, (int, float)):
-                        checkpoint_logs.append(
-                            f"{label}: WR {wr_gain:.0f} m ({wr_rate:.0f} m/h), user {user_gain:.0f} m ({user_rate:.0f} m/h, {score_pct:.0f}%)"
-                        )
-                    else:
-                        checkpoint_logs.append(
-                            f"{label}: WR {wr_gain:.0f} m ({wr_rate:.0f} m/h), user {user_gain:.0f} m ({user_rate:.0f} m/h)"
-                        )
-                else:
-                    checkpoint_logs.append(
-                        f"{label}: WR {wr_gain:.0f} m ({wr_rate:.0f} m/h)"
-                    )
-            if checkpoint_logs:
-                logging.info("WR checkpoints: %s", "; ".join(checkpoint_logs))
-        if score_output:
-            with open(score_output, 'w', newline='') as f:
-                w = csv.DictWriter(f, fieldnames=["duration_s","user_gain_m","wr_gain_m","score_pct","personal_gain_m","goal_gain_m"])
-                w.writeheader()
-                for r in rows:
-                    w.writerow(r)
-    except Exception as e:
-        logging.warning(f"WR/scoring computation failed: {e}")
+    wr_result = _compute_wr_envelope_and_personal(
+        curve,
+        wr_profile=wr_profile,
+        wr_anchors_path=wr_anchors_path,
+        wr_min_seconds=wr_min_seconds,
+        wr_short_cap=wr_short_cap,
+        magic=magic,
+        personal_min_seconds=personal_min_seconds,
+        goals_topk=goals_topk,
+        score_output=score_output,
+    )
+    wr_curve = wr_result.wr_curve
+    personal_curve = wr_result.personal_curve
+    goal_curve = wr_result.goal_curve
+    magic_rows = wr_result.magic_rows
+    H_WR_func = wr_result.H_WR_func
+    wr_rates_env = wr_result.wr_rates
 
     profiler.lap("wr/scoring")
 
@@ -4989,6 +5730,337 @@ def _run(
     return 0
 
 
+def _run_gain_time(
+    fit_files: List[str],
+    output: str,
+    gains: List[str],
+    source: str,
+    verbose: bool,
+    png: Optional[str] = None,
+    no_plot: bool = False,
+    all_windows: bool = True,
+    exhaustive: bool = False,
+    step_s: int = 1,
+    max_duration_s: Optional[int] = None,
+    log_file: Optional[str] = None,
+    merge_eps_sec: float = 0.5,
+    overlap_policy: str = "file:last",
+    resample_1hz: bool = False,
+    parse_workers: int = 0,
+    gain_eps: float = 0.5,
+    session_gap_sec: float = 600.0,
+    qc_enabled: bool = True,
+    qc_spec_path: Optional[str] = None,
+    wr_profile: str = "overall",
+    wr_anchors_path: Optional[str] = None,
+    wr_min_seconds: float = 30.0,
+    wr_short_cap: str = "standard",
+    plot_wr: bool = False,
+    plot_personal: bool = True,
+    split_plots: bool = True,
+    fast_plot: bool = True,
+    magic_gains: Optional[str] = DEFAULT_MAGIC_GAINS,
+    goals_topk: int = 3,
+    profile: bool = False,
+    gain_units: str = "m",
+    iso_rates: Sequence[float] = ISO_RATE_GUIDES,
+    engine: str = "auto",
+    concave_envelope: bool = True,
+    ylog_time: bool = False,
+) -> int:
+    _setup_logging(verbose, log_file=log_file)
+
+    profiler = _StageProfiler(profile)
+    engine_mode = _resolve_engine(engine)
+
+    try:
+        series = _load_activity_series(
+            fit_files,
+            source=source,
+            gain_eps=gain_eps,
+            session_gap_sec=session_gap_sec,
+            qc_enabled=qc_enabled,
+            qc_spec_path=qc_spec_path,
+            resample_1hz=resample_1hz,
+            merge_eps_sec=merge_eps_sec,
+            overlap_policy=overlap_policy,
+            parse_workers=parse_workers,
+            profiler=profiler,
+        )
+    except Exception as exc:
+        logging.error(str(exc))
+        return 2
+
+    times = series.times
+    values = series.values
+    inactivity_gaps = series.inactivity_gaps
+    session_gap_list = series.session_gaps
+    full_span_seconds = series.full_span_seconds
+    selected_raw = series.selected_raw
+    selected_label = series.selected_label
+
+    curve: List[CurvePoint] = []
+    duration_grid: List[int] = []
+
+    if not times:
+        logging.error("No data available to compute gain-time report after preprocessing.")
+        return 2
+
+    if all_windows:
+        step_for_all = step_s if step_s > 0 else 1
+        if not resample_1hz:
+            times, values = _resample_to_1hz(times, values)
+        curve = all_windows_curve(times, values, step=step_for_all)
+        duration_grid = [cp.duration_s for cp in curve]
+    else:
+        if exhaustive:
+            total_span = max(0.0, times[-1] - times[0])
+            if max_duration_s is not None:
+                total_span = min(total_span, float(max_duration_s))
+            span_int = int(math.floor(total_span))
+            if span_int <= 0:
+                logging.warning("Total span too small for exhaustive sweep (%ss)", total_span)
+                durs = []
+            else:
+                fine_until = min(span_int, 2 * 3600)
+                step_eval = step_s if step_s > 0 else 1
+                durs = nice_durations_for_span(
+                    total_span_s=span_int,
+                    fine_until_s=fine_until,
+                    fine_step_s=step_eval,
+                    pct_step=0.01,
+                )
+                logging.info(
+                    "Exhaustive duration grid: %d candidates up to %s",
+                    len(durs),
+                    _fmt_duration_label(span_int),
+                )
+        else:
+            base_durations = [int(d) for d in DEFAULT_DURATIONS]
+            max_base = max(base_durations) if base_durations else 0
+            durs_set: Set[int] = set(d for d in base_durations if d > 0)
+            target_span = int(math.ceil(full_span_seconds)) if full_span_seconds > 0 else 0
+            if target_span > max_base:
+                fine_until = min(target_span, max(max_base, 2 * 3600))
+                step_eval = step_s if step_s > 0 else 60
+                step_eval = max(60, step_eval)
+                extra = nice_durations_for_span(
+                    total_span_s=target_span,
+                    fine_until_s=fine_until,
+                    fine_step_s=step_eval,
+                    pct_step=0.02,
+                )
+                for d in extra:
+                    if d >= 60:
+                        durs_set.add(int(d))
+                durs_set.add(target_span)
+                logging.info(
+                    "Augmented durations with %d additional candidates up to %s",
+                    max(0, len(durs_set) - len(set(base_durations))),
+                    _fmt_duration_label(target_span),
+                )
+            durs = sorted(durs_set) if durs_set else list(DEFAULT_DURATIONS)
+
+        curve = compute_curve(
+            times,
+            values,
+            durs,
+            gaps=session_gap_list,
+            engine=engine_mode,
+        )
+        duration_grid = list(durs)
+        profiler.lap("curve")
+
+    if not curve:
+        logging.error("Unable to compute duration curve for inversion.")
+        return 2
+
+    curve_original = copy.deepcopy(curve)
+    apply_concave = concave_envelope and not exhaustive
+    _enforce_curve_shape(curve, inactivity_gaps=inactivity_gaps, apply_concave=apply_concave)
+    _diagnose_curve_monotonicity(curve, epsilon=1e-6, inactivity_gaps=inactivity_gaps)
+
+    gain_curve = build_gain_time_curve(curve, total_span_s=full_span_seconds, source_label=selected_label)
+
+    wr_result = _compute_wr_envelope_and_personal(
+        curve,
+        wr_profile=wr_profile,
+        wr_anchors_path=wr_anchors_path,
+        wr_min_seconds=wr_min_seconds,
+        wr_short_cap=wr_short_cap,
+        magic=None,
+        personal_min_seconds=wr_min_seconds,
+        goals_topk=goals_topk,
+        score_output=None,
+    )
+
+    wr_gain_curve: Optional[GainTimeCurve] = None
+    if wr_result.wr_curve:
+        wr_gain_curve = convert_samples_to_gain_time_curve(
+            wr_result.wr_curve[0],
+            wr_result.wr_curve[1],
+            source_label="WR",
+        )
+    personal_gain_curve: Optional[GainTimeCurve] = None
+    if wr_result.personal_curve:
+        personal_gain_curve = convert_samples_to_gain_time_curve(
+            wr_result.personal_curve[0],
+            wr_result.personal_curve[1],
+            source_label="Personal",
+        )
+
+    default_targets = list(DEFAULT_GAIN_TARGETS)
+    gain_unit_norm = gain_units.lower()
+    if gains:
+        target_gains = _parse_gain_list(gains, default_unit=gain_unit_norm)
+    else:
+        target_gains = default_targets
+    if not target_gains:
+        target_gains = default_targets
+    target_gains = [float(val) for val in sorted({round(v, 6) for v in target_gains}) if val > 0]
+    if not target_gains:
+        target_gains = list(DEFAULT_GAIN_TARGETS)
+
+    targets_curve = invert_duration_curve_to_gain_time(
+        curve,
+        target_gains,
+        total_span_s=full_span_seconds,
+        source_label=selected_label,
+    )
+    approx_map: Dict[float, GainTimePoint] = {round(pt.gain_m, 6): pt for pt in targets_curve.points}
+    direct_points = min_time_for_gains(times, values, target_gains)
+
+    if len(direct_points) != len(target_gains):
+        logging.warning("Failed to refine gain targets; falling back to envelope inversion only.")
+        merged_points = [approx_map.get(round(val, 6)) for val in target_gains]
+        merged_points = [pt for pt in merged_points if pt is not None]
+    else:
+        merged_points = []
+        for gain_value, direct_point in zip(target_gains, direct_points):
+            key = round(gain_value, 6)
+            approx_pt = approx_map.get(key)
+            note = direct_point.note
+            if note != "unachievable" and approx_pt is not None:
+                if approx_pt.note == "bounded_by_grid":
+                    note = "bounded_by_grid"
+                elif approx_pt.min_time_s - direct_point.min_time_s > 1.5:
+                    note = "bounded_by_grid"
+            merged_points.append(
+                GainTimePoint(
+                    gain_m=direct_point.gain_m,
+                    min_time_s=direct_point.min_time_s,
+                    avg_rate_m_per_hr=direct_point.avg_rate_m_per_hr,
+                    start_offset_s=direct_point.start_offset_s,
+                    end_offset_s=direct_point.end_offset_s,
+                    note=note,
+                )
+            )
+
+    if not merged_points:
+        logging.warning("No valid gain targets; check input parameters.")
+
+    magic_gain_values: List[float] = []
+    magic_tokens = magic_gains.split(",") if magic_gains else []
+    for token in magic_tokens:
+        val = _parse_gain_token(token, default_unit=gain_unit_norm)
+        if val is None or val <= 0:
+            continue
+        magic_gain_values.append(val)
+    magic_gain_values = sorted({round(val, 6) for val in magic_gain_values})
+
+    gain_label = "ft" if gain_unit_norm == "ft" else "m"
+    summary_lines = [f"Gain Time Report (source: {selected_raw})"]
+    total_gain = values[-1] if values else 0.0
+    total_gain_display = _format_gain(total_gain, gain_unit_norm)
+    for pt in merged_points:
+        gain_str = _format_gain(pt.gain_m, gain_unit_norm)
+        if not math.isfinite(pt.min_time_s) or pt.min_time_s <= 0:
+            summary_lines.append(f"- {gain_str}: unachievable (max gain {total_gain_display})")
+            continue
+        rate_str = _fmt_rate_mph(pt.avg_rate_m_per_hr)
+        window_start = _fmt_time_hms(pt.start_offset_s or 0.0)
+        window_end = _fmt_time_hms(pt.end_offset_s or 0.0)
+        note_suffix = f" [{pt.note}]" if pt.note else ""
+        summary_lines.append(
+            f"- {gain_str}: {_fmt_time_hms(pt.min_time_s)} ({rate_str}) window {window_start}–{window_end}{note_suffix}"
+        )
+
+    for line in summary_lines:
+        print(line)
+
+    fieldnames = [
+        "gain_m",
+        "min_time_s",
+        "avg_rate_m_per_hr",
+        "start_offset_s",
+        "end_offset_s",
+        "source",
+        "note",
+    ]
+    with open(output, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(fieldnames)
+        for pt in merged_points:
+            writer.writerow([
+                round(pt.gain_m, 3),
+                round(pt.min_time_s, 3) if math.isfinite(pt.min_time_s) else None,
+                round(pt.avg_rate_m_per_hr, 3) if math.isfinite(pt.avg_rate_m_per_hr) else None,
+                round(pt.start_offset_s, 3) if isinstance(pt.start_offset_s, (int, float)) and math.isfinite(pt.start_offset_s) else None,
+                round(pt.end_offset_s, 3) if isinstance(pt.end_offset_s, (int, float)) and math.isfinite(pt.end_offset_s) else None,
+                selected_raw,
+                pt.note or "",
+            ])
+
+    logging.info("Wrote: %s", output)
+    profiler.lap("csv")
+
+    if not no_plot:
+        png_path = png
+        if png_path is None:
+            if output.lower().endswith(".csv"):
+                png_path = output[:-4] + ".png"
+            else:
+                png_path = output + ".png"
+        gain_magic = [float(val) for val in magic_gain_values]
+        if split_plots:
+            _plot_gain_time_split(
+                gain_curve,
+                png_path,
+                selected_label,
+                merged_points,
+                wr_curve=wr_gain_curve,
+                personal_curve=personal_gain_curve,
+                magic_gains=gain_magic,
+                show_wr=plot_wr,
+                show_personal=plot_personal,
+                unit=gain_unit_norm,
+                fast_plot=fast_plot,
+                iso_rates=iso_rates,
+                ylog_time=ylog_time,
+            )
+            logging.info("Wrote plots: %s", png_path)
+        else:
+            _plot_gain_time(
+                gain_curve,
+                png_path,
+                selected_label,
+                merged_points,
+                wr_curve=wr_gain_curve,
+                personal_curve=personal_gain_curve,
+                magic_gains=gain_magic,
+                show_wr=plot_wr,
+                show_personal=plot_personal,
+                unit=gain_unit_norm,
+                fast_plot=fast_plot,
+                iso_rates=iso_rates,
+                ylog_time=ylog_time,
+            )
+            logging.info("Wrote plot: %s", png_path)
+
+    profiler.lap("plot")
+    return 0
+
+
 def _build_typer_app():  # pragma: no cover
     app = typer.Typer(add_completion=False, help="Critical hill climb rate curve from FIT files.")
 
@@ -5087,6 +6159,152 @@ def _build_typer_app():  # pragma: no cover
             engine=engine,
             profile=profile,
             fast_plot=fast_plot,
+        )
+        if code != 0:
+            raise typer.Exit(code)
+
+    @app.command()
+    def time(
+        fit_files: List[str] = typer.Argument(..., help="One or more input .fit files"),
+        gains: List[str] = typer.Option([], "--gains", "-g", help="Gain targets (accepts suffix m or ft)."),
+        output: str = typer.Option(
+            "gain_time.csv",
+            "--output",
+            "-o",
+            help="Output CSV path",
+        ),
+        source: str = typer.Option(
+            "auto",
+            "--source",
+            help="Data source: auto|runn|altitude",
+        ),
+        verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
+        png: Optional[str] = typer.Option(None, "--png", help="Optional output PNG path (defaults next to CSV)"),
+        no_plot: bool = typer.Option(False, "--no-plot", help="Disable PNG generation"),
+        all_windows: bool = typer.Option(False, "--all/--no-all", help="Compute per-second duration curve for inversion", show_default=True),
+        exhaustive: bool = typer.Option(False, "--exhaustive", help="Evaluate a dense duration grid before inversion"),
+        step_s: int = typer.Option(1, "--step", help="Step size in seconds for exhaustive durations"),
+        max_duration_s: Optional[int] = typer.Option(None, "--max-duration", help="Maximum duration in seconds for exhaustive evaluation"),
+        log_file: Optional[str] = typer.Option(None, "--log-file", help="Optional log file path"),
+        merge_eps_sec: float = typer.Option(0.5, "--merge-eps-sec", help="Coalesce tolerance (seconds) for overlapping timestamps"),
+        overlap_policy: str = typer.Option("file:last", "--overlap-policy", help="Overlap precedence: file:first|file:last"),
+        resample_1hz: bool = typer.Option(False, "--resample-1hz", help="Resample cumulative series to 1 Hz"),
+        parse_workers: int = typer.Option(0, "--parse-workers", help="Number of worker threads for FIT parsing (0=auto, 1=serial)"),
+        gain_eps: float = typer.Option(0.5, "--gain-eps", help="Altitude hysteresis (m) for ascent from altitude"),
+        session_gap_sec: float = typer.Option(600.0, "--session-gap-sec", help="Gap (s) considered inactivity when summarising"),
+        qc: bool = typer.Option(True, "--qc/--no-qc", help="Enable QC filtering for ascent spikes"),
+        qc_spec: Optional[str] = typer.Option(None, "--qc-spec", help="Path to JSON overriding QC windows"),
+        wr_profile: str = typer.Option("overall", "--wr-profile", help="WR envelope profile"),
+        wr_anchors: Optional[str] = typer.Option(None, "--wr-anchors", help="Path to JSON defining WR anchors"),
+        wr_min_seconds: float = typer.Option(30.0, "--wr-min-seconds", help="Minimum duration (s) for WR overlay"),
+        wr_short_cap: str = typer.Option("standard", "--wr-short-cap", help="WR short-duration cap: conservative|standard|aggressive"),
+        plot_wr: bool = typer.Option(False, "--plot-wr/--no-plot-wr", help="Show WR envelope on plots"),
+        plot_personal: bool = typer.Option(True, "--plot-personal/--no-plot-personal", help="Show personal scaled WR curve"),
+        split_plots: bool = typer.Option(True, "--split-plots/--no-split-plots", help="Write separate time/rate PNGs"),
+        fast_plot: bool = typer.Option(True, "--fast-plot/--no-fast-plot", help="Skip heavy plot annotations for faster rendering"),
+        magic_gain_tokens: Optional[str] = typer.Option(DEFAULT_MAGIC_GAINS, "--magic-gains", help="Comma-separated gains to annotate (accepts m/ft suffix)"),
+        goals_topk: int = typer.Option(3, "--goals-topk", help="Reserved for future goal annotations"),
+        profile: bool = typer.Option(False, "--profile/--no-profile", help="Log stage timings"),
+        gain_units: str = typer.Option("m", "--gain-units", help="Display/parse units: m|ft"),
+        engine: str = typer.Option("auto", "--engine", help="Curve engine: auto|numpy|numba|stride"),
+        concave_envelope: bool = typer.Option(True, "--concave-envelope/--no-concave-envelope", help="Apply concave envelope smoothing before inversion"),
+        ylog_time: bool = typer.Option(False, "--ylog-time/--no-ylog-time", help="Use log scale for time axis"),
+    ) -> None:
+        _require_dependency(FitFile, "fitparse", "pip install fitparse")
+        units_norm = gain_units.lower()
+        if units_norm not in ("m", "ft"):
+            raise typer.BadParameter("gain-units must be 'm' or 'ft'")
+        gains_list = list(gains)
+        filtered_files: List[str] = []
+        for token in fit_files:
+            if _token_is_likely_gain(token, default_unit=units_norm):
+                gains_list.append(token)
+            else:
+                filtered_files.append(token)
+        if not filtered_files:
+            raise typer.BadParameter("Provide at least one FIT file after gain tokens.")
+        code = _run_gain_time(
+            filtered_files,
+            output,
+            gains_list,
+            source,
+            verbose,
+            png=png,
+            no_plot=no_plot,
+            all_windows=all_windows,
+            exhaustive=exhaustive,
+            step_s=step_s,
+            max_duration_s=max_duration_s,
+            log_file=log_file,
+            merge_eps_sec=merge_eps_sec,
+            overlap_policy=overlap_policy,
+            resample_1hz=resample_1hz,
+            parse_workers=parse_workers,
+            gain_eps=gain_eps,
+            session_gap_sec=session_gap_sec,
+            qc_enabled=qc,
+            qc_spec_path=qc_spec,
+            wr_profile=wr_profile,
+            wr_anchors_path=wr_anchors,
+            wr_min_seconds=wr_min_seconds,
+            wr_short_cap=wr_short_cap,
+            plot_wr=plot_wr,
+            plot_personal=plot_personal,
+            split_plots=split_plots,
+            fast_plot=fast_plot,
+            magic_gains=magic_gain_tokens,
+            goals_topk=goals_topk,
+            profile=profile,
+            gain_units=units_norm,
+            engine=engine,
+            concave_envelope=concave_envelope,
+            ylog_time=ylog_time,
+        )
+        if code != 0:
+            raise typer.Exit(code)
+
+    @app.command(name="export-series")
+    def export_series(
+        fit_files: List[str] = typer.Argument(..., help="One or more input .fit files"),
+        output: str = typer.Option(
+            "timeseries.csv",
+            "--output",
+            "-o",
+            help="Output CSV path for the canonical cumulative series",
+        ),
+        source: str = typer.Option(
+            "auto",
+            "--source",
+            help="Data source: auto|runn|altitude",
+        ),
+        verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
+        resample_1hz: bool = typer.Option(False, "--resample-1hz", help="Resample cumulative series to 1 Hz"),
+        parse_workers: int = typer.Option(0, "--parse-workers", help="Number of worker threads for FIT parsing (0=auto, 1=serial)"),
+        gain_eps: float = typer.Option(0.5, "--gain-eps", help="Altitude hysteresis (m) for ascent from altitude"),
+        session_gap_sec: float = typer.Option(600.0, "--session-gap-sec", help="Gap (s) considered inactivity when summarising"),
+        qc: bool = typer.Option(True, "--qc/--no-qc", help="Censor implausible ascent spikes before computing the series"),
+        qc_spec: Optional[str] = typer.Option(None, "--qc-spec", help="Path to JSON overriding QC windows {window_s: max_gain_m}"),
+        merge_eps_sec: float = typer.Option(0.5, "--merge-eps-sec", help="Coalesce tolerance (seconds) for overlapping timestamps"),
+        overlap_policy: str = typer.Option("file:last", "--overlap-policy", help="Overlap precedence for total gain: file:first|file:last"),
+        log_file: Optional[str] = typer.Option(None, "--log-file", help="Optional log file path"),
+        profile: bool = typer.Option(False, "--profile/--no-profile", help="Log stage timings for performance profiling"),
+    ) -> None:
+        _require_dependency(FitFile, "fitparse", "pip install fitparse")
+        code = _export_series_command(
+            fit_files,
+            output,
+            source,
+            verbose,
+            resample_1hz,
+            parse_workers,
+            gain_eps,
+            session_gap_sec,
+            qc,
+            qc_spec,
+            merge_eps_sec,
+            overlap_policy,
+            log_file,
+            profile,
         )
         if code != 0:
             raise typer.Exit(code)
