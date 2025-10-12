@@ -15,7 +15,7 @@ use serde_wasm_bindgen::to_value as to_js;
 use web_sys::{Blob, FileList, HtmlInputElement};
 
 #[cfg(feature = "chart_plotly")]
-use hc_curve::{compute_curves, compute_gain_time, parse_records, Params};
+use hc_curve::{compute_curves, compute_gain_time, parse_records, Curves, Params, HcError};
 
 #[cfg(feature = "chart_plotly")]
 #[derive(Clone)]
@@ -149,6 +149,59 @@ fn build_iso_line(xmin: f64, xmax: f64, rate: f64) -> JsValue {
 }
 
 #[cfg(feature = "chart_plotly")]
+fn fallback_param_candidates(base: &Params) -> Vec<(String, Params)> {
+    let mut candidates = Vec::new();
+    candidates.push(("default parameters".to_string(), base.clone()));
+
+    if base.qc_enabled {
+        let mut no_qc = base.clone();
+        no_qc.qc_enabled = false;
+        candidates.push(("disabled QC filtering".to_string(), no_qc));
+    }
+
+    if base.source == hc_curve::Source::Auto {
+        let mut altitude = base.clone();
+        altitude.source = hc_curve::Source::Altitude;
+        candidates.push(("forced altitude ascent".to_string(), altitude));
+    }
+
+    if base.resample_1hz {
+        let mut raw = base.clone();
+        raw.resample_1hz = false;
+        candidates.push(("raw sampling (no 1 Hz)".to_string(), raw));
+    }
+
+    candidates
+}
+
+#[cfg(feature = "chart_plotly")]
+fn try_compute_curves(
+    records_by_file: &Vec<Vec<hc_curve::FitRecord>>,
+    base_params: &Params,
+) -> Result<(Curves, Params, Vec<String>), HcError> {
+    let mut attempts = fallback_param_candidates(base_params);
+    let mut last_err: Option<HcError> = None;
+    let mut notes: Vec<String> = Vec::new();
+
+    for (label, candidate) in attempts.drain(..) {
+        match compute_curves(records_by_file.clone(), &candidate) {
+            Ok(curves) => {
+                if label != "default parameters" {
+                    notes.push(format!("Applied {label}"));
+                }
+                return Ok((curves, candidate, notes));
+            }
+            Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| HcError::InvalidParameter("curve computation failed".into())))
+}
+
+#[cfg(feature = "chart_plotly")]
 fn blob_url_from_str(s: &str) -> String {
     let arr = js_sys::Array::new();
     arr.push(&JsValue::from_str(s));
@@ -251,8 +304,8 @@ pub fn App() -> impl IntoView {
             };
 
             // Curves
-            let curves = match compute_curves(records_by_file.clone(), &params) {
-                Ok(c) => c,
+            let (curves, params_used, fallback_notes) = match try_compute_curves(&records_by_file, &params) {
+                Ok(res) => res,
                 Err(err) => {
                     set_status_cb.set(format!("Curve computation failed: {err}"));
                     set_busy_cb.set(false);
@@ -290,7 +343,7 @@ pub fn App() -> impl IntoView {
 
             // Gain-time
             const DEFAULT_GAIN_TARGETS: &[f64] = &[50.0, 100.0, 150.0, 200.0, 300.0, 500.0, 750.0, 1000.0];
-            let gt = match compute_gain_time(records_by_file.clone(), &params, DEFAULT_GAIN_TARGETS) {
+            let gt = match compute_gain_time(records_by_file.clone(), &params_used, DEFAULT_GAIN_TARGETS) {
                 Ok(r) => r,
                 Err(err) => {
                     set_status_cb.set(format!("Gain-time computation failed: {err}"));
@@ -342,6 +395,9 @@ pub fn App() -> impl IntoView {
             set_gain_href_cb.set(blob_url_from_str(&gt_csv));
 
             let mut msg = String::from("Done. Explore the plots and downloads.");
+            if !fallback_notes.is_empty() {
+                msg.push_str(&format!(" {}.", fallback_notes.join(", ")));
+            }
             if !unsupported.is_empty() { msg.push_str(&format!(" Skipped {} unsupported file(s).", unsupported.len())); }
             set_status_cb.set(msg);
             set_busy_cb.set(false);
