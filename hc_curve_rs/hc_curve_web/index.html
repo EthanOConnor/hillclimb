@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hillclimb Curves (Web)</title>
+    <!-- Trunk will build the Rust WASM app referenced via this link -->
+    <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="2" />
+    <!-- Plotly CDN for interactive charts -->
+    <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+    <style>
+      :root { --fg:#111; --muted:#666; --bg:#fff; --accent:#0a7; }
+      html, body { margin: 0; padding: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: var(--fg); background: var(--bg); }
+      main.tufte { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+      header { margin-bottom: 16px; }
+      header h1 { margin: 0 0 8px; font-weight: 650; }
+      .subtitle { color: var(--muted); margin: 0; }
+      .controls { margin: 16px 0; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      .dropzone { border: 2px dashed #ccc; border-radius: 8px; padding: 16px; display: inline-flex; align-items: center; gap: 12px; cursor: pointer; color: #555; }
+      .dropzone input[type=file] { display: none; }
+      .files { margin: 8px 0 4px; color: var(--muted); }
+      .btn { background: var(--accent); color: white; border: none; padding: 10px 14px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+      .btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+      .plots { display: grid; grid-template-columns: 1fr; gap: 16px; }
+      .plot { min-height: 360px; border: 1px solid #eee; border-radius: 8px; }
+      .downloads { margin-top: 8px; display: flex; gap: 12px; }
+      .downloads a { color: #055; text-decoration: none; font-weight: 600; }
+      .note { color: var(--muted); font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <!-- Leptos mounts to body in start() -->
+  </body>
+  <!-- Built files will be injected by Trunk -->
+  <!-- The app will look for #curve_plot and #gain_time_plot divs created by Rust -->
+</html>
+

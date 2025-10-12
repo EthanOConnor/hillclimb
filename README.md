@@ -108,3 +108,19 @@ Common developer-named fields are auto-detected when present, including:
 - `total_distance` (preferred distance source, used over `enhanced_distance`/`distance` when present)
 - `inclineRunn` (incline percent)
 - The curve search vectorizes start/end-aligned windows with cached envelope lookups (NumPy `searchsorted`) and gap-aware skipping, keeping per-duration work linear even on multi-day spans.
+
+Web App (WASM)
+---------------
+A minimal client‑side web app is scaffolded under `hc_curve_rs/hc_curve_web`. It lets you upload FIT/GPX files in the browser, computes the same curves locally (no server), renders interactive Plotly charts, and offers CSV downloads.
+
+Build locally:
+- `rustup target add wasm32-unknown-unknown`
+- `cargo install trunk`
+- `cd hc_curve_rs/hc_curve_web && trunk serve`
+
+Deploy to GitHub Pages:
+- Push to `main`; the included workflow `.github/workflows/deploy-web.yml` publishes to `gh-pages`.
+- Enable Pages in repo settings (branch: `gh-pages`).
+- Visit `https://<owner>.github.io/<repo>/`.
+
+See `docs/web_mvp_spec.md` for architecture and details, and `docs/WEB_APP_USAGE.md` for an end‑user guide.

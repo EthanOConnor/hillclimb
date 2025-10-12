@@ -1,0 +1,5 @@
+dist = "dist"
+
+# For GitHub Pages served at /<repo>/, pass --public-url from CI:
+# trunk build --release --public-url /${REPO_NAME}/
+

@@ -16,8 +16,11 @@ wasm-bindgen = { version = "0.2", optional = true }
 web-sys = { version = "0.3", optional = true, features = [
     "File",
     "FileList",
+    "DataTransfer",
+    "DragEvent",
     "HtmlElement",
     "HtmlInputElement",
+    "Url",
     "Window",
     "Document",
     "EventTarget",
