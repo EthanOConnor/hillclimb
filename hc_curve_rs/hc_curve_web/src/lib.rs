@@ -79,14 +79,71 @@ fn plot_xy(div_id: &str, traces: &js_sys::Array, layout: &JsValue) {
             if let Some(div) = document.get_element_by_id(div_id) {
                 let plotly = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("Plotly"))
                     .unwrap_or(JsValue::UNDEFINED);
-                if let Ok(func) = js_sys::Reflect::get(&plotly, &JsValue::from_str("newPlot"))
+                if let Ok(func) = js_sys::Reflect::get(&plotly, &JsValue::from_str("react"))
+                    .or_else(|_| js_sys::Reflect::get(&plotly, &JsValue::from_str("newPlot")))
                     .and_then(|v| v.dyn_into::<js_sys::Function>())
                 {
-                    let _ = func.call3(&JsValue::NULL, &div.into(), &traces.clone().into(), layout);
+                    let div_val = JsValue::from(div);
+                    let traces_val = JsValue::from(traces.clone());
+                    let _ = func.call3(&JsValue::NULL, &div_val, &traces_val, layout);
                 }
             }
         }
     }
+}
+
+#[cfg(feature = "chart_plotly")]
+fn build_scatter_trace(name: &str, mode: &str, x: &[f64], y: &[f64], line: Option<serde_json::Value>) -> JsValue {
+    let trace = js_sys::Object::new();
+    let name_js = JsValue::from_str(name);
+    let mode_js = JsValue::from_str(mode);
+    js_sys::Reflect::set(&trace, &JsValue::from_str("type"), &JsValue::from_str("scatter")).ok();
+    js_sys::Reflect::set(&trace, &JsValue::from_str("name"), &name_js).ok();
+    js_sys::Reflect::set(&trace, &JsValue::from_str("mode"), &mode_js).ok();
+    let x_arr = js_sys::Array::new();
+    for v in x {
+        x_arr.push(&JsValue::from_f64(*v));
+    }
+    let y_arr = js_sys::Array::new();
+    for v in y {
+        y_arr.push(&JsValue::from_f64(*v));
+    }
+    js_sys::Reflect::set(&trace, &JsValue::from_str("x"), &x_arr.into()).ok();
+    js_sys::Reflect::set(&trace, &JsValue::from_str("y"), &y_arr.into()).ok();
+    if let Some(line_spec) = line {
+        if let Ok(value) = to_js(&line_spec) {
+            js_sys::Reflect::set(&trace, &JsValue::from_str("line"), &value).ok();
+        }
+    }
+    trace.into()
+}
+
+#[cfg(feature = "chart_plotly")]
+fn build_line_trace(name: &str, x: &[f64], y: &[f64], dash: &str, color: &str) -> JsValue {
+    build_scatter_trace(
+        name,
+        "lines",
+        x,
+        y,
+        Some(serde_json::json!({ "dash": dash, "color": color })),
+    )
+}
+
+#[cfg(feature = "chart_plotly")]
+fn build_iso_line(xmin: f64, xmax: f64, rate: f64) -> JsValue {
+    let x = [xmin, xmax];
+    let y = [xmin / rate * 3600.0, xmax / rate * 3600.0];
+    let trace = build_scatter_trace(
+        "",
+        "lines",
+        &x,
+        &y,
+        Some(serde_json::json!({ "dash": "dot", "color": "#bbb", "width": 1 })),
+    );
+    let obj: js_sys::Object = trace.clone().into();
+    js_sys::Reflect::set(&obj, &JsValue::from_str("hoverinfo"), &JsValue::from_str("skip")).ok();
+    js_sys::Reflect::set(&obj, &JsValue::from_str("showlegend"), &JsValue::from_bool(false)).ok();
+    trace
 }
 
 #[cfg(feature = "chart_plotly")]
@@ -198,18 +255,16 @@ pub fn App() -> impl IntoView {
             };
             let x: Vec<f64> = curves.points.iter().map(|p| p.duration_s as f64).collect();
             let y: Vec<f64> = curves.points.iter().map(|p| p.max_climb_m).collect();
-            let trace = to_js(&serde_json::json!({
-                "type": "scatter", "mode": "lines", "name": "Climb (m)", "x": x, "y": y
-            })).unwrap();
+            web_sys::console::log_1(&JsValue::from_str(&format!("curve points: {}", x.len())));
+            set_status_cb.set(format!("Rendering curve ({} durations)…", x.len()));
+            let trace = build_scatter_trace("Climb (m)", "lines", &x, &y, None);
+            web_sys::console::log_1(&JsValue::from_str(&format!("curve points: {}", x.len())));
             let data = js_sys::Array::new(); data.push(&trace);
             if show_wr_now {
                 if let Some((dur, gains)) = curves.wr_curve.clone() {
                     let wx: Vec<f64> = dur.into_iter().map(|d| d as f64).collect();
                     let wy: Vec<f64> = gains;
-                    let wtrace = to_js(&serde_json::json!({
-                        "type":"scatter","mode":"lines","name":"WR","x": wx, "y": wy,
-                        "line": {"dash":"dash","color":"#888"}
-                    })).unwrap();
+                    let wtrace = build_line_trace("WR", &wx, &wy, "dash", "#888");
                     data.push(&wtrace);
                 }
             }
@@ -238,18 +293,15 @@ pub fn App() -> impl IntoView {
             set_diag_gain_cb.set(gt.total_gain_m);
             let gx: Vec<f64> = gt.curve.iter().map(|p| p.gain_m).collect();
             let gy: Vec<f64> = gt.curve.iter().map(|p| p.min_time_s).collect();
-            let gtrace = to_js(&serde_json::json!({
-                "type": "scatter", "mode": "lines+markers", "name": "Min Time (s)", "x": gx, "y": gy
-            })).unwrap();
+            web_sys::console::log_1(&JsValue::from_str(&format!("gain-time points: {}", gx.len())));
+            let gtrace = build_scatter_trace("Min Time (s)", "lines+markers", &gx, &gy, None);
+            web_sys::console::log_1(&JsValue::from_str(&format!("gain-time points: {}", gx.len())));
             let gdata = js_sys::Array::new(); gdata.push(&gtrace);
             if show_wr_now {
                 if let Some(wr_pts) = gt.wr_curve.clone() {
                     let wx: Vec<f64> = wr_pts.iter().map(|p| p.gain_m).collect();
                     let wy: Vec<f64> = wr_pts.iter().map(|p| p.min_time_s).collect();
-                    let wtrace = to_js(&serde_json::json!({
-                        "type":"scatter","mode":"lines","name":"WR","x": wx, "y": wy,
-                        "line": {"dash":"dash","color":"#888"}
-                    })).unwrap();
+                    let wtrace = build_line_trace("WR", &wx, &wy, "dash", "#888");
                     gdata.push(&wtrace);
                 }
             }
@@ -260,13 +312,7 @@ pub fn App() -> impl IntoView {
             };
             let rates = [800.0, 1000.0, 1200.0, 1500.0, 2000.0, 2500.0];
             for r in rates {
-                let xline = vec![xmin, xmax];
-                let yline = vec![xmin / r * 3600.0, xmax / r * 3600.0];
-                let line = to_js(&serde_json::json!({
-                    "type":"scatter","mode":"lines","x": xline, "y": yline,
-                    "line": {"dash":"dot","color":"#bbb","width":1},
-                    "hoverinfo":"skip","showlegend": false
-                })).unwrap();
+                let line = build_iso_line(xmin, xmax, r);
                 gdata.push(&line);
             }
             let glayout = to_js(&serde_json::json!({
