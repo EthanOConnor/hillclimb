@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: deploy-web-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
@@ -17,33 +21,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache cargo registry and binaries
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Cache cargo target directory
-        uses: actions/cache@v3
-        with:
-          path: hc_curve_rs/target
-          key: ${{ runner.os }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-target-
-
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspace: hc_curve_rs
+          target-dir: hc_curve_rs/target
+          shared-key: wasm
+
       - name: Ensure trunk is available
         run: |
-          command -v trunk >/dev/null 2>&1 || cargo install trunk
+          command -v trunk >/dev/null 2>&1 || cargo install trunk --locked
 
       - name: Build Web App (Trunk)
         working-directory: hc_curve_rs/hc_curve_web
