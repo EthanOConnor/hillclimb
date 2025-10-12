@@ -17,6 +17,7 @@ const WR_SAMPLE_SECONDS_MIN: f64 = 1e-3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WrModelKind {
+    #[allow(dead_code)]
     Sbpl1,
     Sbpl2,
 }
@@ -41,6 +42,7 @@ pub enum WrModel {
 }
 
 impl WrModel {
+    #[allow(dead_code)]
     pub fn kind(&self) -> WrModelKind {
         match self {
             WrModel::Sbpl1 { .. } => WrModelKind::Sbpl1,
@@ -90,6 +92,7 @@ impl WrModel {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct WrEnvelope {
     pub model: WrModel,
     pub durations: Vec<f64>,
@@ -271,7 +274,7 @@ impl WrProfileConfig {
             }
             other => {
                 // Unknown profile -> fall back to overall but keep anchor scale unchanged.
-                let mut cfg = Self::base_overall();
+                let cfg = Self::base_overall();
                 eprintln!("Unknown WR profile '{}'; falling back to overall", other);
                 cfg
             }
@@ -280,6 +283,7 @@ impl WrProfileConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct AnchorOverride {
     w_s: f64,
     #[serde(default)]
@@ -291,6 +295,7 @@ struct AnchorOverride {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct AnchorOverrideFile {
     #[serde(default)]
     anchors: Option<Vec<AnchorOverride>>,
