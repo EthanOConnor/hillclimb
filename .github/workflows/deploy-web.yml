@@ -11,18 +11,39 @@ permissions:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Cache cargo registry and binaries
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache cargo target directory
+        uses: actions/cache@v3
+        with:
+          path: hc_curve_rs/target
+          key: ${{ runner.os }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Install Trunk
+      - name: Ensure trunk is available
         run: |
-          cargo install trunk
+          command -v trunk >/dev/null 2>&1 || cargo install trunk
 
       - name: Build Web App (Trunk)
         working-directory: hc_curve_rs/hc_curve_web
@@ -38,4 +59,3 @@ jobs:
           publish_dir: hc_curve_rs/hc_curve_web/dist
           publish_branch: gh-pages
           force_orphan: true
-
