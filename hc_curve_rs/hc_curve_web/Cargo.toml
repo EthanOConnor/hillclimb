@@ -13,13 +13,16 @@ serde.workspace = true
 serde_json.workspace = true
 serde-wasm-bindgen = { version = "0.6", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3", optional = true, features = [
     "File",
     "FileList",
     "DataTransfer",
     "DragEvent",
+    "HtmlButtonElement",
     "HtmlElement",
     "HtmlInputElement",
+    "HtmlSelectElement",
     "Url",
     "Window",
     "Document",
@@ -33,7 +36,7 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [features]
 default = ["chart_plotly"]
-chart_plotly = ["plotly", "serde-wasm-bindgen", "wasm-bindgen", "web-sys", "console_error_panic_hook", "wasm-bindgen-futures"]
+chart_plotly = ["plotly", "serde-wasm-bindgen", "wasm-bindgen", "web-sys", "console_error_panic_hook", "wasm-bindgen-futures", "js-sys"]
 chart_plotters = ["plotters", "plotters-canvas", "web-sys", "console_error_panic_hook", "wasm-bindgen"]
 dev_mode = []
 parallel = []

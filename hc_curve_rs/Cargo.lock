@@ -1083,6 +1083,7 @@ dependencies = [
  "anyhow",
  "console_error_panic_hook",
  "hc_curve",
+ "js-sys",
  "leptos",
  "plotly",
  "plotters",

@@ -7,16 +7,13 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 #[cfg(feature = "chart_plotly")]
-use serde::{Deserialize, Serialize};
-
-#[cfg(feature = "chart_plotly")]
 use serde_wasm_bindgen::to_value as to_js;
 
 #[cfg(feature = "chart_plotly")]
 use web_sys::{Blob, FileList, HtmlInputElement};
 
 #[cfg(feature = "chart_plotly")]
-use hc_curve::{compute_curves, compute_gain_time, parse_records, Curves, GainTimeResult, Params};
+use hc_curve::{compute_curves, compute_gain_time, parse_records, Params};
 
 #[cfg(feature = "chart_plotly")]
 #[derive(Clone)]
@@ -364,8 +361,8 @@ pub fn App() -> impl IntoView {
                 </p>
             </section>
             <section class="downloads">
-                <a id="dl_curve" href=move || curve_href.get() download="curve.csv" style=move || if curve_href.get().is_empty() {"display:none;".into()} else {"display:inline;".into()}>"Download curve.csv"</a>
-                <a id="dl_gain" href=move || gain_href.get() download="gain_time.csv" style=move || if gain_href.get().is_empty() {"display:none;".into()} else {"display:inline;".into()}>"Download gain_time.csv"</a>
+                <a id="dl_curve" href=move || curve_href.get() download="curve.csv" style=move || if curve_href.get().is_empty() {"display:none;".to_string()} else {"display:inline;".to_string()}>"Download curve.csv"</a>
+                <a id="dl_gain" href=move || gain_href.get() download="gain_time.csv" style=move || if gain_href.get().is_empty() {"display:none;".to_string()} else {"display:inline;".to_string()}>"Download gain_time.csv"</a>
             </section>
         </main>
     }
@@ -376,5 +373,5 @@ pub fn App() -> impl IntoView {
 pub fn start() {
     #[cfg(feature = "chart_plotly")]
     console_error_panic_hook::set_once();
-    leptos::mount_to_body(|cx| view! { cx, <App/> });
+    leptos::mount_to_body(|| view! { <App/> });
 }
