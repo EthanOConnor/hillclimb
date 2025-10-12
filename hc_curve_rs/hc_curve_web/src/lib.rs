@@ -1,5 +1,7 @@
 use leptos::*;
 
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[cfg(feature = "chart_plotly")]
 use wasm_bindgen::{JsCast, JsValue};
 
@@ -251,7 +253,11 @@ pub fn App() -> impl IntoView {
             // Curves
             let curves = match compute_curves(records_by_file.clone(), &params) {
                 Ok(c) => c,
-                Err(_) => { set_status_cb.set("Curve computation failed.".to_string()); set_busy_cb.set(false); return; }
+                Err(err) => {
+                    set_status_cb.set(format!("Curve computation failed: {err}"));
+                    set_busy_cb.set(false);
+                    return;
+                }
             };
             let x: Vec<f64> = curves.points.iter().map(|p| p.duration_s as f64).collect();
             let y: Vec<f64> = curves.points.iter().map(|p| p.max_climb_m).collect();
@@ -286,7 +292,11 @@ pub fn App() -> impl IntoView {
             const DEFAULT_GAIN_TARGETS: &[f64] = &[50.0, 100.0, 150.0, 200.0, 300.0, 500.0, 750.0, 1000.0];
             let gt = match compute_gain_time(records_by_file.clone(), &params, DEFAULT_GAIN_TARGETS) {
                 Ok(r) => r,
-                Err(_) => { set_status_cb.set("Gain-time computation failed.".to_string()); set_busy_cb.set(false); return; }
+                Err(err) => {
+                    set_status_cb.set(format!("Gain-time computation failed: {err}"));
+                    set_busy_cb.set(false);
+                    return;
+                }
             };
             set_diag_source_cb.set(gt.selected_source.clone());
             set_diag_span_cb.set(gt.total_span_s);
@@ -358,6 +368,7 @@ pub fn App() -> impl IntoView {
             <header>
                 <h1>"Hillclimb Curves"</h1>
                 <p class="subtitle">"Upload FIT or GPX files to compute hillclimb curves in your browser."</p>
+                <p class="note">{"Web version "}{APP_VERSION}</p>
             </header>
             <section class="controls">
                 <label class="dropzone">
