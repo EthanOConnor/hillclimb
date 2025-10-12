@@ -370,6 +370,12 @@ fn parse_fit_records(input: &[u8], file_id: usize) -> Result<Vec<FitRecord>, HcE
                         inc = Some(val / 10.0);
                     }
                 }
+                "unknown_field_141" => {
+                    if let Some(val) = fit_value_to_f64(field.value()) {
+                        // Observed on NPE Runn developer data (inclineRunn) encoded as tenths of a percent.
+                        inc = Some(val / 10.0);
+                    }
+                }
                 "distance" | "enhanced_distance" => {
                     if let Some(val) = fit_value_to_f64(field.value()) {
                         dist = Some(val);
