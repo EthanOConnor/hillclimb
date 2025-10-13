@@ -2,6 +2,7 @@ use leptos::*;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_COMMIT: &str = env!("GIT_COMMIT_HASH");
+const MIN_DURATION_SECONDS: f64 = 30.0;
 
 #[cfg(feature = "chart_plotly")]
 use wasm_bindgen::{JsCast, JsValue};
@@ -262,20 +263,37 @@ fn collect_magic_points(curves: &Curves) -> Vec<MagicPoint> {
 }
 
 #[cfg(feature = "chart_plotly")]
-fn compute_rates_from_curve(durations: &[u64], gains: &[f64]) -> Vec<f64> {
-    durations
-        .iter()
-        .zip(gains.iter())
-        .map(|(&d, &g)| if d == 0 { 0.0 } else { g * 3600.0 / d as f64 })
-        .collect()
+fn filter_minutes_and_values(
+    durations: &[u64],
+    values: &[f64],
+    min_seconds: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for (&d, &v) in durations.iter().zip(values.iter()) {
+        if (d as f64) >= min_seconds {
+            xs.push(d as f64 / 60.0);
+            ys.push(v);
+        }
+    }
+    (xs, ys)
 }
 
 #[cfg(feature = "chart_plotly")]
-fn wr_rate_series(curves: &Curves) -> Option<Vec<f64>> {
-    if let Some(rates) = curves.wr_rates.as_ref() {
-        return Some(rates.clone());
+fn filter_minutes_and_rates(
+    durations: &[u64],
+    gains: &[f64],
+    min_seconds: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for (&d, &g) in durations.iter().zip(gains.iter()) {
+        if (d as f64) >= min_seconds && d > 0 {
+            xs.push(d as f64 / 60.0);
+            ys.push(g * 3600.0 / d as f64);
+        }
     }
-    curves.wr_curve.as_ref().map(|(durs, gains)| compute_rates_from_curve(durs, gains))
+    (xs, ys)
 }
 
 #[cfg(feature = "chart_plotly")]
@@ -289,21 +307,42 @@ fn render_curve_plot(
     ylog_rate: bool,
     ylog_climb: bool,
 ) {
-    if curves.points.is_empty() {
+    let filtered_points: Vec<&hc_curve::CurvePoint> = curves
+        .points
+        .iter()
+        .filter(|p| (p.duration_s as f64) >= MIN_DURATION_SECONDS)
+        .collect();
+
+    if filtered_points.is_empty() {
+        let empty = js_sys::Array::new();
+        let layout = to_js(&serde_json::json!({
+            "title": "No curve points ≥ 30 s",
+            "xaxis": { "title": "Duration (min)" },
+            "yaxis": { "title": "Climb (m)" }
+        }))
+        .unwrap();
+        plot_xy("curve_plot", &empty, &layout);
         return;
     }
 
-    let durations_min: Vec<f64> = curves
-        .points
+    let durations_min: Vec<f64> = filtered_points
         .iter()
         .map(|p| p.duration_s as f64 / 60.0)
         .collect();
-    let climbs: Vec<f64> = curves.points.iter().map(|p| p.max_climb_m).collect();
-    let rates: Vec<f64> = curves
-        .points
+    let climbs: Vec<f64> = filtered_points.iter().map(|p| p.max_climb_m).collect();
+    let rates: Vec<f64> = filtered_points
         .iter()
         .map(|p| p.climb_rate_m_per_hr)
         .collect();
+
+    let magic_points = if show_magic {
+        collect_magic_points(curves)
+            .into_iter()
+            .filter(|pt| pt.duration_s >= MIN_DURATION_SECONDS)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     let data = js_sys::Array::new();
 
@@ -324,10 +363,10 @@ fn render_curve_plot(
 
             if show_wr {
                 if let Some((durs, gains)) = curves.wr_curve.as_ref() {
-                    if !durs.is_empty() {
-                        let wr_minutes: Vec<f64> =
-                            durs.iter().map(|d| *d as f64 / 60.0).collect();
-                        let trace = build_line_trace("WR climb", &wr_minutes, gains, "dash", "#777");
+                    let (wr_minutes, wr_values) =
+                        filter_minutes_and_values(durs, gains, MIN_DURATION_SECONDS);
+                    if !wr_minutes.is_empty() {
+                        let trace = build_line_trace("WR climb", &wr_minutes, &wr_values, "dash", "#777");
                         data.push(&trace);
                     }
                 }
@@ -335,18 +374,18 @@ fn render_curve_plot(
 
             if show_personal {
                 if let Some((durs, gains)) = curves.personal_curve.as_ref() {
-                    if !durs.is_empty() {
-                        let minutes: Vec<f64> =
-                            durs.iter().map(|d| *d as f64 / 60.0).collect();
-                        let trace = build_line_trace("Personal climb", &minutes, gains, "solid", "#1e90ff");
+                    let (minutes, values) =
+                        filter_minutes_and_values(durs, gains, MIN_DURATION_SECONDS);
+                    if !minutes.is_empty() {
+                        let trace = build_line_trace("Personal climb", &minutes, &values, "solid", "#1e90ff");
                         data.push(&trace);
                     }
                 }
                 if let Some((durs, gains)) = curves.goal_curve.as_ref() {
-                    if !durs.is_empty() {
-                        let minutes: Vec<f64> =
-                            durs.iter().map(|d| *d as f64 / 60.0).collect();
-                        let trace = build_line_trace("Goal climb", &minutes, gains, "solid", "#228b22");
+                    let (minutes, values) =
+                        filter_minutes_and_values(durs, gains, MIN_DURATION_SECONDS);
+                    if !minutes.is_empty() {
+                        let trace = build_line_trace("Goal climb", &minutes, &values, "solid", "#228b22");
                         data.push(&trace);
                     }
                 }
@@ -358,16 +397,19 @@ fn render_curve_plot(
                     if session.durations.is_empty() || session.climbs.is_empty() {
                         continue;
                     }
-                    let minutes: Vec<f64> = session
-                        .durations
-                        .iter()
-                        .map(|d| *d as f64 / 60.0)
-                        .collect();
+                    let (minutes, values) = filter_minutes_and_values(
+                        &session.durations,
+                        &session.climbs,
+                        MIN_DURATION_SECONDS,
+                    );
+                    if minutes.is_empty() {
+                        continue;
+                    }
                     let trace = build_scatter_trace(
                         &format!("Session {}", idx + 1),
                         "lines",
                         &minutes,
-                        &session.climbs,
+                        &values,
                         None,
                     );
                     let obj = js_sys::Object::from(trace.clone());
@@ -382,31 +424,28 @@ fn render_curve_plot(
                 }
             }
 
-            if show_magic {
-                let magic = collect_magic_points(curves);
-                if !magic.is_empty() {
-                    let trace = js_sys::Object::new();
-                    let xs = js_sys::Array::new();
-                    let ys = js_sys::Array::new();
-                    let texts = js_sys::Array::new();
-                    for pt in magic {
-                        xs.push(&JsValue::from_f64(pt.duration_s / 60.0));
-                        ys.push(&JsValue::from_f64(pt.user_gain_m));
-                        texts.push(&JsValue::from_str(&pt.label));
-                    }
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("type"), &JsValue::from_str("scatter")).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("mode"), &JsValue::from_str("markers+text")).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("name"), &JsValue::from_str("Magic durations")).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("x"), &JsValue::from(xs)).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("y"), &JsValue::from(ys)).ok();
-                    let marker = serde_json::json!({ "size": 8, "color": "#000000" });
-                    if let Ok(marker_js) = to_js(&marker) {
-                        js_sys::Reflect::set(&trace, &JsValue::from_str("marker"), &marker_js).ok();
-                    }
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("text"), &JsValue::from(texts)).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("textposition"), &JsValue::from_str("top center")).ok();
-                    data.push(&JsValue::from(trace));
+            if !magic_points.is_empty() {
+                let trace = js_sys::Object::new();
+                let xs = js_sys::Array::new();
+                let ys = js_sys::Array::new();
+                let texts = js_sys::Array::new();
+                for pt in &magic_points {
+                    xs.push(&JsValue::from_f64(pt.duration_s / 60.0));
+                    ys.push(&JsValue::from_f64(pt.user_gain_m));
+                    texts.push(&JsValue::from_str(&pt.label));
                 }
+                js_sys::Reflect::set(&trace, &JsValue::from_str("type"), &JsValue::from_str("scatter")).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("mode"), &JsValue::from_str("markers+text")).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("name"), &JsValue::from_str("Magic durations")).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("x"), &JsValue::from(xs)).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("y"), &JsValue::from(ys)).ok();
+                let marker = serde_json::json!({ "size": 8, "color": "#000000" });
+                if let Ok(marker_js) = to_js(&marker) {
+                    js_sys::Reflect::set(&trace, &JsValue::from_str("marker"), &marker_js).ok();
+                }
+                js_sys::Reflect::set(&trace, &JsValue::from_str("text"), &JsValue::from(texts)).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("textposition"), &JsValue::from_str("top center")).ok();
+                data.push(&JsValue::from(trace));
             }
 
             let layout = serde_json::json!({
@@ -435,16 +474,11 @@ fn render_curve_plot(
 
             if show_wr {
                 if let Some((durs, gains)) = curves.wr_curve.as_ref() {
-                    let wr_minutes: Vec<f64> =
-                        durs.iter().map(|d| *d as f64 / 60.0).collect();
-                    if let Some(wr_rates) = wr_rate_series(curves) {
+                    let (wr_minutes, wr_rates) =
+                        filter_minutes_and_rates(durs, gains, MIN_DURATION_SECONDS);
+                    if !wr_minutes.is_empty() {
                         let trace =
                             build_line_trace("WR rate", &wr_minutes, &wr_rates, "dash", "#777");
-                        data.push(&trace);
-                    } else {
-                        let computed = compute_rates_from_curve(durs, gains);
-                        let trace =
-                            build_line_trace("WR rate", &wr_minutes, &computed, "dash", "#777");
                         data.push(&trace);
                     }
                 }
@@ -452,49 +486,48 @@ fn render_curve_plot(
 
             if show_personal {
                 if let Some((durs, gains)) = curves.personal_curve.as_ref() {
-                    let minutes: Vec<f64> =
-                        durs.iter().map(|d| *d as f64 / 60.0).collect();
-                    let rates = compute_rates_from_curve(durs, gains);
-                    let trace =
-                        build_line_trace("Personal rate", &minutes, &rates, "solid", "#1e90ff");
-                    data.push(&trace);
+                    let (minutes, values) =
+                        filter_minutes_and_rates(durs, gains, MIN_DURATION_SECONDS);
+                    if !minutes.is_empty() {
+                        let trace =
+                            build_line_trace("Personal rate", &minutes, &values, "solid", "#1e90ff");
+                        data.push(&trace);
+                    }
                 }
                 if let Some((durs, gains)) = curves.goal_curve.as_ref() {
-                    let minutes: Vec<f64> =
-                        durs.iter().map(|d| *d as f64 / 60.0).collect();
-                    let rates = compute_rates_from_curve(durs, gains);
-                    let trace =
-                        build_line_trace("Goal rate", &minutes, &rates, "solid", "#228b22");
-                    data.push(&trace);
+                    let (minutes, values) =
+                        filter_minutes_and_rates(durs, gains, MIN_DURATION_SECONDS);
+                    if !minutes.is_empty() {
+                        let trace =
+                            build_line_trace("Goal rate", &minutes, &values, "solid", "#228b22");
+                        data.push(&trace);
+                    }
                 }
             }
 
-            if show_magic {
-                let magic = collect_magic_points(curves);
-                if !magic.is_empty() {
-                    let trace = js_sys::Object::new();
-                    let xs = js_sys::Array::new();
-                    let ys = js_sys::Array::new();
-                    let texts = js_sys::Array::new();
-                    for pt in magic {
-                        xs.push(&JsValue::from_f64(pt.duration_s / 60.0));
-                        ys.push(&JsValue::from_f64(pt.rate_m_per_hr));
-                        texts.push(&JsValue::from_str(&pt.label));
-                    }
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("type"), &JsValue::from_str("scatter")).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("mode"), &JsValue::from_str("markers+text")).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("name"), &JsValue::from_str("Magic rate")).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("x"), &JsValue::from(xs)).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("y"), &JsValue::from(ys)).ok();
-                    if let Ok(marker_js) =
-                        to_js(&serde_json::json!({ "size": 8, "color": "#000000" }))
-                    {
-                        js_sys::Reflect::set(&trace, &JsValue::from_str("marker"), &marker_js).ok();
-                    }
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("text"), &JsValue::from(texts)).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("textposition"), &JsValue::from_str("top center")).ok();
-                    data.push(&JsValue::from(trace));
+            if !magic_points.is_empty() {
+                let trace = js_sys::Object::new();
+                let xs = js_sys::Array::new();
+                let ys = js_sys::Array::new();
+                let texts = js_sys::Array::new();
+                for pt in &magic_points {
+                    xs.push(&JsValue::from_f64(pt.duration_s / 60.0));
+                    ys.push(&JsValue::from_f64(pt.rate_m_per_hr));
+                    texts.push(&JsValue::from_str(&pt.label));
                 }
+                js_sys::Reflect::set(&trace, &JsValue::from_str("type"), &JsValue::from_str("scatter")).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("mode"), &JsValue::from_str("markers+text")).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("name"), &JsValue::from_str("Magic rate")).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("x"), &JsValue::from(xs)).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("y"), &JsValue::from(ys)).ok();
+                if let Ok(marker_js) =
+                    to_js(&serde_json::json!({ "size": 8, "color": "#000000" }))
+                {
+                    js_sys::Reflect::set(&trace, &JsValue::from_str("marker"), &marker_js).ok();
+                }
+                js_sys::Reflect::set(&trace, &JsValue::from_str("text"), &JsValue::from(texts)).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("textposition"), &JsValue::from_str("top center")).ok();
+                data.push(&JsValue::from(trace));
             }
 
             let layout = serde_json::json!({
@@ -537,10 +570,10 @@ fn render_curve_plot(
 
             if show_wr {
                 if let Some((durs, gains)) = curves.wr_curve.as_ref() {
-                    if !durs.is_empty() {
-                        let wr_minutes: Vec<f64> =
-                            durs.iter().map(|d| *d as f64 / 60.0).collect();
-                        let trace = build_line_trace("WR climb", &wr_minutes, gains, "dash", "#777");
+                    let (wr_minutes, wr_values) =
+                        filter_minutes_and_values(durs, gains, MIN_DURATION_SECONDS);
+                    if !wr_minutes.is_empty() {
+                        let trace = build_line_trace("WR climb", &wr_minutes, &wr_values, "dash", "#777");
                         data.push(&trace);
                     }
                 }
@@ -548,18 +581,22 @@ fn render_curve_plot(
 
             if show_personal {
                 if let Some((durs, gains)) = curves.personal_curve.as_ref() {
-                    let minutes: Vec<f64> =
-                        durs.iter().map(|d| *d as f64 / 60.0).collect();
-                    let trace =
-                        build_line_trace("Personal climb", &minutes, gains, "solid", "#1e90ff");
-                    data.push(&trace);
+                    let (minutes, values) =
+                        filter_minutes_and_values(durs, gains, MIN_DURATION_SECONDS);
+                    if !minutes.is_empty() {
+                        let trace =
+                            build_line_trace("Personal climb", &minutes, &values, "solid", "#1e90ff");
+                        data.push(&trace);
+                    }
                 }
                 if let Some((durs, gains)) = curves.goal_curve.as_ref() {
-                    let minutes: Vec<f64> =
-                        durs.iter().map(|d| *d as f64 / 60.0).collect();
-                    let trace =
-                        build_line_trace("Goal climb", &minutes, gains, "solid", "#228b22");
-                    data.push(&trace);
+                    let (minutes, values) =
+                        filter_minutes_and_values(durs, gains, MIN_DURATION_SECONDS);
+                    if !minutes.is_empty() {
+                        let trace =
+                            build_line_trace("Goal climb", &minutes, &values, "solid", "#228b22");
+                        data.push(&trace);
+                    }
                 }
             }
 
@@ -569,16 +606,19 @@ fn render_curve_plot(
                     if session.durations.is_empty() || session.climbs.is_empty() {
                         continue;
                     }
-                    let minutes: Vec<f64> = session
-                        .durations
-                        .iter()
-                        .map(|d| *d as f64 / 60.0)
-                        .collect();
+                    let (minutes, values) = filter_minutes_and_values(
+                        &session.durations,
+                        &session.climbs,
+                        MIN_DURATION_SECONDS,
+                    );
+                    if minutes.is_empty() {
+                        continue;
+                    }
                     let trace = build_scatter_trace(
                         &format!("Session {}", idx + 1),
                         "lines",
                         &minutes,
-                        &session.climbs,
+                        &values,
                         None,
                     );
                     let obj = js_sys::Object::from(trace.clone());
@@ -593,32 +633,28 @@ fn render_curve_plot(
                 }
             }
 
-            if show_magic {
-                let magic = collect_magic_points(curves);
-                if !magic.is_empty() {
-                    let trace = js_sys::Object::new();
-                    let xs = js_sys::Array::new();
-                    let ys = js_sys::Array::new();
-                    let texts = js_sys::Array::new();
-                    for pt in magic {
-                        xs.push(&JsValue::from_f64(pt.duration_s / 60.0));
-                        ys.push(&JsValue::from_f64(pt.user_gain_m));
-                        texts.push(&JsValue::from_str(&pt.label));
-                    }
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("type"), &JsValue::from_str("scatter")).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("mode"), &JsValue::from_str("markers+text")).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("name"), &JsValue::from_str("Magic durations")).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("x"), &JsValue::from(xs)).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("y"), &JsValue::from(ys)).ok();
-                    if let Ok(marker_js) =
-                        to_js(&serde_json::json!({ "size": 8, "color": "#000000" }))
-                    {
-                        js_sys::Reflect::set(&trace, &JsValue::from_str("marker"), &marker_js).ok();
-                    }
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("text"), &JsValue::from(texts)).ok();
-                    js_sys::Reflect::set(&trace, &JsValue::from_str("textposition"), &JsValue::from_str("top center")).ok();
-                    data.push(&JsValue::from(trace));
+            if !magic_points.is_empty() {
+                let trace = js_sys::Object::new();
+                let xs = js_sys::Array::new();
+                let ys = js_sys::Array::new();
+                let texts = js_sys::Array::new();
+                for pt in &magic_points {
+                    xs.push(&JsValue::from_f64(pt.duration_s / 60.0));
+                    ys.push(&JsValue::from_f64(pt.user_gain_m));
+                    texts.push(&JsValue::from_str(&pt.label));
                 }
+                js_sys::Reflect::set(&trace, &JsValue::from_str("type"), &JsValue::from_str("scatter")).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("mode"), &JsValue::from_str("markers+text")).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("name"), &JsValue::from_str("Magic durations")).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("x"), &JsValue::from(xs)).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("y"), &JsValue::from(ys)).ok();
+                let marker = serde_json::json!({ "size": 8, "color": "#000000" });
+                if let Ok(marker_js) = to_js(&marker) {
+                    js_sys::Reflect::set(&trace, &JsValue::from_str("marker"), &marker_js).ok();
+                }
+                js_sys::Reflect::set(&trace, &JsValue::from_str("text"), &JsValue::from(texts)).ok();
+                js_sys::Reflect::set(&trace, &JsValue::from_str("textposition"), &JsValue::from_str("top center")).ok();
+                data.push(&JsValue::from(trace));
             }
 
             let layout = serde_json::json!({
