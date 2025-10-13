@@ -1,6 +1,7 @@
 use leptos::*;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const APP_COMMIT: &str = env!("GIT_COMMIT_HASH");
 
 #[cfg(feature = "chart_plotly")]
 use wasm_bindgen::{JsCast, JsValue};
@@ -1049,7 +1050,7 @@ pub fn App() -> impl IntoView {
             <header>
                 <h1>"Hillclimb Curves"</h1>
                 <p class="subtitle">"Upload FIT or GPX files to compute hillclimb curves in your browser."</p>
-                <p class="note">{"Web version "}{APP_VERSION}</p>
+                <p class="note">{"Web version "}{APP_VERSION}{" ("}{APP_COMMIT}{")"}</p>
             </header>
             <section class="controls">
                 <label class="dropzone">
