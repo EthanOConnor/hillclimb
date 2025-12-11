@@ -708,7 +708,7 @@ def _parse_single_fit_records(fit_path: str, file_id: int) -> List[Dict[str, Any
     cached = _load_fit_cache(fit_path)
     if cached is not None:
         return [dict(rec, file_id=file_id) for rec in cached]
-    _require_dependency(FitFile, "fitparse", "pip install fitparse")
+    _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
     fit = FitFile(fit_path)
     fit.parse()
     out: List[Dict[str, Any]] = []
@@ -6484,7 +6484,7 @@ def _build_typer_app():  # pragma: no cover
         concave_envelope: bool = typer.Option(True, "--concave-envelope/--no-concave-envelope", help="Apply concave envelope smoothing before inversion"),
         ylog_time: bool = typer.Option(False, "--ylog-time/--no-ylog-time", help="Use log scale for time axis"),
     ) -> None:
-        _require_dependency(FitFile, "fitparse", "pip install fitparse")
+        _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
         units_norm = gain_units.lower()
         if units_norm not in ("m", "ft"):
             raise typer.BadParameter("gain-units must be 'm' or 'ft'")
@@ -6570,7 +6570,7 @@ def _build_typer_app():  # pragma: no cover
         log_file: Optional[str] = typer.Option(None, "--log-file", help="Optional log file path"),
         profile: bool = typer.Option(False, "--profile/--no-profile", help="Log stage timings for performance profiling"),
     ) -> None:
-        _require_dependency(FitFile, "fitparse", "pip install fitparse")
+        _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
         code = _export_series_command(
             fit_files,
             output,
@@ -6598,7 +6598,7 @@ def _build_typer_app():  # pragma: no cover
     ) -> None:
         """Summarize record field keys and candidate total-gain fields for debugging."""
         _setup_logging(verbose)
-        _require_dependency(FitFile, "fitparse", "pip install fitparse")
+        _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
         report_lines: List[str] = []
         for path in fit_files:
             try:

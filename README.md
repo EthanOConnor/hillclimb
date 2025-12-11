@@ -11,7 +11,7 @@ Data sources
 Usage
 -----
 
-Requirements: `fitparse`, `typer`, `matplotlib` (see `requirements.txt`).
+Requirements: `python-fitparse` (imported as `fitparse`), `typer`, `matplotlib` (see `requirements.txt`).
 Optional acceleration: `numba` (auto-detected when available).
 
 Recommended environment setup:

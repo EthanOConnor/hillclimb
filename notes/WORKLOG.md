@@ -32,3 +32,6 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 ## 2025‑12‑11 – Inter‑session notes system
 - Added `notes/` directory with MEMORY/WORKLOG/BACKLOG/CHAT/SCRUTINY to mirror the `streamvis` coordination pattern.
 - Updated `AGENTS.md` to require maintaining these notes and marked legacy `AGENT_NOTES.md`/`WORKLOG.md` as pointers.
+
+## 2025‑12‑11 – Fix FIT parser dependency naming
+- Updated `requirements.txt` to depend on `python-fitparse` (the maintained FIT parser) and adjusted install hints/docs accordingly.

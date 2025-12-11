@@ -5,8 +5,8 @@ Critical review and risk tracking. Record concerns about correctness, performanc
 ## 2025‑12‑11 – Repo audit risks
 
 ### Dependency / reproducibility
-- **High:** `requirements.txt` lists `fitparse` (PyPI 1.2.0, unmaintained) but the project intends `python-fitparse` (2.0.4). Risk: users install wrong parser and CLI fails or mis‑parses.
-  - Mitigation: rename dep, pin lower/upper bounds, add a runtime version check in `_require_dependency`.
+- **High:** `requirements.txt` listed `fitparse` (PyPI 1.2.0, unmaintained) but the project intends `python-fitparse`. Risk: users install wrong parser and CLI fails or mis‑parses.
+  - Status: dependency renamed to `python-fitparse`; version bounds/runtime check still pending.
 - **Medium:** No version pins for Python deps; numpy 2.x and Typer 0.20 may introduce subtle API/behavior changes.
   - Mitigation: pin or bound, add `requirements-dev.txt`, CI smoke run.
 
@@ -21,4 +21,3 @@ Critical review and risk tracking. Record concerns about correctness, performanc
 ### Caching correctness
 - **Low:** FIT cache keys on mtime/size only; parsing‑logic changes won’t invalidate cached records.
   - Mitigation: embed schema/hash in cache payload; add `--clear-cache` CLI.
-

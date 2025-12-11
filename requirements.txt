@@ -1,4 +1,4 @@
-fitparse
+python-fitparse
 typer
 matplotlib
 numpy
