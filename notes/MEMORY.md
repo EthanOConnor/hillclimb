@@ -35,3 +35,10 @@ Priority is chosen per merged timeline based on available fields:
 - Default: split plots for Python CLI (`_rate.png`, `_climb.png`), combined plot optional.
 - Dual‑axis combined view: climb rate (m/h) and max climb (m) vs duration (log x‑axis). Annotated points for quick reading.
 
+## 2025‑12‑11 – Python module layout
+
+- `hc_curve.py` is now the core library (FIT parsing, curve math, gain‑time, WR envelope). It still exposes a `main_cli()` shim so `python hc_curve.py …` works as before.
+- `hc_plotting.py` owns all Matplotlib rendering and plot‑specific constants.
+- `hc_cli.py` owns the Typer CLI app and orchestration (`curve`, `time`, `export-series`, `diagnose`).
+
+Rationale: reduce monolith size while keeping CLI parity and import stability.

@@ -11,8 +11,8 @@ Critical review and risk tracking. Record concerns about correctness, performanc
   - Status: version ranges added to `requirements.txt`; consider CI smoke run later.
 
 ### Maintainability
-- **High:** `hc_curve.py` is ~6700 lines; hard for juniors to navigate and for seniors to safely extend.
-  - Mitigation: modularize into concern‑scoped files; keep public API stable.
+- **High:** `hc_curve.py` was ~6700 lines; hard for juniors to navigate and for seniors to safely extend.
+  - Status: plotting and CLI moved into `hc_plotting.py` / `hc_cli.py`; `hc_curve.py` trimmed to core library with stable CLI shim.
 
 ### Rust/web drift
 - **Medium:** Rust uses older `fitparser` (0.7 vs 0.9) and `leptos` (0.6 vs 0.8). Upgrades may bring bug fixes but have breaking changes.

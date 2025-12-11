@@ -39,3 +39,7 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 ## 2025‑12‑11 – Pin Python dependency ranges
 - Added explicit version bounds for Python runtime deps and documented optional `numba`/`scipy` extras.
 - Added a runtime warning if an old `fitparse` (<2.x) package is detected.
+
+## 2025‑12‑11 – Modularize Python implementation
+- Split Matplotlib plotting into `hc_plotting.py` and Typer CLI orchestration into `hc_cli.py`.
+- Trimmed `hc_curve.py` to core parsing/math/WR logic and left a thin CLI shim (`python hc_curve.py ...` unchanged).
