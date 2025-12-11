@@ -1,5 +1,7 @@
-Design Notes
-============
+Design Notes (legacy)
+=====================
+
+This file is kept for backwards compatibility. Canonical long‑lived decisions now live in `notes/MEMORY.md`.
 
 Source Selection (Auto)
 -----------------------

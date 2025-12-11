@@ -1,5 +1,7 @@
-Worklog
-=======
+Worklog (legacy)
+================
+
+This file is kept for backwards compatibility. Canonical work history now lives in `notes/WORKLOG.md`.
 
 Initial Implementation
 ----------------------

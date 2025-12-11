@@ -25,6 +25,28 @@
 - When altering data sourcing logic, compare the resulting `curve.csv` and plot to a known-good baseline and note deltas in your PR.
 - Capture edge cases such as mixed `runn_total_gain` and altitude fallback by crafting short notebooks or scripts under `outputs/` and referencing them in reviews.
 
+## Notes system (`notes/`)
+
+`notes/` is for inter‑session, inter‑agent memory and coordination. Files:
+
+- `notes/MEMORY.md`
+  - Long‑lived architectural memory and “why” behind choices.
+- `notes/WORKLOG.md`
+  - Chronological log of meaningful work.
+- `notes/BACKLOG.md`
+  - Detailed technical backlog/roadmap.
+- `notes/CHAT.md`
+  - Scratchpad for ideas that may become work.
+- `notes/SCRUTINY.md`
+  - Risk tracking and critical review items.
+
+When editing code in this repo:
+
+- Update `notes/WORKLOG.md` for any substantive change.
+- Update `notes/MEMORY.md` when you make or rely on a design decision.
+- Prefer adding tasks to `notes/BACKLOG.md` instead of TODOs in code.
+- If you spot a risk or subtle behavior, add it to `notes/SCRUTINY.md`.
+
 ## Commit & Pull Request Guidelines
 - Follow the existing history: short, imperative commit subjects ("Implement ascent QC filtering"); include a focused body when context is non-obvious.
 - Each PR should summarize the behavior change, list the commands used for verification, and attach before/after artifacts when plots or CSV outputs change.
