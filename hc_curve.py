@@ -59,6 +59,7 @@ if "XDG_CACHE_HOME" not in os.environ:
 _PARSED_FIT_CACHE_DIR = os.path.join(_BASE_DIR, ".cache", "parsed_fit")
 
 _MATPLOTLIB_STYLE_READY = False
+_FITPARSE_VERSION_CHECKED = False
 
 
 
@@ -616,6 +617,37 @@ def _require_dependency(dep, name: str, install_hint: Optional[str] = None) -> N
         )
 
 
+def _check_fitparse_version() -> None:
+    global _FITPARSE_VERSION_CHECKED
+    if _FITPARSE_VERSION_CHECKED or FitFile is None:
+        return
+    _FITPARSE_VERSION_CHECKED = True
+    try:
+        from importlib import metadata as importlib_metadata  # py3.8+
+    except Exception:
+        return
+    candidates: List[Tuple[str, str]] = []
+    for pkg in ("python-fitparse", "fitparse"):
+        try:
+            ver = importlib_metadata.version(pkg)
+        except Exception:
+            continue
+        candidates.append((pkg, ver))
+    for pkg, ver in candidates:
+        try:
+            major = int(ver.split(".")[0])
+        except Exception:
+            continue
+        if major < 2:
+            logging.warning(
+                "Detected %s %s; hillclimb expects python-fitparse>=2.0. "
+                "If parsing fails, run: pip install python-fitparse",
+                pkg,
+                ver,
+            )
+            break
+
+
 def _pick_total_gain_key(sample_values: dict) -> Optional[str]:
     # Heuristic: prefer a developer field that looks like cumulative total gain
     candidates: List[str] = []
@@ -709,6 +741,7 @@ def _parse_single_fit_records(fit_path: str, file_id: int) -> List[Dict[str, Any
     if cached is not None:
         return [dict(rec, file_id=file_id) for rec in cached]
     _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
+    _check_fitparse_version()
     fit = FitFile(fit_path)
     fit.parse()
     out: List[Dict[str, Any]] = []
@@ -6485,6 +6518,7 @@ def _build_typer_app():  # pragma: no cover
         ylog_time: bool = typer.Option(False, "--ylog-time/--no-ylog-time", help="Use log scale for time axis"),
     ) -> None:
         _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
+        _check_fitparse_version()
         units_norm = gain_units.lower()
         if units_norm not in ("m", "ft"):
             raise typer.BadParameter("gain-units must be 'm' or 'ft'")
@@ -6571,6 +6605,7 @@ def _build_typer_app():  # pragma: no cover
         profile: bool = typer.Option(False, "--profile/--no-profile", help="Log stage timings for performance profiling"),
     ) -> None:
         _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
+        _check_fitparse_version()
         code = _export_series_command(
             fit_files,
             output,
@@ -6599,6 +6634,7 @@ def _build_typer_app():  # pragma: no cover
         """Summarize record field keys and candidate total-gain fields for debugging."""
         _setup_logging(verbose)
         _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
+        _check_fitparse_version()
         report_lines: List[str] = []
         for path in fit_files:
             try:

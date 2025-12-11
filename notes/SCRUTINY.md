@@ -6,9 +6,9 @@ Critical review and risk tracking. Record concerns about correctness, performanc
 
 ### Dependency / reproducibility
 - **High:** `requirements.txt` listed `fitparse` (PyPI 1.2.0, unmaintained) but the project intends `python-fitparse`. Risk: users install wrong parser and CLI fails or mis‑parses.
-  - Status: dependency renamed to `python-fitparse`; version bounds/runtime check still pending.
+  - Status: dependency renamed to `python-fitparse`, version bounds added, and a runtime warning now flags old `fitparse` installs.
 - **Medium:** No version pins for Python deps; numpy 2.x and Typer 0.20 may introduce subtle API/behavior changes.
-  - Mitigation: pin or bound, add `requirements-dev.txt`, CI smoke run.
+  - Status: version ranges added to `requirements.txt`; consider CI smoke run later.
 
 ### Maintainability
 - **High:** `hc_curve.py` is ~6700 lines; hard for juniors to navigate and for seniors to safely extend.

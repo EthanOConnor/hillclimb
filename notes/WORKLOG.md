@@ -35,3 +35,7 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 
 ## 2025‑12‑11 – Fix FIT parser dependency naming
 - Updated `requirements.txt` to depend on `python-fitparse` (the maintained FIT parser) and adjusted install hints/docs accordingly.
+
+## 2025‑12‑11 – Pin Python dependency ranges
+- Added explicit version bounds for Python runtime deps and documented optional `numba`/`scipy` extras.
+- Added a runtime warning if an old `fitparse` (<2.x) package is detected.

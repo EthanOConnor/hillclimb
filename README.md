@@ -11,8 +11,12 @@ Data sources
 Usage
 -----
 
-Requirements: `python-fitparse` (imported as `fitparse`), `typer`, `matplotlib` (see `requirements.txt`).
-Optional acceleration: `numba` (auto-detected when available).
+Requirements: `python-fitparse` (imported as `fitparse`), `typer`, `matplotlib`, `numpy` (see `requirements.txt` for supported ranges).
+
+Optional extras:
+- `numba` for ~5× faster exhaustive/all‑windows kernels (auto‑detected).
+- `scipy` for improved WR parameter fitting (falls back to grid search if absent).
+Install with: `pip install numba scipy`.
 
 Recommended environment setup:
 
