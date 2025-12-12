@@ -21,7 +21,8 @@
 - Maintain feature parity between the Python and Rust CLI implementations; ship new features in both unless explicitly agreed otherwise.
 
 ## Testing Guidelines
-- There is no automated test suite yet; validate changes by replaying the sample commands above against multiple FIT inputs.
+- A lightweight `unittest` suite lives under `tests/`; run with `.venv/bin/python -m unittest discover -s tests -v`.
+- Validate major changes by replaying the sample commands above against multiple FIT inputs.
 - When altering data sourcing logic, compare the resulting `curve.csv` and plot to a known-good baseline and note deltas in your PR.
 - Capture edge cases such as mixed `runn_total_gain` and altitude fallback by crafting short notebooks or scripts under `outputs/` and referencing them in reviews.
 

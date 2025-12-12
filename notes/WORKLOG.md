@@ -51,3 +51,7 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 ## 2025‑12‑12 – Improve FIT cache invalidation
 - Added a cache schema version to both Python pickle caches and Rust JSON caches; old caches now safely invalidate.
 - Added `--clear-cache` to Python and Rust CLIs to delete `.cache/parsed_fit` before parsing inputs.
+
+## 2025‑12‑12 – Add Python unit tests
+- Added a minimal `unittest` suite under `tests/` covering core curve math and FIT-record merge heuristics.
+- Run with: `.venv/bin/python -m unittest discover -s tests -v`.
