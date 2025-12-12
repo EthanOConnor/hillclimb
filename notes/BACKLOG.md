@@ -10,7 +10,7 @@ Detailed technical backlog / roadmap. Prefer adding items here over TODOs in cod
 ## P1
 - [x] Add JSON export with metadata (inputs, selected source, sampling/QC stats, engine) alongside CSV.
 - [ ] Add unit tests for parser and curve math using small synthetic FIT‑like fixtures.
-- [ ] Improve cache invalidation: include schema/version in FIT cache entries and expose `--clear-cache`.
+- [x] Improve cache invalidation: include schema/version in FIT cache entries and expose `--clear-cache`.
 
 ## P2
 - Optional smoothing/interpolation for nicer curves on sparse data (configurable, off by default).

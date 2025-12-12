@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple, Dict, Any, Set, NamedTuple, Union, Literal, Sequence
 import json
 import pickle
+import shutil
 
 import numpy as np
 try:
@@ -57,6 +58,7 @@ if "XDG_CACHE_HOME" not in os.environ:
         pass
 
 _PARSED_FIT_CACHE_DIR = os.path.join(_BASE_DIR, ".cache", "parsed_fit")
+_FIT_CACHE_SCHEMA_VERSION = 1
 
 _FITPARSE_VERSION_CHECKED = False
 
@@ -710,6 +712,8 @@ def _load_fit_cache(fit_path: str) -> Optional[List[Dict[str, Any]]]:
     meta = data.get("meta") if isinstance(data, dict) else None
     if not isinstance(meta, dict):
         return None
+    if meta.get("schema_version") != _FIT_CACHE_SCHEMA_VERSION:
+        return None
     if meta.get("mtime_ns") != st.st_mtime_ns or meta.get("size") != st.st_size:
         return None
     records = data.get("records")
@@ -723,7 +727,11 @@ def _save_fit_cache(fit_path: str, records: List[Dict[str, Any]]) -> None:
     if cache_path is None or st is None or prefix is None:
         return
     payload = {
-        "meta": {"mtime_ns": st.st_mtime_ns, "size": st.st_size},
+        "meta": {
+            "schema_version": _FIT_CACHE_SCHEMA_VERSION,
+            "mtime_ns": st.st_mtime_ns,
+            "size": st.st_size,
+        },
         "records": records,
     }
     tmp_path = cache_path + ".tmp"
@@ -751,6 +759,16 @@ def _save_fit_cache(fit_path: str, records: List[Dict[str, Any]]) -> None:
                 pass
     except Exception:
         pass
+
+
+def _clear_parsed_fit_cache() -> None:
+    """Delete the parsed FIT cache directory (best effort)."""
+    try:
+        shutil.rmtree(_PARSED_FIT_CACHE_DIR)
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        logging.warning("Failed to clear FIT cache: %s", exc)
 
 
 def _parse_single_fit_records(fit_path: str, file_id: int) -> List[Dict[str, Any]]:

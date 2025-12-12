@@ -47,3 +47,7 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 ## 2025‑12‑11 – Add JSON sidecar exports
 - Added `--json/--no-json` to Python and Rust CLIs to emit a `.json` report next to CSV outputs for `curve`, `time`/`gain-time`, and `export-series`.
 - JSON includes metadata (inputs, selected source, sampling/QC stats, engine) plus the computed curves/series.
+
+## 2025‑12‑12 – Improve FIT cache invalidation
+- Added a cache schema version to both Python pickle caches and Rust JSON caches; old caches now safely invalidate.
+- Added `--clear-cache` to Python and Rust CLIs to delete `.cache/parsed_fit` before parsing inputs.

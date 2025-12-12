@@ -24,6 +24,7 @@ use plotters_backend::{
     DrawingErrorKind,
 };
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value as JsonValue;
 use std::cmp::Ordering;
@@ -36,6 +37,13 @@ const GAIN_TIME_ISO_RATES: &[f64] = &[800.0, 1_000.0, 1_200.0, 1_500.0, 2_000.0,
 const DEFAULT_MAGIC_GAIN_TOKENS: &[&str] = &[
     "50m", "100m", "150m", "200m", "300m", "500m", "750m", "1000m",
 ];
+const FIT_CACHE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CachePayload {
+    schema_version: u32,
+    records: Vec<hc_curve::FitRecord>,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Hillclimb curve computation CLI", long_about = None)]
@@ -77,6 +85,10 @@ struct CurveArgs {
     /// Write JSON report next to CSV
     #[arg(long, action = ArgAction::SetTrue)]
     json: bool,
+
+    /// Clear parsed FIT cache before running
+    #[arg(long, action = ArgAction::SetTrue)]
+    clear_cache: bool,
 
     /// Disable plot generation
     #[arg(long, action = ArgAction::SetTrue)]
@@ -256,6 +268,10 @@ struct GainTimeArgs {
     #[arg(long, action = ArgAction::SetTrue)]
     json: bool,
 
+    /// Clear parsed FIT cache before running
+    #[arg(long, action = ArgAction::SetTrue)]
+    clear_cache: bool,
+
     /// Disable plot generation
     #[arg(long, action = ArgAction::SetTrue)]
     no_plot: bool,
@@ -402,6 +418,10 @@ struct ExportSeriesArgs {
     /// Write JSON report next to CSV
     #[arg(long, action = ArgAction::SetTrue)]
     json: bool,
+
+    /// Clear parsed FIT cache before running
+    #[arg(long, action = ArgAction::SetTrue)]
+    clear_cache: bool,
 
     /// Data source preference
     #[arg(long, value_enum, default_value_t = SourceOpt::Auto)]
@@ -604,6 +624,9 @@ fn handle_curve(args: CurveArgs) -> Result<()> {
 
     // Prepare cache dir
     let cache_dir = PathBuf::from(".cache").join("parsed_fit");
+    if args.clear_cache {
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
     let _ = fs::create_dir_all(&cache_dir);
 
     // Parse inputs (possibly in parallel) with caching
@@ -859,6 +882,9 @@ fn handle_gain_time(args: GainTimeArgs) -> Result<()> {
     }
 
     let cache_dir = PathBuf::from(".cache").join("parsed_fit");
+    if args.clear_cache {
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
     let _ = fs::create_dir_all(&cache_dir);
 
     let t_parse = Instant::now();
@@ -1067,6 +1093,9 @@ fn handle_export_series(args: ExportSeriesArgs) -> Result<()> {
     }
 
     let cache_dir = PathBuf::from(".cache").join("parsed_fit");
+    if args.clear_cache {
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
     let _ = fs::create_dir_all(&cache_dir);
 
     let inputs: Vec<(usize, PathBuf)> = args.inputs.iter().cloned().enumerate().collect();
@@ -1181,12 +1210,20 @@ fn cache_key(path: &Path) -> Result<String> {
 fn read_cache(dir: &Path, key: &str) -> Option<Vec<hc_curve::FitRecord>> {
     let path = dir.join(format!("{}.json", key));
     let text = fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&text).ok()
+    let payload: CachePayload = serde_json::from_str(&text).ok()?;
+    if payload.schema_version != FIT_CACHE_SCHEMA_VERSION {
+        return None;
+    }
+    Some(payload.records)
 }
 
 fn write_cache(dir: &Path, key: &str, records: &[hc_curve::FitRecord]) -> Result<()> {
     let path = dir.join(format!("{}.json", key));
-    let text = serde_json::to_string(records)?;
+    let payload = CachePayload {
+        schema_version: FIT_CACHE_SCHEMA_VERSION,
+        records: records.to_vec(),
+    };
+    let text = serde_json::to_string(&payload)?;
     fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
@@ -1685,6 +1722,35 @@ fn write_gain_time_records<W: io::Write>(
                 .unwrap_or_default(),
             result.selected_source.clone(),
             point.note.clone().unwrap_or_default(),
+        ])?;
+    }
+    Ok(())
+}
+
+fn write_timeseries_stdout(series: &TimeseriesExport) -> Result<()> {
+    let mut writer = csv::Writer::from_writer(io::stdout());
+    write_timeseries_records(&mut writer, series)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_timeseries_csv(series: &TimeseriesExport, path: &Path) -> Result<()> {
+    let mut writer = csv::Writer::from_path(path)?;
+    write_timeseries_records(&mut writer, series)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_timeseries_records<W: io::Write>(
+    writer: &mut csv::Writer<W>,
+    series: &TimeseriesExport,
+) -> Result<()> {
+    writer.write_record(["time_s", "cumulative_gain_m", "source"])?;
+    for (t, g) in series.times.iter().zip(series.gain.iter()) {
+        writer.write_record([
+            format!("{:.6}", t),
+            format!("{:.6}", g),
+            series.selected_source.clone(),
         ])?;
     }
     Ok(())

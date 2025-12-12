@@ -7,6 +7,7 @@ from hc_curve import *  # type: ignore
 from hc_curve import (
     _StageProfiler,
     _check_fitparse_version,
+    _clear_parsed_fit_cache,
     _compute_wr_envelope_and_personal,
     _diagnose_curve_monotonicity,
     _enforce_curve_shape,
@@ -88,8 +89,12 @@ def _run(
     profile: bool = False,
     fast_plot: bool = True,
     json_sidecar: bool = False,
+    clear_cache: bool = False,
 ) -> int:
     _setup_logging(verbose, log_file=log_file)
+
+    if clear_cache:
+        _clear_parsed_fit_cache()
 
     selected = "mixed"
     curve: List[CurvePoint] = []
@@ -500,8 +505,12 @@ def _run_gain_time(
     concave_envelope: bool = True,
     ylog_time: bool = False,
     json_sidecar: bool = False,
+    clear_cache: bool = False,
 ) -> int:
     _setup_logging(verbose, log_file=log_file)
+
+    if clear_cache:
+        _clear_parsed_fit_cache()
 
     profiler = _StageProfiler(profile)
     engine_mode = _resolve_engine(engine)
@@ -929,6 +938,7 @@ def _build_typer_app():  # pragma: no cover
         profile: bool = typer.Option(False, "--profile/--no-profile", help="Log stage timings for performance profiling"),
         fast_plot: bool = typer.Option(True, "--fast-plot/--no-fast-plot", help="Skip heavy plot annotations for faster rendering"),
         json_sidecar: bool = typer.Option(False, "--json/--no-json", help="Write JSON report next to the CSV"),
+        clear_cache: bool = typer.Option(False, "--clear-cache", help="Clear parsed FIT cache before running"),
     ) -> None:
         """Compute the critical hill climb rate curve and save to CSV."""
         code = _run(
@@ -971,6 +981,7 @@ def _build_typer_app():  # pragma: no cover
             profile=profile,
             fast_plot=fast_plot,
             json_sidecar=json_sidecar,
+            clear_cache=clear_cache,
         )
         if code != 0:
             raise typer.Exit(code)
@@ -1027,6 +1038,7 @@ def _build_typer_app():  # pragma: no cover
         concave_envelope: bool = typer.Option(True, "--concave-envelope/--no-concave-envelope", help="Apply concave envelope smoothing before inversion"),
         ylog_time: bool = typer.Option(False, "--ylog-time/--no-ylog-time", help="Use log scale for time axis"),
         json_sidecar: bool = typer.Option(False, "--json/--no-json", help="Write JSON report next to the CSV"),
+        clear_cache: bool = typer.Option(False, "--clear-cache", help="Clear parsed FIT cache before running"),
     ) -> None:
         _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
         _check_fitparse_version()
@@ -1086,6 +1098,7 @@ def _build_typer_app():  # pragma: no cover
             concave_envelope=concave_envelope,
             ylog_time=ylog_time,
             json_sidecar=json_sidecar,
+            clear_cache=clear_cache,
         )
         if code != 0:
             raise typer.Exit(code)
@@ -1116,9 +1129,12 @@ def _build_typer_app():  # pragma: no cover
         log_file: Optional[str] = typer.Option(None, "--log-file", help="Optional log file path"),
         profile: bool = typer.Option(False, "--profile/--no-profile", help="Log stage timings for performance profiling"),
         json_sidecar: bool = typer.Option(False, "--json/--no-json", help="Write JSON report next to the CSV"),
+        clear_cache: bool = typer.Option(False, "--clear-cache", help="Clear parsed FIT cache before running"),
     ) -> None:
         _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
         _check_fitparse_version()
+        if clear_cache:
+            _clear_parsed_fit_cache()
         code = _export_series_command(
             fit_files,
             output,

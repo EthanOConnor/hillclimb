@@ -20,4 +20,4 @@ Critical review and risk tracking. Record concerns about correctness, performanc
 
 ### Caching correctness
 - **Low:** FIT cache keys on mtime/size only; parsing‑logic changes won’t invalidate cached records.
-  - Mitigation: embed schema/hash in cache payload; add `--clear-cache` CLI.
+  - Status: cache payloads now include a schema version and both CLIs expose `--clear-cache`.

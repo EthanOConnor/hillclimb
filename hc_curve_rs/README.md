@@ -42,6 +42,7 @@ Key flags:
 - `--raw-sampling` to skip 1 Hz resampling
 - `--no-qc` to disable QC censoring; `--qc-spec path.json` to override limits
 - `--json` to write a JSON sidecar next to the CSV with metadata and computed curves
+- `--clear-cache` to delete `.cache/parsed_fit` before parsing inputs
 - `--score-output outputs/scores.csv` to write the scoring table
 - `--profile` to log timings for parse/compute/CSV/plot stages
 - `--gains-from path.txt` to merge gain targets from a file (one per line, accepts `m|ft` suffix)
