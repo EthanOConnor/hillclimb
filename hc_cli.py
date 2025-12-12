@@ -28,6 +28,9 @@ from hc_curve import (
     _split_sessions_from_gaps,
     _token_is_likely_gain,
 )
+import json
+import os
+
 from hc_plotting import (
     ISO_RATE_GUIDES,
     _plot_curve,
@@ -84,6 +87,7 @@ def _run(
     engine: str = "auto",
     profile: bool = False,
     fast_plot: bool = True,
+    json_sidecar: bool = False,
 ) -> int:
     _setup_logging(verbose, log_file=log_file)
 
@@ -333,6 +337,73 @@ def _run(
     logging.info("Wrote: %s", output)
     profiler.lap("csv")
 
+    if json_sidecar:
+        json_path = output[:-4] + ".json" if output.lower().endswith(".csv") else output + ".json"
+        try:
+            meta = {
+                "command": "curve",
+                "inputs": list(fit_files),
+                "output_csv": output,
+                "selected_source": selected,
+                "selected_raw": selected_raw,
+                "used_sources": sorted(series.used_sources),
+                "n_samples": len(times),
+                "full_span_s": full_span_seconds,
+                "total_gain_m": total_ascent,
+                "engine": engine_mode,
+                "params": {
+                    "durations_s": duration_grid,
+                    "exhaustive": exhaustive,
+                    "all_windows": all_windows,
+                    "step_s": step_s,
+                    "max_duration_s": max_duration_s,
+                    "resample_1hz": resample_1hz,
+                    "parse_workers": parse_workers,
+                    "gain_eps": gain_eps,
+                    "session_gap_sec": session_gap_sec,
+                    "qc_enabled": qc_enabled,
+                    "qc_spec_path": qc_spec_path,
+                    "merge_eps_sec": merge_eps_sec,
+                    "overlap_policy": overlap_policy,
+                    "concave_envelope": concave_envelope,
+                    "wr_profile": wr_profile,
+                    "wr_min_seconds": wr_min_seconds,
+                    "wr_short_cap": wr_short_cap,
+                    "plot_wr": plot_wr,
+                    "plot_personal": plot_personal,
+                    "split_plots": split_plots,
+                    "ylog_rate": ylog_rate,
+                    "ylog_climb": ylog_climb,
+                    "goal_min_seconds": goal_min_seconds,
+                    "personal_min_seconds": personal_min_seconds,
+                    "fast_plot": fast_plot,
+                },
+            }
+            data = {
+                "points": [
+                    {
+                        "duration_s": cp.duration_s,
+                        "max_climb_m": cp.max_climb_m,
+                        "climb_rate_m_per_hr": cp.climb_rate_m_per_hr,
+                        "start_offset_s": cp.start_offset_s,
+                        "end_offset_s": cp.end_offset_s,
+                    }
+                    for cp in curve
+                ],
+                "wr_curve": wr_curve,
+                "wr_rates": wr_rates_env,
+                "personal_curve": personal_curve,
+                "goal_curve": goal_curve,
+                "magic_rows": magic_rows,
+                "envelope_curve": envelope_curve,
+                "session_curves": session_curves,
+            }
+            with open(json_path, "w", encoding="utf-8") as jf:
+                json.dump({"meta": meta, "curves": data}, jf, indent=2)
+            logging.info("Wrote JSON: %s", json_path)
+        except Exception as exc:
+            logging.warning("Failed to write JSON sidecar: %s", exc)
+
     if not no_plot:
         png_path = png
         if png_path is None:
@@ -428,6 +499,7 @@ def _run_gain_time(
     engine: str = "auto",
     concave_envelope: bool = True,
     ylog_time: bool = False,
+    json_sidecar: bool = False,
 ) -> int:
     _setup_logging(verbose, log_file=log_file)
 
@@ -698,6 +770,60 @@ def _run_gain_time(
     logging.info("Wrote: %s", output)
     profiler.lap("csv")
 
+    if json_sidecar:
+        json_path = output[:-4] + ".json" if output.lower().endswith(".csv") else output + ".json"
+        try:
+            meta = {
+                "command": "time",
+                "inputs": list(fit_files),
+                "output_csv": output,
+                "selected_source": selected_label,
+                "selected_raw": selected_raw,
+                "used_sources": sorted(series.used_sources),
+                "n_samples": len(times),
+                "full_span_s": full_span_seconds,
+                "total_gain_m": total_ascent,
+                "engine": engine_mode,
+                "params": {
+                    "all_windows": all_windows,
+                    "exhaustive": exhaustive,
+                    "step_s": step_s,
+                    "max_duration_s": max_duration_s,
+                    "resample_1hz": resample_1hz,
+                    "parse_workers": parse_workers,
+                    "gain_eps": gain_eps,
+                    "session_gap_sec": session_gap_sec,
+                    "qc_enabled": qc_enabled,
+                    "qc_spec_path": qc_spec_path,
+                    "merge_eps_sec": merge_eps_sec,
+                    "overlap_policy": overlap_policy,
+                    "wr_profile": wr_profile,
+                    "wr_min_seconds": wr_min_seconds,
+                    "wr_short_cap": wr_short_cap,
+                    "plot_wr": plot_wr,
+                    "plot_personal": plot_personal,
+                    "split_plots": split_plots,
+                    "fast_plot": fast_plot,
+                    "gain_units": gain_units,
+                    "magic_gains": magic_gains,
+                    "goals_topk": goals_topk,
+                    "iso_rates": list(iso_rates),
+                    "concave_envelope": concave_envelope,
+                    "ylog_time": ylog_time,
+                },
+            }
+            data = {
+                "gain_curve": [pt.__dict__ for pt in gain_curve.points],
+                "targets": [pt.__dict__ for pt in target_points],
+                "wr_curve": [pt.__dict__ for pt in wr_gain_curve.points] if wr_gain_curve else None,
+                "personal_curve": [pt.__dict__ for pt in personal_gain_curve.points] if personal_gain_curve else None,
+            }
+            with open(json_path, "w", encoding="utf-8") as jf:
+                json.dump({"meta": meta, "gain_time": data}, jf, indent=2)
+            logging.info("Wrote JSON: %s", json_path)
+        except Exception as exc:
+            logging.warning("Failed to write JSON sidecar: %s", exc)
+
     if not no_plot:
         png_path = png
         if png_path is None:
@@ -802,6 +928,7 @@ def _build_typer_app():  # pragma: no cover
         engine: str = typer.Option("auto", "--engine", help="Curve engine: auto|numpy|numba|stride"),
         profile: bool = typer.Option(False, "--profile/--no-profile", help="Log stage timings for performance profiling"),
         fast_plot: bool = typer.Option(True, "--fast-plot/--no-fast-plot", help="Skip heavy plot annotations for faster rendering"),
+        json_sidecar: bool = typer.Option(False, "--json/--no-json", help="Write JSON report next to the CSV"),
     ) -> None:
         """Compute the critical hill climb rate curve and save to CSV."""
         code = _run(
@@ -843,6 +970,7 @@ def _build_typer_app():  # pragma: no cover
             engine=engine,
             profile=profile,
             fast_plot=fast_plot,
+            json_sidecar=json_sidecar,
         )
         if code != 0:
             raise typer.Exit(code)
@@ -898,6 +1026,7 @@ def _build_typer_app():  # pragma: no cover
         engine: str = typer.Option("auto", "--engine", help="Curve engine: auto|numpy|numba|stride"),
         concave_envelope: bool = typer.Option(True, "--concave-envelope/--no-concave-envelope", help="Apply concave envelope smoothing before inversion"),
         ylog_time: bool = typer.Option(False, "--ylog-time/--no-ylog-time", help="Use log scale for time axis"),
+        json_sidecar: bool = typer.Option(False, "--json/--no-json", help="Write JSON report next to the CSV"),
     ) -> None:
         _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
         _check_fitparse_version()
@@ -956,6 +1085,7 @@ def _build_typer_app():  # pragma: no cover
             engine=engine,
             concave_envelope=concave_envelope,
             ylog_time=ylog_time,
+            json_sidecar=json_sidecar,
         )
         if code != 0:
             raise typer.Exit(code)
@@ -985,6 +1115,7 @@ def _build_typer_app():  # pragma: no cover
         overlap_policy: str = typer.Option("file:last", "--overlap-policy", help="Overlap precedence for total gain: file:first|file:last"),
         log_file: Optional[str] = typer.Option(None, "--log-file", help="Optional log file path"),
         profile: bool = typer.Option(False, "--profile/--no-profile", help="Log stage timings for performance profiling"),
+        json_sidecar: bool = typer.Option(False, "--json/--no-json", help="Write JSON report next to the CSV"),
     ) -> None:
         _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
         _check_fitparse_version()
@@ -1003,6 +1134,7 @@ def _build_typer_app():  # pragma: no cover
             overlap_policy,
             log_file,
             profile,
+            json_sidecar,
         )
         if code != 0:
             raise typer.Exit(code)

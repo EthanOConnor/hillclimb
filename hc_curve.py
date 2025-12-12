@@ -514,6 +514,7 @@ def _export_series_command(
     overlap_policy: str,
     log_file: Optional[str],
     profile: bool,
+    json_sidecar: bool = False,
 ) -> int:
     _setup_logging(verbose, log_file=log_file)
     profiler = _StageProfiler(profile)
@@ -546,6 +547,42 @@ def _export_series_command(
     except Exception as exc:
         logging.error(f"Failed to write export: {exc}")
         return 2
+
+    if json_sidecar:
+        json_path = output[:-4] + ".json" if output.lower().endswith(".csv") else output + ".json"
+        try:
+            meta = {
+                "command": "export-series",
+                "inputs": list(fit_files),
+                "output_csv": output,
+                "selected_source": series.selected_label,
+                "selected_raw": series.selected_raw,
+                "used_sources": sorted(series.used_sources),
+                "n_samples": len(series.times),
+                "full_span_s": series.full_span_seconds,
+                "total_gain_m": float(series.values[-1] - series.values[0]) if series.values else 0.0,
+                "params": {
+                    "source": source,
+                    "resample_1hz": resample_1hz,
+                    "parse_workers": parse_workers,
+                    "gain_eps": gain_eps,
+                    "session_gap_sec": session_gap_sec,
+                    "qc_enabled": qc_enabled,
+                    "qc_spec_path": qc_spec_path,
+                    "merge_eps_sec": merge_eps_sec,
+                    "overlap_policy": overlap_policy,
+                },
+            }
+            data = {
+                "times_s": series.times,
+                "cumulative_gain_m": series.values,
+                "source": series.selected_raw,
+            }
+            with open(json_path, "w", encoding="utf-8") as jf:
+                json.dump({"meta": meta, "series": data}, jf, indent=2)
+            logging.info("Wrote JSON: %s", json_path)
+        except Exception as exc:
+            logging.warning("Failed to write JSON sidecar: %s", exc)
 
     return 0
 

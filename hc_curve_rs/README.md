@@ -41,6 +41,7 @@ Key flags:
 - `--source auto|runn|altitude` to select data source preference
 - `--raw-sampling` to skip 1 Hz resampling
 - `--no-qc` to disable QC censoring; `--qc-spec path.json` to override limits
+- `--json` to write a JSON sidecar next to the CSV with metadata and computed curves
 - `--score-output outputs/scores.csv` to write the scoring table
 - `--profile` to log timings for parse/compute/CSV/plot stages
 - `--gains-from path.txt` to merge gain targets from a file (one per line, accepts `m|ft` suffix)

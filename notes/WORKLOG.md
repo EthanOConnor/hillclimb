@@ -43,3 +43,7 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 ## 2025‑12‑11 – Modularize Python implementation
 - Split Matplotlib plotting into `hc_plotting.py` and Typer CLI orchestration into `hc_cli.py`.
 - Trimmed `hc_curve.py` to core parsing/math/WR logic and left a thin CLI shim (`python hc_curve.py ...` unchanged).
+
+## 2025‑12‑11 – Add JSON sidecar exports
+- Added `--json/--no-json` to Python and Rust CLIs to emit a `.json` report next to CSV outputs for `curve`, `time`/`gain-time`, and `export-series`.
+- JSON includes metadata (inputs, selected source, sampling/QC stats, engine) plus the computed curves/series.

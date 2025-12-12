@@ -24,6 +24,7 @@ use plotters_backend::{
     DrawingErrorKind,
 };
 use rayon::prelude::*;
+use serde_json::json;
 use serde_json::Value as JsonValue;
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
@@ -72,6 +73,10 @@ struct CurveArgs {
     /// Output SVG figure path
     #[arg(long, value_hint = ValueHint::FilePath)]
     svg: Option<PathBuf>,
+
+    /// Write JSON report next to CSV
+    #[arg(long, action = ArgAction::SetTrue)]
+    json: bool,
 
     /// Disable plot generation
     #[arg(long, action = ArgAction::SetTrue)]
@@ -247,6 +252,10 @@ struct GainTimeArgs {
     #[arg(long, value_hint = ValueHint::FilePath)]
     png: Option<PathBuf>,
 
+    /// Write JSON report next to CSV
+    #[arg(long, action = ArgAction::SetTrue)]
+    json: bool,
+
     /// Disable plot generation
     #[arg(long, action = ArgAction::SetTrue)]
     no_plot: bool,
@@ -389,6 +398,10 @@ struct ExportSeriesArgs {
     /// Output CSV path (`-` for stdout)
     #[arg(short, long, default_value = "timeseries.csv", value_hint = ValueHint::FilePath)]
     output: PathBuf,
+
+    /// Write JSON report next to CSV
+    #[arg(long, action = ArgAction::SetTrue)]
+    json: bool,
 
     /// Data source preference
     #[arg(long, value_enum, default_value_t = SourceOpt::Auto)]
@@ -634,6 +647,12 @@ fn handle_curve(args: CurveArgs) -> Result<()> {
         );
     }
 
+    let records_for_json = if args.json {
+        Some(records.clone())
+    } else {
+        None
+    };
+
     let t_compute = Instant::now();
     let curves = compute_curves(records, &params)?;
     if args.profile || args.verbose {
@@ -696,6 +715,57 @@ fn handle_curve(args: CurveArgs) -> Result<()> {
             );
         }
         info!("Wrote curve CSV: {}", args.output.display());
+
+        if args.json {
+            let mut json_path = args.output.clone();
+            json_path.set_extension("json");
+
+            let (n_samples, total_span_s, total_gain_m) = if let Some(rec_sets) = records_for_json.clone() {
+                match compute_timeseries_export(rec_sets, &params) {
+                    Ok(ts) => {
+                        let n = ts.times.len();
+                        let span = ts.times.last().copied().unwrap_or(0.0);
+                        let gain = ts.gain.last().copied().unwrap_or(0.0) - ts.gain.first().copied().unwrap_or(0.0);
+                        (n, span, gain)
+                    }
+                    Err(err) => {
+                        warn!("Unable to build timeseries for JSON report: {}", err);
+                        (0, 0.0, 0.0)
+                    }
+                }
+            } else {
+                (0, 0.0, 0.0)
+            };
+
+            let meta = json!({
+                "command": "curve",
+                "inputs": args.inputs.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+                "output_csv": args.output.to_string_lossy(),
+                "selected_source": curves.selected_source,
+                "n_samples": n_samples,
+                "total_span_s": total_span_s,
+                "total_gain_m": total_gain_m,
+                "engine": format!("{:?}", params.engine).to_lowercase(),
+                "qc_enabled": params.qc_enabled,
+                "qc_spec": args.qc_spec.as_ref().map(|p| p.to_string_lossy()),
+                "resample_1hz": params.resample_1hz,
+                "durations_s": curves.points.iter().map(|p| p.duration_s).collect::<Vec<_>>(),
+                "exhaustive": params.exhaustive,
+                "all_windows": params.all_windows,
+                "step_s": params.step_s,
+                "max_duration_s": params.max_duration_s,
+            });
+
+            let payload = json!({
+                "meta": meta,
+                "curves": curves,
+            });
+
+            let text = serde_json::to_string_pretty(&payload)?;
+            fs::write(&json_path, text)
+                .with_context(|| format!("failed to write {}", json_path.display()))?;
+            info!("Wrote JSON: {}", json_path.display());
+        }
     }
 
     if !args.no_plot {
@@ -829,6 +899,12 @@ fn handle_gain_time(args: GainTimeArgs) -> Result<()> {
         );
     }
 
+    let records_for_json = if args.json {
+        Some(records.clone())
+    } else {
+        None
+    };
+
     let t_compute = Instant::now();
     let result = compute_gain_time(records, &params, &gain_targets)?;
     if args.profile || args.verbose {
@@ -859,6 +935,53 @@ fn handle_gain_time(args: GainTimeArgs) -> Result<()> {
             );
         }
         info!("Wrote gain-time CSV: {}", args.output.display());
+
+        if args.json {
+            let mut json_path = args.output.clone();
+            json_path.set_extension("json");
+
+            let n_samples = if let Some(rec_sets) = records_for_json {
+                match compute_timeseries_export(rec_sets, &params) {
+                    Ok(ts) => ts.times.len(),
+                    Err(err) => {
+                        warn!("Unable to build timeseries for JSON report: {}", err);
+                        0
+                    }
+                }
+            } else {
+                0
+            };
+
+            let meta = json!({
+                "command": "gain-time",
+                "inputs": args.inputs.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+                "output_csv": args.output.to_string_lossy(),
+                "selected_source": result.selected_source,
+                "n_samples": n_samples,
+                "total_span_s": result.total_span_s,
+                "total_gain_m": result.total_gain_m,
+                "engine": format!("{:?}", params.engine).to_lowercase(),
+                "qc_enabled": params.qc_enabled,
+                "qc_spec": args.qc_spec.as_ref().map(|p| p.to_string_lossy()),
+                "resample_1hz": params.resample_1hz,
+                "exhaustive": params.exhaustive,
+                "all_windows": params.all_windows,
+                "step_s": params.step_s,
+                "max_duration_s": params.max_duration_s,
+                "gain_units": format!("{:?}", gain_unit).to_lowercase(),
+                "magic_gains": magic_gain_targets.clone(),
+            });
+
+            let payload = json!({
+                "meta": meta,
+                "gain_time": result,
+            });
+
+            let text = serde_json::to_string_pretty(&payload)?;
+            fs::write(&json_path, text)
+                .with_context(|| format!("failed to write {}", json_path.display()))?;
+            info!("Wrote JSON: {}", json_path.display());
+        }
     }
 
     if !args.no_plot {
@@ -1001,6 +1124,38 @@ fn handle_export_series(args: ExportSeriesArgs) -> Result<()> {
     } else {
         write_timeseries_csv(&series, &args.output)?;
         info!("Wrote timeseries CSV: {}", args.output.display());
+
+        if args.json {
+            let mut json_path = args.output.clone();
+            json_path.set_extension("json");
+
+            let meta = json!({
+                "command": "export-series",
+                "inputs": args.inputs.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+                "output_csv": args.output.to_string_lossy(),
+                "selected_source": series.selected_source,
+                "n_samples": series.times.len(),
+                "total_span_s": series.times.last().copied().unwrap_or(0.0),
+                "total_gain_m": series.gain.last().copied().unwrap_or(0.0) - series.gain.first().copied().unwrap_or(0.0),
+                "qc_enabled": params.qc_enabled,
+                "qc_spec": args.qc_spec.as_ref().map(|p| p.to_string_lossy()),
+                "resample_1hz": params.resample_1hz,
+                "gain_eps": params.gain_eps_m,
+                "session_gap_sec": params.session_gap_sec,
+                "merge_eps_sec": params.merge_eps_sec,
+                "overlap_policy": params.overlap_policy,
+            });
+
+            let payload = json!({
+                "meta": meta,
+                "series": series,
+            });
+
+            let text = serde_json::to_string_pretty(&payload)?;
+            fs::write(&json_path, text)
+                .with_context(|| format!("failed to write {}", json_path.display()))?;
+            info!("Wrote JSON: {}", json_path.display());
+        }
     }
 
     Ok(())

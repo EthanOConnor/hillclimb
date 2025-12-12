@@ -54,6 +54,7 @@ Examples (recommended):
 
 Options:
 - `--output, -o`: Output CSV path (default: `curve.csv`).
+- `--json/--no-json`: Write a JSON sidecar next to the CSV (same basename, `.json`) containing metadata and the computed curves.
 - `--durations, -d`: Durations in seconds (default: 60, 120, 300, 600, 1200, 1800, 3600).
 - `--all`: Exact per-second curve across the whole activity (recommended).
 - `--exhaustive`: Evaluate a multi-resolution duration grid (dense 1s up to ~2h, geometric above; tweak short-range density with `--step`).
