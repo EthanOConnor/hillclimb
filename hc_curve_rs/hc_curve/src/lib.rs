@@ -1794,7 +1794,10 @@ fn build_per_source_cumulative(
     if alt_raw_t.len() >= 2 {
         let speed_med = estimate_session_speed(records, t0);
         let grade_med = estimate_session_grade(records);
-        let altitude_eff = effective_altitude_path(&alt_raw_t, &alt_raw_v, speed_med, grade_med);
+        let mut altitude_eff = effective_altitude_path(&alt_raw_t, &alt_raw_v, speed_med, grade_med);
+        if params.smooth_sec > 0.0 {
+            altitude_eff = rolling_median_time(&alt_raw_t, &altitude_eff, params.smooth_sec);
+        }
         let (altitude_adj, moving_mask, idle_mask) =
             apply_idle_detection(records, t0, &alt_raw_t, &altitude_eff);
         inactivity_gaps = compute_inactivity_gaps(&alt_raw_t, &idle_mask);
@@ -1932,7 +1935,10 @@ fn build_timeseries_from_altitude(
     let speed_med = estimate_session_speed(records, t0);
     let grade_med = estimate_session_grade(records);
 
-    let altitude_eff = effective_altitude_path(&times_raw, &altitude_raw, speed_med, grade_med);
+    let mut altitude_eff = effective_altitude_path(&times_raw, &altitude_raw, speed_med, grade_med);
+    if params.smooth_sec > 0.0 {
+        altitude_eff = rolling_median_time(&times_raw, &altitude_eff, params.smooth_sec);
+    }
 
     let (altitude_adj, moving_mask, idle_mask) =
         apply_idle_detection(records, t0, &times_raw, &altitude_eff);

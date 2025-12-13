@@ -62,6 +62,8 @@ Options:
 - `--step`: Step size in seconds for exhaustive durations (default 1s).
 - `--max-duration`: Limit maximum duration (seconds) when using `--exhaustive`.
 - `--source`: `auto` (default), `runn`, or `altitude`.
+- `--gain-eps`: Altitude hysteresis (meters) for ascent derived from altitude (default 0.5).
+- `--smooth`: Optional additional altitude smoothing window (seconds) applied after the effective altitude path (default 0; altitude-derived sources only).
 - `--verbose, -v`: Verbose logging.
 - Plotting defaults: split plots on for the Python CLI; WR overlay off; goal curve hidden below 120s. Use `--plot-wr` to show WR. The Rust CLI keeps a single combined PNG by default—use `--split-plots` there to opt in.
 - `--goal-min-seconds`: Hide goal curve/labels below this duration (default 120s).

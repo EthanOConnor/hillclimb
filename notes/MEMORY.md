@@ -42,3 +42,9 @@ Priority is chosen per merged timeline based on available fields:
 - `hc_cli.py` owns the Typer CLI app and orchestration (`curve`, `time`, `export-series`, `diagnose`).
 
 Rationale: reduce monolith size while keeping CLI parity and import stability.
+
+## 2025‑12‑13 – Altitude smoothing semantics
+
+- `--smooth` is an optional, off-by-default extra smoothing pass for altitude-derived ascent only.
+- Implementation: apply a rolling-median window (seconds) to the *effective altitude path* before idle detection and ascent integration. This lives alongside (not replacing) the existing spike repair, morphological closing, and local-polynomial smoothing.
+- `--gain-eps` remains the ascent hysteresis threshold (meters) used when converting altitude deltas into cumulative ascent.

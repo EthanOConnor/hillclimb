@@ -509,6 +509,7 @@ def _export_series_command(
     resample_1hz: bool,
     parse_workers: int,
     gain_eps: float,
+    smooth_sec: float,
     session_gap_sec: float,
     qc_enabled: bool,
     qc_spec_path: Optional[str],
@@ -525,6 +526,7 @@ def _export_series_command(
             fit_files,
             source=source,
             gain_eps=gain_eps,
+            smooth_sec=smooth_sec,
             session_gap_sec=session_gap_sec,
             qc_enabled=qc_enabled,
             qc_spec_path=qc_spec_path,
@@ -568,6 +570,7 @@ def _export_series_command(
                     "resample_1hz": resample_1hz,
                     "parse_workers": parse_workers,
                     "gain_eps": gain_eps,
+                    "smooth_sec": smooth_sec,
                     "session_gap_sec": session_gap_sec,
                     "qc_enabled": qc_enabled,
                     "qc_spec_path": qc_spec_path,
@@ -1042,6 +1045,7 @@ def _build_timeseries(
     merged: List[Dict[str, Any]],
     source: str = "auto",
     gain_eps: float = 0.5,
+    smooth_sec: float = 0.0,
 ) -> Tuple[List[float], List[float], str]:
     # Decide source
     any_tg = any(r.get("tg") is not None for r in merged)
@@ -1200,6 +1204,12 @@ def _build_timeseries(
         except Exception:
             pass
         alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med, diag)
+        if smooth_sec and smooth_sec > 0:
+            try:
+                alt_eff = _rolling_median_time(t_alt, alt_eff, float(smooth_sec))
+                diag["alt_smooth_sec"] = float(smooth_sec)
+            except Exception:
+                pass
         indoor_hint = _infer_indoor_mode(merged)
         alt_idle, moving_mask, _ = _apply_idle_detection(
             merged,
@@ -1209,11 +1219,10 @@ def _build_timeseries(
             t0,
             indoor_hint=indoor_hint,
         )
-        # Cumulative ascent (uprun epsilon, baro/GNSS defaults lower)
-        eps_gain = 0.02
+        # Cumulative ascent (uprun epsilon via gain_eps).
         cum_series = _cum_ascent_from_alt(
             alt_idle,
-            eps_gain,
+            gain_eps,
             mode="uprun",
             diag=diag,
             moving_mask=moving_mask,
@@ -2986,7 +2995,11 @@ def _enforce_curve_shape(
 # Canonical timeline and all-windows sweep
 # -----------------
 
-def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tuple[List[float], List[Optional[float]], List[Optional[float]], List[Optional[float]]]:
+def _build_per_source_cum(
+    session: List[Dict[str, Any]],
+    gain_eps: float,
+    smooth_sec: float = 0.0,
+) -> Tuple[List[float], List[Optional[float]], List[Optional[float]], List[Optional[float]]]:
     if not session:
         return [], [], [], []
     t0 = session[0]["t"]
@@ -3115,6 +3128,12 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
         except Exception:
             pass
         alt_eff = _effective_altitude_path(t_alt, z_alt, speed_med, grade_med, diag)
+        if smooth_sec and smooth_sec > 0:
+            try:
+                alt_eff = _rolling_median_time(t_alt, alt_eff, float(smooth_sec))
+                diag["alt_smooth_sec"] = float(smooth_sec)
+            except Exception:
+                pass
         indoor_hint = _infer_indoor_mode(session)
         alt_idle, moving_mask, _ = _apply_idle_detection(
             session,
@@ -3124,10 +3143,9 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
             t0,
             indoor_hint=indoor_hint,
         )
-        eps_gain = 0.02
         cum_series = _cum_ascent_from_alt(
             alt_idle,
-            eps_gain,
+            gain_eps,
             mode="uprun",
             diag=diag,
             moving_mask=moving_mask,
@@ -3170,10 +3188,11 @@ def _build_per_source_cum(session: List[Dict[str, Any]], gain_eps: float) -> Tup
 def _build_canonical_timeseries(
     session: List[Dict[str, Any]],
     gain_eps: float,
+    smooth_sec: float,
     dwell_sec: float = 5.0,
     gap_threshold: float = 600.0,
 ) -> Tuple[List[float], List[float], Set[str], List[Tuple[float, float]]]:
-    times, tg_cum, inc_cum, alt_cum = _build_per_source_cum(session, gain_eps)
+    times, tg_cum, inc_cum, alt_cum = _build_per_source_cum(session, gain_eps, smooth_sec=smooth_sec)
     if not times:
         return [], [], set(), []
     rank = {"tg": 3, "incline": 2, "alt_enh": 1, "alt": 0}
@@ -3310,6 +3329,7 @@ def _load_activity_series(
     fit_files: List[str],
     source: str,
     gain_eps: float,
+    smooth_sec: float,
     session_gap_sec: float,
     qc_enabled: bool,
     qc_spec_path: Optional[str],
@@ -3355,12 +3375,18 @@ def _load_activity_series(
         times, values, used_sources, inactivity_gaps = _build_canonical_timeseries(
             merged,
             gain_eps=gain_eps,
+            smooth_sec=smooth_sec,
             dwell_sec=5.0,
             gap_threshold=session_gap_sec,
         )
         overall_sources_raw = {SOURCE_NAME_MAP.get(u, u) for u in used_sources if u}
     else:
-        times, values, label = _build_timeseries(merged, source=source, gain_eps=gain_eps)
+        times, values, label = _build_timeseries(
+            merged,
+            source=source,
+            gain_eps=gain_eps,
+            smooth_sec=smooth_sec,
+        )
         inactivity_gaps = []
         overall_sources_raw = {label}
 

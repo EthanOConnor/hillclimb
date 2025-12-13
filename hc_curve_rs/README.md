@@ -39,6 +39,7 @@ Key flags:
 - `--plot-wr` to overlay the world‑record envelope
 - `--durations 60,300,600` or `--all --step 1` to control evaluation grid
 - `--source auto|runn|altitude` to select data source preference
+- `--gain-eps` (meters) and `--smooth` (seconds) to tune altitude-derived ascent (`--smooth` is an optional extra rolling median window, off by default)
 - `--raw-sampling` to skip 1 Hz resampling
 - `--no-qc` to disable QC censoring; `--qc-spec path.json` to override limits
 - `--json` to write a JSON sidecar next to the CSV with metadata and computed curves

@@ -13,6 +13,6 @@ Detailed technical backlog / roadmap. Prefer adding items here over TODOs in cod
 - [x] Improve cache invalidation: include schema/version in FIT cache entries and expose `--clear-cache`.
 
 ## P2
-- Optional smoothing/interpolation for nicer curves on sparse data (configurable, off by default).
+- [x] Optional smoothing/interpolation for nicer curves on sparse data (configurable, off by default).
 - Web UI polish: progress indicator, theme toggle, and better mobile plot layout; keep WASM bundle small.
 - Consider upgrading Rust crates (`fitparser` 0.9, `leptos` 0.8) after assessing breaking changes.

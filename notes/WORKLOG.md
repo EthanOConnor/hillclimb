@@ -55,3 +55,8 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 ## 2025‑12‑12 – Add Python unit tests
 - Added a minimal `unittest` suite under `tests/` covering core curve math and FIT-record merge heuristics.
 - Run with: `.venv/bin/python -m unittest discover -s tests -v`.
+
+## 2025‑12‑13 – Altitude smoothing (`--smooth`) and epsilon fix
+- Wired the existing Rust CLI `--smooth` flag through the core altitude pipeline and added a matching Python `--smooth` option (off by default).
+- `--smooth` applies an additional rolling-median window (seconds) after the effective altitude path to reduce staircase artifacts on sparse/noisy data.
+- Fixed Python altitude ascent integration to respect `--gain-eps` instead of a hardcoded epsilon.
