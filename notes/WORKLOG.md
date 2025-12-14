@@ -70,3 +70,8 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 - Upgraded Rust FIT parsing crate `fitparser` to 0.9.x and web UI framework `leptos` to 0.8.x; updated `Cargo.lock`.
 - Added a WASM-only `getrandom` override (`features = ["js"]`) required by the newer dependency graph.
 - Updated the web app to current Leptos idioms (`signal`, `Effect::new`, and new import paths) and validated builds for CLI + WASM target.
+
+## 2025‑12‑14 – Notes/docs currency sweep
+- Updated `AGENTS.md` to reflect the current Python module layout and dependency naming.
+- Refreshed `docs/web_mvp_spec.md` and `docs/handoff_prompt_next_agent.md` so they reflect the post‑MVP web app.
+- Captured remaining follow‑ups (CI smoke checks, Rust warnings, repo hygiene) in `notes/BACKLOG.md` and updated `notes/SCRUTINY.md`.

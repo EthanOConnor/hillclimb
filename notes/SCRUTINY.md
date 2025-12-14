@@ -15,8 +15,9 @@ Critical review and risk tracking. Record concerns about correctness, performanc
   - Status: plotting and CLI moved into `hc_plotting.py` / `hc_cli.py`; `hc_curve.py` trimmed to core library with stable CLI shim.
 
 ### Rust/web drift
-- **Medium:** Rust uses older `fitparser` (0.7 vs 0.9) and `leptos` (0.6 vs 0.8). Upgrades may bring bug fixes but have breaking changes.
-  - Mitigation: schedule a controlled upgrade branch with parity tests vs Python outputs.
+- **Medium:** Rust/web dependencies can drift and break WASM builds unexpectedly (especially around `getrandom` + WASM targets).
+  - Status: upgraded to `fitparser` 0.9.x and `leptos` 0.8.x; web now includes a WASM-only `getrandom` override (`features = ["js"]`) and builds under `wasm32-unknown-unknown`.
+  - Mitigation: add CI smoke checks (Rust CLI + WASM compile, plus Python unit tests) so future drift is caught early.
 
 ### Caching correctness
 - **Low:** FIT cache keys on mtime/size only; parsing‑logic changes won’t invalidate cached records.

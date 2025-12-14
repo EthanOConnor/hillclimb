@@ -16,3 +16,8 @@ Detailed technical backlog / roadmap. Prefer adding items here over TODOs in cod
 - [x] Optional smoothing/interpolation for nicer curves on sparse data (configurable, off by default).
 - [x] Web UI polish: progress indicator, theme toggle, and better mobile plot layout; keep WASM bundle small.
 - [x] Consider upgrading Rust crates (`fitparser` 0.9, `leptos` 0.8) after assessing breaking changes.
+
+## P3 (next work)
+- Add CI smoke checks (Python tests, Rust CLI `cargo check`, WASM `cargo check`).
+- Clean up Rust CLI warnings (unused `mut`, dead fields) so `cargo check` is quiet.
+- Repo hygiene: decide fate of untracked local files `AGENTS.md.old` and `docs/gain_time_spec.md` (delete, ignore, or commit if valuable).

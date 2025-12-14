@@ -1,4 +1,4 @@
-You are the coding agent picking up the Hillclimb Web MVP.
+You are the coding agent picking up the Hillclimb Web App (post‑MVP).
 
 Context
 -------
@@ -6,48 +6,37 @@ Context
 - Python CLI: `hc_curve.py:1` (reference design and plotting pipeline).
 - Rust core: `hc_curve_rs/hc_curve/src/lib.rs:1` (FIT/GPX parsing, QC, curve/gain-time, WR envelope).
 - Rust CLIs: `hc_curve_rs/hc_curve_cli/src/main.rs:1` (mirrors Python features via Plotters).
-- Web entry: `hc_curve_rs/hc_curve_web` (Leptos CSR + wasm). We’ve added an MVP scaffold: file upload, compute, minimal plots, CSV export, and a Pages workflow.
+- Web entry: `hc_curve_rs/hc_curve_web` (Leptos CSR + wasm). The app is functional and includes: drag‑and‑drop upload, compute controls, WR/personal/session overlays, iso‑rate guides, progress UI, a theme toggle, responsive Plotly charts, and CSV downloads.
 - Spec: docs/web_mvp_spec.md:1 (architecture, UX, build/deploy, defaults).
 
 Your Goals
 ----------
-1) Make the web MVP fully functional and polished while staying minimal.
-2) Ensure the Trunk build works locally and on GitHub Pages.
-3) Keep the changes surgical; don’t regress existing CLIs.
+1) Keep the web app working across dependency upgrades and browser quirks.
+2) Improve robustness/perf for large files without bloating the bundle.
+3) Add lightweight CI smoke checks so regressions are caught early.
 
 Where to Start
 --------------
 1. Read the spec: docs/web_mvp_spec.md:1.
 2. Open web app: hc_curve_rs/hc_curve_web/src/lib.rs:1 and hc_curve_rs/hc_curve_web/index.html:1.
-3. Confirm function imports from core (`parse_records`, `compute_curves`, `compute_gain_time`) compile in wasm.
+3. Confirm function imports from core (`parse_records`, `compute_curves`, `compute_gain_time`) compile in wasm and that Plotly is present on the page.
 
-Implementation Tasks
---------------------
-- File ingestion
-  - Verify `read_files_from_input` properly reads both FIT and GPX; handle unknown extensions with a clear status.
-  - Add drag-and-drop if time permits; otherwise keep input-click workflow.
+Implementation Tasks (next)
+---------------------------
+- CI smoke checks
+  - Add a minimal GitHub Actions workflow to run:
+    - Python unit tests (`.venv/bin/python -m unittest …` or `python -m unittest …` with `pip install -r requirements.txt`)
+    - `cargo check -p hc_curve_cli`
+    - `cargo check -p hc_curve_web --target wasm32-unknown-unknown`
+  - Keep it fast and dependency‑light; don’t add heavy test infra.
 
-- Compute
-  - Confirm Params defaults are acceptable for browser; optionally expose toggles for `source`, `exhaustive` vs `all_windows`, `step`, and `max_duration`.
-  - Handle compute failures (show error; keep UI responsive).
+- Large‑file resilience
+  - Improve progress fidelity (more granular phases, yield more often, or chunked parsing/compute).
+  - Consider optional Web Worker offload if the UI becomes unresponsive for multi‑hour files.
 
-- Plots
-  - Current plots: climb vs duration and min time vs gain. Ensure proper axes labels and units.
-  - Add iso-rate guide lines on gain-time if possible.
-  - Optionally add WR overlay using built-in profiles; skip anchors path support on web.
-
-- CSV downloads
-  - Validate CSV content aligns with CLI column semantics.
-  - Keep URLs fresh (revoke old object URLs if you iterate on memory hygiene).
-
-- UX polish
-  - Disable compute while running; show progress updates.
-  - Render selected source, total span, total gain (from GainTimeResult) in a small diagnostics area.
-  - Add a brief “Nothing leaves your device” note.
-
-- CI/CD (GitHub Pages)
-  - The workflow `.github/workflows/deploy-web.yml:1` builds with `--public-url /<repo>/` and publishes `hc_curve_rs/hc_curve_web/dist` to `gh-pages`.
-  - After merge to main, enable Pages (from branch `gh-pages`) in repo settings once.
+- UX clarity
+  - Make error states actionable (e.g., “FIT unsupported by browser; try GPX”).
+  - Consider exposing `gain_eps`/`smooth` and QC toggles if user reports noisy altitude plots.
 
 Local Dev Instructions (first-time friendly)
 -------------------------------------------
@@ -74,12 +63,10 @@ Pages Deploy Instructions
 Notes
 -----
 - Keep dependencies unchanged unless essential; the web crate already includes optional `wasm` dependencies via feature `chart_plotly`.
-- If FIT parsing fails in wasm on some browser, gate FIT behind a status message and accept GPX for MVP; do not block the release — document any limitation.
+- If FIT parsing fails in wasm on some browser, degrade gracefully (status message, accept GPX), and document any limitation.
 - Follow AGENTS.md coding style and repo guidelines when touching files.
 
 Deliverables
 ------------
-- Working web app with plots and CSV downloads.
-- Verified local trunk build and a passing Pages deployment.
-- Brief README section addition describing the web app and linking to the live site.
-
+- CI smoke workflow that guards CLI + WASM compilation.
+- Any perf/UX improvement shipped with updated `docs/WEB_APP_USAGE.md`.

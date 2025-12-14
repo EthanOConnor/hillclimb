@@ -9,7 +9,7 @@ Architecture
 ------------
 - Frontend: Leptos CSR app in `hc_curve_rs/hc_curve_web` compiled to WebAssembly.
 - Core compute: Rust crate `hc_curve` (FIT/GPX parsing, QC, curve/gain‑time) compiled to wasm with `default-features = false` and `features = ["wasm"]` via the web crate.
-- Charts: Plotly via CDN. Rust renders by calling global `Plotly.newPlot` through `web-sys` interop.
+- Charts: Plotly via CDN. Rust renders by calling global `Plotly.react/newPlot` through `web-sys` interop (responsive config enabled).
 - Hosting: GitHub Pages (gh-pages branch) built by Trunk.
 
 User Flow
@@ -21,9 +21,10 @@ User Flow
 
 MVP UI
 ------
-- Header with title and a one‑liner about local processing.
-- Controls: file input (multiple), compute button, status line.
-- Plots: two div containers (curve and gain‑time) rendered via Plotly.
+- Header with title, a one‑liner about local processing, and a light/dark theme toggle.
+- Controls: file input (multiple) plus drag‑and‑drop, compute button, and a small set of source/plot toggles.
+- Progress: status line includes a spinner + progress bar during compute.
+- Plots: two responsive Plotly containers (curve and gain‑time).
 - Downloads: two links for `curve.csv` and `gain_time.csv` (revealed after compute).
 
 Files Added/Modified
@@ -56,7 +57,6 @@ Notes & Defaults
 
 Future Enhancements
 -------------------
-- UI controls for WR overlays, personal/goal curves, and split plots.
-- Idle detection display and session segmentation summaries.
-- Larger file support with progress feedback.
-
+- Inline diagnostics for QC removals and gap/session segmentation summaries.
+- Optional custom WR anchors JSON upload (keep bundle small).
+- Better large‑file handling (streaming parse, chunked compute, optional Web Worker offload).

@@ -1,10 +1,13 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `hc_curve.py` contains the CLI, data parsing utilities, and plotting pipeline; keep helpers grouped by concern (FIT parsing, curve math, plotting) for readability.
+- `hc_cli.py` contains the Typer CLI and orchestration for the Python implementation.
+- `hc_curve.py` contains core parsing/curve math/WR logic and a small CLI shim (`python hc_curve.py …` remains supported).
+- `hc_plotting.py` contains the Matplotlib plotting pipeline for the Python CLI.
+- Keep helpers grouped by concern (FIT parsing, curve math, plotting) for readability.
 - `Tracklogs/` stores example FIT data for local diagnostics; treat as read-only fixtures when writing tests or repro scripts.
 - `outputs/` is the recommended scratch space for generated CSV/PNG artifacts; clean it before committing.
-- `requirements.txt` pins the minimum runtime packages (`fitparse`, `typer`, `matplotlib`, `numpy`); update the README if you add dependencies.
+- `requirements.txt` pins the minimum runtime packages (`python-fitparse`, `typer`, `matplotlib`, `numpy`); update the README if you add dependencies.
 - The script creates `.mplconfig/` and `.cache/` automatically for Matplotlib; no manual setup is required.
 
 ## Build, Test, and Development Commands
