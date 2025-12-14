@@ -65,3 +65,8 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 - Added a light/dark theme toggle with persistent preference (`localStorage`) and applied theme colors to Plotly layouts.
 - Added a compute progress indicator (spinner + progress bar) and inserted small async yields so the UI updates before long WASM compute steps.
 - Improved responsiveness: Plotly `responsive` config, safer plot sizing, and a two-column layout on wide screens.
+
+## 2025‑12‑13 – Rust crate upgrades (fitparser/leptos)
+- Upgraded Rust FIT parsing crate `fitparser` to 0.9.x and web UI framework `leptos` to 0.8.x; updated `Cargo.lock`.
+- Added a WASM-only `getrandom` override (`features = ["js"]`) required by the newer dependency graph.
+- Updated the web app to current Leptos idioms (`signal`, `Effect::new`, and new import paths) and validated builds for CLI + WASM target.

@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 console_error_panic_hook = { version = "0.1", optional = true }
 hc_curve = { path = "../hc_curve", features = ["wasm"], default-features = false }
-leptos = { version = "0.6", default-features = false, features = ["csr"] }
+leptos = { version = "0.8", default-features = false, features = ["csr"] }
 serde.workspace = true
 serde_json.workspace = true
 serde-wasm-bindgen = { version = "0.6", optional = true }
@@ -46,3 +46,6 @@ chart_plotly = ["plotly", "serde-wasm-bindgen", "wasm-bindgen", "web-sys", "cons
 chart_plotters = ["plotters", "plotters-canvas", "web-sys", "console_error_panic_hook", "wasm-bindgen"]
 dev_mode = []
 parallel = []
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

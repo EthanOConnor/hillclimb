@@ -1,4 +1,6 @@
-use leptos::*;
+use leptos::prelude::*;
+use leptos::mount::mount_to_body;
+use leptos::task::spawn_local;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_COMMIT: &str = env!("GIT_COMMIT_HASH");
@@ -970,38 +972,38 @@ fn render_gain_plot(
 
 #[component]
 pub fn App() -> impl IntoView {
-    let (theme, set_theme) = create_signal(load_theme_preference());
-    create_effect({
+    let (theme, set_theme) = signal(load_theme_preference());
+    Effect::new({
         let theme = theme.clone();
         move |_| {
             apply_theme_preference(&theme.get());
         }
     });
 
-    let (files, set_files) = create_signal(Vec::<FileBytes>::new());
-    let (busy, set_busy) = create_signal(false);
-    let (progress, set_progress) = create_signal(0.0_f64);
-    let (status, set_status) = create_signal(String::from("No files selected."));
-    let (curve_href, set_curve_href) = create_signal(String::new());
-    let (gain_href, set_gain_href) = create_signal(String::new());
-    let (source_sel, set_source_sel) = create_signal(String::from("auto"));
-    let (all_windows, set_all_windows) = create_signal(false);
-    let (step_s, set_step_s) = create_signal(1u64);
-    let (max_dur_s, set_max_dur_s) = create_signal(0u64); // 0 => None
-    let (show_wr, set_show_wr) = create_signal(true);
-    let (show_personal, set_show_personal) = create_signal(true);
-    let (show_sessions, set_show_sessions) = create_signal(false);
-    let (show_magic, set_show_magic) = create_signal(false);
-    let (curve_mode, set_curve_mode) = create_signal(String::from("combined"));
-    let (curve_ylog_rate, set_curve_ylog_rate) = create_signal(false);
-    let (curve_ylog_climb, set_curve_ylog_climb) = create_signal(false);
-    let (gain_mode, set_gain_mode) = create_signal(String::from("time"));
-    let (gain_ylog_time, set_gain_ylog_time) = create_signal(false);
-    let (curve_data, set_curve_data) = create_signal(Option::<Curves>::None);
-    let (gain_data, set_gain_data) = create_signal(Option::<GainTimeResult>::None);
-    let (diag_source, set_diag_source) = create_signal(String::new());
-    let (diag_span_s, set_diag_span_s) = create_signal(0.0_f64);
-    let (diag_gain_m, set_diag_gain_m) = create_signal(0.0_f64);
+    let (files, set_files) = signal(Vec::<FileBytes>::new());
+    let (busy, set_busy) = signal(false);
+    let (progress, set_progress) = signal(0.0_f64);
+    let (status, set_status) = signal(String::from("No files selected."));
+    let (curve_href, set_curve_href) = signal(String::new());
+    let (gain_href, set_gain_href) = signal(String::new());
+    let (source_sel, set_source_sel) = signal(String::from("auto"));
+    let (all_windows, set_all_windows) = signal(false);
+    let (step_s, set_step_s) = signal(1u64);
+    let (max_dur_s, set_max_dur_s) = signal(0u64); // 0 => None
+    let (show_wr, set_show_wr) = signal(true);
+    let (show_personal, set_show_personal) = signal(true);
+    let (show_sessions, set_show_sessions) = signal(false);
+    let (show_magic, set_show_magic) = signal(false);
+    let (curve_mode, set_curve_mode) = signal(String::from("combined"));
+    let (curve_ylog_rate, set_curve_ylog_rate) = signal(false);
+    let (curve_ylog_climb, set_curve_ylog_climb) = signal(false);
+    let (gain_mode, set_gain_mode) = signal(String::from("time"));
+    let (gain_ylog_time, set_gain_ylog_time) = signal(false);
+    let (curve_data, set_curve_data) = signal(Option::<Curves>::None);
+    let (gain_data, set_gain_data) = signal(Option::<GainTimeResult>::None);
+    let (diag_source, set_diag_source) = signal(String::new());
+    let (diag_span_s, set_diag_span_s) = signal(0.0_f64);
+    let (diag_gain_m, set_diag_gain_m) = signal(0.0_f64);
 
     fn fmt_hms(secs: f64) -> String {
         let s = if secs.is_finite() && secs >= 0.0 { secs } else { 0.0 };
@@ -1034,7 +1036,7 @@ pub fn App() -> impl IntoView {
     };
 
     // Re-render curve chart whenever data or controls change
-    create_effect({
+    Effect::new({
         let curve_mode = curve_mode.clone();
         let show_wr = show_wr.clone();
         let show_personal = show_personal.clone();
@@ -1062,7 +1064,7 @@ pub fn App() -> impl IntoView {
     });
 
     // Re-render gain chart when data or controls change
-    create_effect({
+    Effect::new({
         let gain_mode = gain_mode.clone();
         let show_wr = show_wr.clone();
         let show_personal = show_personal.clone();
@@ -1364,5 +1366,5 @@ pub fn App() -> impl IntoView {
 pub fn start() {
     #[cfg(feature = "chart_plotly")]
     console_error_panic_hook::set_once();
-    leptos::mount_to_body(|| view! { <App/> });
+    mount_to_body(|| view! { <App/> });
 }
