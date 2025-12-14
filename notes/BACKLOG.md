@@ -2,10 +2,10 @@
 
 Detailed technical backlog / roadmap. Prefer adding items here over TODOs in code. Keep items small, testable, and prioritized.
 
-## P0 (next work)
-- Fix Python dependency naming: `requirements.txt` should depend on `python-fitparse` (module `fitparse`) instead of the dormant `fitparse` 1.2.0 package; update README accordingly.
-- Add explicit version bounds/pins for Python deps to avoid numpy/typer/matplotlib breakage; document optional extras (`numba`, `scipy`).
-- Break `hc_curve.py` into modules (`fit_parsing.py`, `curve_math.py`, `wr.py`, `plotting.py`, `cli.py`) without changing behavior; add a minimal import shim for backwards CLI parity.
+## P0 (completed)
+- [x] Fix Python dependency naming: `requirements.txt` should depend on `python-fitparse` (module `fitparse`) instead of the dormant `fitparse` 1.2.0 package; update README accordingly.
+- [x] Add explicit version bounds/pins for Python deps to avoid numpy/typer/matplotlib breakage; document optional extras (`numba`, `scipy`).
+- [x] Break `hc_curve.py` into modules (`fit_parsing.py`, `curve_math.py`, `wr.py`, `plotting.py`, `cli.py`) without changing behavior; add a minimal import shim for backwards CLI parity.
 
 ## P1
 - [x] Add JSON export with metadata (inputs, selected source, sampling/QC stats, engine) alongside CSV.
