@@ -5,7 +5,7 @@ const APP_COMMIT: &str = env!("GIT_COMMIT_HASH");
 const MIN_DURATION_SECONDS: f64 = 30.0;
 
 #[cfg(feature = "chart_plotly")]
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 
 #[cfg(feature = "chart_plotly")]
 use wasm_bindgen_futures::JsFuture;
@@ -82,6 +82,91 @@ async fn read_files_from_list(list: &FileList) -> Vec<FileBytes> {
 }
 
 #[cfg(feature = "chart_plotly")]
+async fn yield_to_browser() {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        if let Some(window) = web_sys::window() {
+            let resolve = resolve.clone();
+            let cb = Closure::<dyn FnMut()>::new(move || {
+                let _ = resolve.call0(&JsValue::NULL);
+            });
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                0,
+            );
+            cb.forget();
+        } else {
+            let _ = resolve.call0(&JsValue::NULL);
+        }
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
+#[cfg(feature = "chart_plotly")]
+fn get_local_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok().flatten()
+}
+
+#[cfg(feature = "chart_plotly")]
+fn load_theme_preference() -> String {
+    if let Some(storage) = get_local_storage() {
+        if let Ok(Some(value)) = storage.get_item("hc_theme") {
+            let normalized = value.trim().to_ascii_lowercase();
+            if normalized == "dark" || normalized == "light" {
+                return normalized;
+            }
+        }
+    }
+    "light".to_string()
+}
+
+#[cfg(feature = "chart_plotly")]
+fn apply_theme_preference(theme: &str) {
+    let normalized = theme.trim().to_ascii_lowercase();
+    if let Some(window) = web_sys::window() {
+        if let Some(document) = window.document() {
+            if let Some(root) = document.document_element() {
+                let _ = root.set_attribute("data-theme", &normalized);
+            }
+        }
+    }
+    if let Some(storage) = get_local_storage() {
+        let _ = storage.set_item("hc_theme", &normalized);
+    }
+}
+
+#[cfg(feature = "chart_plotly")]
+fn css_var(name: &str) -> Option<String> {
+    let window = web_sys::window()?;
+    let document = window.document()?;
+    let root = document.document_element()?;
+    let style = window.get_computed_style(&root).ok().flatten()?;
+    let value = style.get_property_value(name).ok()?;
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+#[cfg(feature = "chart_plotly")]
+#[derive(Clone)]
+struct PlotTheme {
+    fg: String,
+    muted: String,
+    panel: String,
+    grid: String,
+    accent: String,
+}
+
+#[cfg(feature = "chart_plotly")]
+fn current_plot_theme() -> PlotTheme {
+    PlotTheme {
+        fg: css_var("--fg").unwrap_or_else(|| "#111".to_string()),
+        muted: css_var("--muted").unwrap_or_else(|| "#666".to_string()),
+        panel: css_var("--panel").unwrap_or_else(|| "#fff".to_string()),
+        grid: css_var("--grid").unwrap_or_else(|| "#e8e8e8".to_string()),
+        accent: css_var("--accent").unwrap_or_else(|| "#0a7".to_string()),
+    }
+}
+
+#[cfg(feature = "chart_plotly")]
 fn plot_xy(div_id: &str, traces: &js_sys::Array, layout: &JsValue) {
     if let Some(window) = web_sys::window() {
         if let Some(document) = window.document() {
@@ -94,7 +179,13 @@ fn plot_xy(div_id: &str, traces: &js_sys::Array, layout: &JsValue) {
                 {
                     let div_val = JsValue::from(div);
                     let traces_val = JsValue::from(traces.clone());
-                    let _ = func.call3(&JsValue::NULL, &div_val, &traces_val, layout);
+                    let config = to_js(&serde_json::json!({
+                        "responsive": true,
+                        "displaylogo": false,
+                        "displayModeBar": "hover"
+                    }))
+                    .unwrap_or(JsValue::UNDEFINED);
+                    let _ = func.call4(&JsValue::NULL, &div_val, &traces_val, layout, &config);
                 }
             }
         }
@@ -139,7 +230,7 @@ fn build_line_trace(name: &str, x: &[f64], y: &[f64], dash: &str, color: &str) -
 }
 
 #[cfg(feature = "chart_plotly")]
-fn build_iso_line(xmin: f64, xmax: f64, rate: f64) -> JsValue {
+fn build_iso_line(xmin: f64, xmax: f64, rate: f64, color: &str) -> JsValue {
     let x = [xmin, xmax];
     let y = [xmin / rate * 3600.0, xmax / rate * 3600.0];
     let trace = build_scatter_trace(
@@ -147,7 +238,7 @@ fn build_iso_line(xmin: f64, xmax: f64, rate: f64) -> JsValue {
         "lines",
         &x,
         &y,
-        Some(serde_json::json!({ "dash": "dot", "color": "#bbb", "width": 1 })),
+        Some(serde_json::json!({ "dash": "dot", "color": color, "width": 1 })),
     );
     let obj: js_sys::Object = trace.clone().into();
     js_sys::Reflect::set(&obj, &JsValue::from_str("hoverinfo"), &JsValue::from_str("skip")).ok();
@@ -335,6 +426,8 @@ fn render_curve_plot(
         .map(|p| p.climb_rate_m_per_hr)
         .collect();
 
+    let theme = current_plot_theme();
+
     let magic_points = if show_magic {
         collect_magic_points(curves)
             .into_iter()
@@ -350,7 +443,7 @@ fn render_curve_plot(
         "climb" => {
             let climb_trace = build_scatter_trace("Climb (m)", "lines", &durations_min, &climbs, None);
             let climb_obj = js_sys::Object::from(climb_trace.clone());
-            if let Ok(line) = to_js(&serde_json::json!({ "width": 2, "color": "#303030" })) {
+            if let Ok(line) = to_js(&serde_json::json!({ "width": 2, "color": theme.fg.clone() })) {
                 js_sys::Reflect::set(&climb_obj, &JsValue::from_str("line"), &line).ok();
             }
             js_sys::Reflect::set(
@@ -366,7 +459,7 @@ fn render_curve_plot(
                     let (wr_minutes, wr_values) =
                         filter_minutes_and_values(durs, gains, MIN_DURATION_SECONDS);
                     if !wr_minutes.is_empty() {
-                        let trace = build_line_trace("WR climb", &wr_minutes, &wr_values, "dash", "#777");
+                        let trace = build_line_trace("WR climb", &wr_minutes, &wr_values, "dash", theme.muted.as_str());
                         data.push(&trace);
                     }
                 }
@@ -439,7 +532,7 @@ fn render_curve_plot(
                 js_sys::Reflect::set(&trace, &JsValue::from_str("name"), &JsValue::from_str("Magic durations")).ok();
                 js_sys::Reflect::set(&trace, &JsValue::from_str("x"), &JsValue::from(xs)).ok();
                 js_sys::Reflect::set(&trace, &JsValue::from_str("y"), &JsValue::from(ys)).ok();
-                let marker = serde_json::json!({ "size": 8, "color": "#000000" });
+                let marker = serde_json::json!({ "size": 8, "color": theme.fg.clone() });
                 if let Ok(marker_js) = to_js(&marker) {
                     js_sys::Reflect::set(&trace, &JsValue::from_str("marker"), &marker_js).ok();
                 }
@@ -451,9 +544,13 @@ fn render_curve_plot(
             let layout = serde_json::json!({
                 "title": "Climb vs Duration",
                 "hovermode": "x unified",
-                "xaxis": { "title": "Duration (min)" },
-                "yaxis": { "title": "Climb (m)", "type": if ylog_climb { "log" } else { "linear" } },
-                "legend": { "orientation": "h" }
+                "paper_bgcolor": theme.panel.clone(),
+                "plot_bgcolor": theme.panel.clone(),
+                "font": { "color": theme.fg.clone() },
+                "margin": { "l": 56, "r": 24, "t": 54, "b": 80 },
+                "xaxis": { "title": "Duration (min)", "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+                "yaxis": { "title": "Climb (m)", "type": if ylog_climb { "log" } else { "linear" }, "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+                "legend": { "orientation": "h", "y": -0.25, "x": 0 }
             });
             let layout_js = to_js(&layout).unwrap();
             plot_xy("curve_plot", &data, &layout_js);
@@ -478,7 +575,7 @@ fn render_curve_plot(
                         filter_minutes_and_rates(durs, gains, MIN_DURATION_SECONDS);
                     if !wr_minutes.is_empty() {
                         let trace =
-                            build_line_trace("WR rate", &wr_minutes, &wr_rates, "dash", "#777");
+                            build_line_trace("WR rate", &wr_minutes, &wr_rates, "dash", theme.muted.as_str());
                         data.push(&trace);
                     }
                 }
@@ -521,7 +618,7 @@ fn render_curve_plot(
                 js_sys::Reflect::set(&trace, &JsValue::from_str("x"), &JsValue::from(xs)).ok();
                 js_sys::Reflect::set(&trace, &JsValue::from_str("y"), &JsValue::from(ys)).ok();
                 if let Ok(marker_js) =
-                    to_js(&serde_json::json!({ "size": 8, "color": "#000000" }))
+                    to_js(&serde_json::json!({ "size": 8, "color": theme.fg.clone() }))
                 {
                     js_sys::Reflect::set(&trace, &JsValue::from_str("marker"), &marker_js).ok();
                 }
@@ -533,9 +630,13 @@ fn render_curve_plot(
             let layout = serde_json::json!({
                 "title": "Climb Rate vs Duration",
                 "hovermode": "x unified",
-                "xaxis": { "title": "Duration (min)" },
-                "yaxis": { "title": "Rate (m/h)", "type": if ylog_rate { "log" } else { "linear" } },
-                "legend": { "orientation": "h" }
+                "paper_bgcolor": theme.panel.clone(),
+                "plot_bgcolor": theme.panel.clone(),
+                "font": { "color": theme.fg.clone() },
+                "margin": { "l": 56, "r": 24, "t": 54, "b": 80 },
+                "xaxis": { "title": "Duration (min)", "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+                "yaxis": { "title": "Rate (m/h)", "type": if ylog_rate { "log" } else { "linear" }, "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+                "legend": { "orientation": "h", "y": -0.25, "x": 0 }
             });
             let layout_js = to_js(&layout).unwrap();
             plot_xy("curve_plot", &data, &layout_js);
@@ -543,7 +644,7 @@ fn render_curve_plot(
         _ => {
             let climb_trace = build_scatter_trace("Climb (m)", "lines", &durations_min, &climbs, None);
             let climb_obj = js_sys::Object::from(climb_trace.clone());
-            if let Ok(line) = to_js(&serde_json::json!({ "width": 2, "color": "#303030" })) {
+            if let Ok(line) = to_js(&serde_json::json!({ "width": 2, "color": theme.fg.clone() })) {
                 js_sys::Reflect::set(&climb_obj, &JsValue::from_str("line"), &line).ok();
             }
             js_sys::Reflect::set(
@@ -573,7 +674,7 @@ fn render_curve_plot(
                     let (wr_minutes, wr_values) =
                         filter_minutes_and_values(durs, gains, MIN_DURATION_SECONDS);
                     if !wr_minutes.is_empty() {
-                        let trace = build_line_trace("WR climb", &wr_minutes, &wr_values, "dash", "#777");
+                        let trace = build_line_trace("WR climb", &wr_minutes, &wr_values, "dash", theme.muted.as_str());
                         data.push(&trace);
                     }
                 }
@@ -648,7 +749,7 @@ fn render_curve_plot(
                 js_sys::Reflect::set(&trace, &JsValue::from_str("name"), &JsValue::from_str("Magic durations")).ok();
                 js_sys::Reflect::set(&trace, &JsValue::from_str("x"), &JsValue::from(xs)).ok();
                 js_sys::Reflect::set(&trace, &JsValue::from_str("y"), &JsValue::from(ys)).ok();
-                let marker = serde_json::json!({ "size": 8, "color": "#000000" });
+                let marker = serde_json::json!({ "size": 8, "color": theme.fg.clone() });
                 if let Ok(marker_js) = to_js(&marker) {
                     js_sys::Reflect::set(&trace, &JsValue::from_str("marker"), &marker_js).ok();
                 }
@@ -660,15 +761,20 @@ fn render_curve_plot(
             let layout = serde_json::json!({
                 "title": "Climb + Rate vs Duration",
                 "hovermode": "x unified",
-                "xaxis": { "title": "Duration (min)" },
-                "yaxis": { "title": "Climb (m)", "type": if ylog_climb { "log" } else { "linear" } },
+                "paper_bgcolor": theme.panel.clone(),
+                "plot_bgcolor": theme.panel.clone(),
+                "font": { "color": theme.fg.clone() },
+                "margin": { "l": 56, "r": 40, "t": 54, "b": 90 },
+                "xaxis": { "title": "Duration (min)", "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+                "yaxis": { "title": "Climb (m)", "type": if ylog_climb { "log" } else { "linear" }, "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
                 "yaxis2": {
                     "title": "Rate (m/h)",
                     "type": if ylog_rate { "log" } else { "linear" },
                     "overlaying": "y",
-                    "side": "right"
+                    "side": "right",
+                    "showgrid": false
                 },
-                "legend": { "orientation": "h" }
+                "legend": { "orientation": "h", "y": -0.25, "x": 0 }
             });
             let layout_js = to_js(&layout).unwrap();
             plot_xy("curve_plot", &data, &layout_js);
@@ -687,6 +793,8 @@ fn render_gain_plot(
     if result.curve.is_empty() {
         return;
     }
+
+    let theme = current_plot_theme();
 
     let gains_m: Vec<f64> = result.curve.iter().map(|p| p.gain_m).collect();
     let gains_display = gains_m.clone();
@@ -718,7 +826,7 @@ fn render_gain_plot(
                 if let Some(curve) = result.wr_curve.as_ref() {
                     let wr_x: Vec<f64> = curve.iter().map(|p| p.gain_m).collect();
                     let wr_y: Vec<f64> = curve.iter().map(|p| p.avg_rate_m_per_hr).collect();
-                    let trace = build_line_trace("WR rate", &wr_x, &wr_y, "dash", "#777");
+                    let trace = build_line_trace("WR rate", &wr_x, &wr_y, "dash", theme.muted.as_str());
                     data.push(&trace);
                 }
             }
@@ -746,7 +854,7 @@ fn render_gain_plot(
                 js_sys::Reflect::set(&trace, &JsValue::from_str("name"), &JsValue::from_str("Targets")).ok();
                 js_sys::Reflect::set(&trace, &JsValue::from_str("x"), &JsValue::from(xs)).ok();
                 js_sys::Reflect::set(&trace, &JsValue::from_str("y"), &JsValue::from(ys)).ok();
-                if let Ok(marker) = to_js(&serde_json::json!({ "size": 8, "color": "#005f6a" })) {
+                if let Ok(marker) = to_js(&serde_json::json!({ "size": 8, "color": theme.accent.clone() })) {
                     js_sys::Reflect::set(&trace, &JsValue::from_str("marker"), &marker).ok();
                 }
                 data.push(&JsValue::from(trace));
@@ -755,9 +863,13 @@ fn render_gain_plot(
             let layout = serde_json::json!({
                 "title": "Average Rate vs Gain",
                 "hovermode": "x unified",
-                "xaxis": { "title": "Gain (m)" },
-                "yaxis": { "title": "Rate (m/h)", "type": "linear" },
-                "legend": { "orientation": "h" }
+                "paper_bgcolor": theme.panel.clone(),
+                "plot_bgcolor": theme.panel.clone(),
+                "font": { "color": theme.fg.clone() },
+                "margin": { "l": 56, "r": 24, "t": 54, "b": 80 },
+                "xaxis": { "title": "Gain (m)", "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+                "yaxis": { "title": "Rate (m/h)", "type": "linear", "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+                "legend": { "orientation": "h", "y": -0.25, "x": 0 }
             });
             let layout_js = to_js(&layout).unwrap();
             plot_xy("gain_time_plot", &data, &layout_js);
@@ -786,7 +898,7 @@ fn render_gain_plot(
                 if let Some(curve) = result.wr_curve.as_ref() {
                     let wr_x: Vec<f64> = curve.iter().map(|p| p.gain_m).collect();
                     let wr_y: Vec<f64> = curve.iter().map(|p| p.min_time_s / 60.0).collect();
-                    let trace = build_line_trace("WR", &wr_x, &wr_y, "dash", "#777");
+                    let trace = build_line_trace("WR", &wr_x, &wr_y, "dash", theme.muted.as_str());
                     data.push(&trace);
                 }
             }
@@ -816,7 +928,7 @@ fn render_gain_plot(
                 if rate <= 0.0 {
                     continue;
                 }
-                let trace = build_iso_line(xmin, xmax, rate);
+                let trace = build_iso_line(xmin, xmax, rate, theme.grid.as_str());
                 data.push(&trace);
             }
 
@@ -833,7 +945,7 @@ fn render_gain_plot(
                 js_sys::Reflect::set(&trace, &JsValue::from_str("name"), &JsValue::from_str("Targets")).ok();
                 js_sys::Reflect::set(&trace, &JsValue::from_str("x"), &JsValue::from(xs)).ok();
                 js_sys::Reflect::set(&trace, &JsValue::from_str("y"), &JsValue::from(ys)).ok();
-                if let Ok(marker) = to_js(&serde_json::json!({ "size": 8, "color": "#005f6a" })) {
+                if let Ok(marker) = to_js(&serde_json::json!({ "size": 8, "color": theme.accent.clone() })) {
                     js_sys::Reflect::set(&trace, &JsValue::from_str("marker"), &marker).ok();
                 }
                 data.push(&JsValue::from(trace));
@@ -842,9 +954,13 @@ fn render_gain_plot(
             let layout = serde_json::json!({
                 "title": "Minimum Time vs Gain",
                 "hovermode": "x unified",
-                "xaxis": { "title": "Gain (m)" },
-                "yaxis": { "title": "Time (min)", "type": if ylog_time { "log" } else { "linear" } },
-                "legend": { "orientation": "h" }
+                "paper_bgcolor": theme.panel.clone(),
+                "plot_bgcolor": theme.panel.clone(),
+                "font": { "color": theme.fg.clone() },
+                "margin": { "l": 56, "r": 24, "t": 54, "b": 80 },
+                "xaxis": { "title": "Gain (m)", "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+                "yaxis": { "title": "Time (min)", "type": if ylog_time { "log" } else { "linear" }, "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+                "legend": { "orientation": "h", "y": -0.25, "x": 0 }
             });
             let layout_js = to_js(&layout).unwrap();
             plot_xy("gain_time_plot", &data, &layout_js);
@@ -854,8 +970,17 @@ fn render_gain_plot(
 
 #[component]
 pub fn App() -> impl IntoView {
+    let (theme, set_theme) = create_signal(load_theme_preference());
+    create_effect({
+        let theme = theme.clone();
+        move |_| {
+            apply_theme_preference(&theme.get());
+        }
+    });
+
     let (files, set_files) = create_signal(Vec::<FileBytes>::new());
     let (busy, set_busy) = create_signal(false);
+    let (progress, set_progress) = create_signal(0.0_f64);
     let (status, set_status) = create_signal(String::from("No files selected."));
     let (curve_href, set_curve_href) = create_signal(String::new());
     let (gain_href, set_gain_href) = create_signal(String::new());
@@ -903,6 +1028,11 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    let on_toggle_theme = move |_ev: leptos::ev::MouseEvent| {
+        let next = if theme.get_untracked() == "dark" { "light" } else { "dark" };
+        set_theme.set(next.to_string());
+    };
+
     // Re-render curve chart whenever data or controls change
     create_effect({
         let curve_mode = curve_mode.clone();
@@ -912,7 +1042,9 @@ pub fn App() -> impl IntoView {
         let show_magic = show_magic.clone();
         let curve_ylog_rate = curve_ylog_rate.clone();
         let curve_ylog_climb = curve_ylog_climb.clone();
+        let theme = theme.clone();
         move |_| {
+            let _ = theme.get();
             if let Some(curves) = curve_data.get() {
                 let mode = curve_mode.get();
                 render_curve_plot(
@@ -935,7 +1067,9 @@ pub fn App() -> impl IntoView {
         let show_wr = show_wr.clone();
         let show_personal = show_personal.clone();
         let gain_ylog_time = gain_ylog_time.clone();
+        let theme = theme.clone();
         move |_| {
+            let _ = theme.get();
             if let Some(result) = gain_data.get() {
                 let mode = gain_mode.get();
                 render_gain_plot(
@@ -958,9 +1092,11 @@ pub fn App() -> impl IntoView {
             return;
         }
         set_busy.set(true);
-        set_status.set("Computing… this may take a moment.".to_string());
+        set_progress.set(0.0);
+        set_status.set("Preparing…".to_string());
         let set_status_cb = set_status.clone();
         let set_busy_cb = set_busy.clone();
+        let set_progress_cb = set_progress.clone();
         let set_curve_href_cb = set_curve_href.clone();
         let set_gain_href_cb = set_gain_href.clone();
         let curve_href_get = curve_href.clone();
@@ -977,16 +1113,25 @@ pub fn App() -> impl IntoView {
         let set_curve_data_cb = set_curve_data.clone();
         let set_gain_data_cb = set_gain_data.clone();
         spawn_local(async move {
+            set_progress_cb.set(0.02);
+            yield_to_browser().await;
+
             let mut records_by_file: Vec<Vec<hc_curve::FitRecord>> = Vec::new();
             let mut unsupported: Vec<String> = Vec::new();
+            let total_files = files_now.len().max(1);
             for (idx, fb) in files_now.iter().enumerate() {
+                set_status_cb.set(format!("Parsing {}/{}: {}", idx + 1, total_files, fb.name));
+                yield_to_browser().await;
                 match parse_records(&fb.bytes, idx, &fb.ext) {
                     Ok(recs) => { if recs.len() > 2 { records_by_file.push(recs); } },
                     Err(_) => { unsupported.push(fb.name.clone()); }
                 }
+                set_progress_cb.set(0.05 + 0.35 * ((idx + 1) as f64 / total_files as f64));
+                yield_to_browser().await;
             }
             if records_by_file.is_empty() {
                 set_status_cb.set("No valid records in uploaded files.".to_string());
+                set_progress_cb.set(0.0);
                 set_busy_cb.set(false);
                 return;
             }
@@ -1006,10 +1151,14 @@ pub fn App() -> impl IntoView {
             };
 
             // Curves
+            set_status_cb.set("Computing curves…".to_string());
+            set_progress_cb.set(0.45);
+            yield_to_browser().await;
             let (curves, params_used, fallback_notes) = match try_compute_curves(&records_by_file, &params) {
                 Ok(res) => res,
                 Err(err) => {
                     set_status_cb.set(format!("Curve computation failed: {err}"));
+                    set_progress_cb.set(0.0);
                     set_busy_cb.set(false);
                     return;
                 }
@@ -1022,6 +1171,8 @@ pub fn App() -> impl IntoView {
             ));
 
             // curve.csv
+            set_progress_cb.set(0.65);
+            yield_to_browser().await;
             let mut curve_csv = String::from("duration_s,max_climb_m,climb_rate_m_per_hr,start_offset_s,end_offset_s,source\n");
             for p in curves.points.iter() {
                 curve_csv.push_str(&format!("{},{:.6},{:.6},{:.3},{:.3},{}\n", p.duration_s, p.max_climb_m, p.climb_rate_m_per_hr, p.start_offset_s, p.end_offset_s, curves.selected_source));
@@ -1031,11 +1182,15 @@ pub fn App() -> impl IntoView {
             set_curve_href_cb.set(blob_url_from_str(&curve_csv));
 
             // Gain-time
+            set_status_cb.set("Computing gain-time…".to_string());
+            set_progress_cb.set(0.75);
+            yield_to_browser().await;
             const DEFAULT_GAIN_TARGETS: &[f64] = &[50.0, 100.0, 150.0, 200.0, 300.0, 500.0, 750.0, 1000.0];
             let gt = match compute_gain_time(records_by_file.clone(), &params_used, DEFAULT_GAIN_TARGETS) {
                 Ok(r) => r,
                 Err(err) => {
                     set_status_cb.set(format!("Gain-time computation failed: {err}"));
+                    set_progress_cb.set(0.0);
                     set_busy_cb.set(false);
                     return;
                 }
@@ -1062,6 +1217,7 @@ pub fn App() -> impl IntoView {
             }
             if !unsupported.is_empty() { msg.push_str(&format!(" Skipped {} unsupported file(s).", unsupported.len())); }
             set_status_cb.set(msg);
+            set_progress_cb.set(1.0);
             set_busy_cb.set(false);
         });
     };
@@ -1084,9 +1240,16 @@ pub fn App() -> impl IntoView {
             }
         }>
             <header>
-                <h1>"Hillclimb Curves"</h1>
-                <p class="subtitle">"Upload FIT or GPX files to compute hillclimb curves in your browser."</p>
-                <p class="note">{"Web version "}{APP_VERSION}{" ("}{APP_COMMIT}{")"}</p>
+                <div class="header-row">
+                    <div>
+                        <h1>"Hillclimb Curves"</h1>
+                        <p class="subtitle">"Upload FIT or GPX files to compute hillclimb curves in your browser."</p>
+                        <p class="note">{"Web version "}{APP_VERSION}{" ("}{APP_COMMIT}{")"}</p>
+                    </div>
+                    <button class="btn secondary" on:click=on_toggle_theme>
+                        {move || if theme.get() == "dark" { "Light theme" } else { "Dark theme" }}
+                    </button>
+                </div>
             </header>
             <section class="controls">
                 <label class="dropzone">
@@ -1152,7 +1315,18 @@ pub fn App() -> impl IntoView {
                     }/>" Time axis log"</label>
                 </div>
                 <button class="btn" on:click=on_compute disabled=move || busy.get()>"Compute"</button>
-                <span class="note">{move || status.get()}</span>
+                <Show when=move || busy.get()>
+                    <progress class="progress" max="1" prop:value=move || progress.get().to_string()></progress>
+                </Show>
+                <div class="status">
+                    <Show when=move || busy.get() fallback=|| ()>
+                        <span class="spinner" aria-hidden="true"></span>
+                    </Show>
+                    <span class="note" aria-live="polite">{move || status.get()}</span>
+                    <Show when=move || busy.get() fallback=|| ()>
+                        <span class="note">{move || format!("{:.0}%", (progress.get() * 100.0).clamp(0.0, 100.0))}</span>
+                    </Show>
+                </div>
             </section>
             <section class="files">
                 <ul>{file_list_view}</ul>

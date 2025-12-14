@@ -60,3 +60,8 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 - Wired the existing Rust CLI `--smooth` flag through the core altitude pipeline and added a matching Python `--smooth` option (off by default).
 - `--smooth` applies an additional rolling-median window (seconds) after the effective altitude path to reduce staircase artifacts on sparse/noisy data.
 - Fixed Python altitude ascent integration to respect `--gain-eps` instead of a hardcoded epsilon.
+
+## 2025‑12‑13 – Web UI polish (progress, theme, mobile)
+- Added a light/dark theme toggle with persistent preference (`localStorage`) and applied theme colors to Plotly layouts.
+- Added a compute progress indicator (spinner + progress bar) and inserted small async yields so the UI updates before long WASM compute steps.
+- Improved responsiveness: Plotly `responsive` config, safer plot sizing, and a two-column layout on wide screens.

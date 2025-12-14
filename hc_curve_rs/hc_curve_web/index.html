@@ -9,25 +9,43 @@
     <!-- Plotly CDN for interactive charts -->
     <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
     <style>
-      :root { --fg:#111; --muted:#666; --bg:#fff; --accent:#0a7; }
-      html, body { margin: 0; padding: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: var(--fg); background: var(--bg); }
-      main.tufte { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+      :root { --fg:#111; --muted:#666; --bg:#fff; --panel:#fff; --border:#e6e6e6; --grid:#e8e8e8; --accent:#0a7; }
+      :root[data-theme="dark"] { --fg:#e8e8e8; --muted:#a8a8a8; --bg:#0b0c0e; --panel:#111217; --border:#2a2e35; --grid:#2a2e35; --accent:#12b886; }
+      html, body { margin: 0; padding: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: var(--fg); background: var(--bg); color-scheme: light dark; }
+      main.tufte { max-width: 1100px; margin: 0 auto; padding: calc(24px + env(safe-area-inset-top)) 16px calc(48px + env(safe-area-inset-bottom)); }
       header { margin-bottom: 16px; }
       header h1 { margin: 0 0 8px; font-weight: 650; }
+      .header-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
       .subtitle { color: var(--muted); margin: 0; }
       .controls { margin: 16px 0; display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
       .control-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
-      .controls select { padding: 6px 10px; border-radius: 4px; border: 1px solid #ccc; font-size: 14px; }
-      .dropzone { border: 2px dashed #ccc; border-radius: 8px; padding: 16px; display: inline-flex; align-items: center; gap: 12px; cursor: pointer; color: #555; }
+      .controls select, .controls input[type=number] { padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); font-size: 14px; background: var(--panel); color: var(--fg); }
+      .dropzone { border: 2px dashed var(--border); border-radius: 8px; padding: 16px; display: inline-flex; align-items: center; gap: 12px; cursor: pointer; color: var(--muted); background: var(--panel); }
       .dropzone input[type=file] { display: none; }
       .files { margin: 8px 0 4px; color: var(--muted); }
       .btn { background: var(--accent); color: white; border: none; padding: 10px 14px; border-radius: 6px; cursor: pointer; font-weight: 600; }
       .btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+      .btn.secondary { background: transparent; color: var(--fg); border: 1px solid var(--border); }
+      .status { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .spinner { width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.9s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      progress.progress { width: 100%; max-width: 520px; height: 10px; border-radius: 6px; overflow: hidden; accent-color: var(--accent); }
       .plots { display: grid; grid-template-columns: 1fr; gap: 16px; }
-      .plot { min-height: 360px; border: 1px solid #eee; border-radius: 8px; }
+      .plot { height: clamp(320px, 50vh, 520px); border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
       .downloads { margin-top: 8px; display: flex; gap: 12px; }
-      .downloads a { color: #055; text-decoration: none; font-weight: 600; }
+      .downloads a { color: var(--accent); text-decoration: none; font-weight: 600; }
       .note { color: var(--muted); font-size: 13px; }
+
+      @media (min-width: 980px) {
+        .plots { grid-template-columns: 1fr 1fr; }
+      }
+
+      @media (max-width: 540px) {
+        main.tufte { padding: calc(16px + env(safe-area-inset-top)) 12px calc(32px + env(safe-area-inset-bottom)); }
+        .dropzone { width: 100%; justify-content: center; }
+        .btn { width: 100%; }
+        .header-row { flex-direction: column; align-items: flex-start; }
+      }
     </style>
   </head>
   <body>
