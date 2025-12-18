@@ -81,3 +81,4 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 - Reworked `notes/BACKLOG.md` into a prioritized, owner-assigned ticket list with acceptance criteria.
 - Recorded strategic direction: Rust `hc_curve` should become the canonical “source of truth”, with Python moving toward a wrapper/plotting role.
 - Documented parser strategy guidance (python-fitparse vs fitdecode) and the recommended migration path.
+- Added a CI smoke workflow (`.github/workflows/ci-smoke.yml`) to run Python unit tests, Rust workspace tests, and a WASM compile check on PR/push.

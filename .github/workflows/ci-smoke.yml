@@ -1,0 +1,66 @@
+name: CI Smoke
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+concurrency:
+  group: ci-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    name: Python unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s tests -v
+
+  rust-tests:
+    name: Rust build + tests (CLI + WASM check)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspace: hc_curve_rs
+          target-dir: hc_curve_rs/target
+          shared-key: smoke
+
+      - name: Cargo test (workspace)
+        working-directory: hc_curve_rs
+        run: |
+          cargo test --workspace
+
+      - name: Cargo check (WASM target)
+        working-directory: hc_curve_rs
+        run: |
+          cargo check -p hc_curve_web --target wasm32-unknown-unknown
+
