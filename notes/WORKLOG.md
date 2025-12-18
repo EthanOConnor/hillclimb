@@ -119,3 +119,7 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 ## 2025‑12‑18 – Algorithm Lab CLI (`ascent list` / `ascent compare`)
 - Added `hc_curve_cli ascent list` and `hc_curve_cli ascent compare` for side-by-side ascent algorithm comparison on a single activity.
 - `ascent compare` prints a compact table (gain + delta vs baseline) and optionally writes a versioned JSON report including per-algorithm diagnostics and curve deltas.
+
+## 2025‑12‑18 – Algorithm Lab web UI (multi-algorithm comparison)
+- Added an Algorithm Lab mode to the WASM web app: baseline + multi-select algorithms, a comparison plot, and a results table.
+- Web comparison uses the Rust core `compute_ascent_compare` output so CLI/Web share the same canonical semantics.

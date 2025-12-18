@@ -60,7 +60,7 @@ See also: `docs/REVIEW_2025-12-18.md` (comprehensive handoff + decisions).
   - Acceptance: `hc_curve_cli ascent compare … --json` (or similar) produces a multi-algorithm report for a single activity.
   - Acceptance: report includes algorithm-by-algorithm totals + curve deltas + summary table.
 
-- [ ] **(ENG/Junior)** Web UI: multi-algorithm comparison mode
+- [x] **(ENG/Junior)** Web UI: multi-algorithm comparison mode
   - Acceptance: multi-select algorithms, recompute, and render overlays + a results table.
   - Acceptance: UI communicates “local processing” and “definitions” clearly; error states are actionable.
 

@@ -121,6 +121,7 @@ Common developer-named fields are auto-detected when present, including:
 Web App (WASM)
 ---------------
 A minimal client‑side web app is scaffolded under `hc_curve_rs/hc_curve_web`. It lets you upload FIT/GPX files in the browser, computes the same curves locally (no server), renders interactive Plotly charts, and offers CSV downloads.
+Enable “Algorithm Lab” in the UI to compare ascent algorithms side-by-side and see how totals/curves differ.
 
 Build locally:
 - `rustup target add wasm32-unknown-unknown`

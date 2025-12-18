@@ -24,8 +24,13 @@ use web_sys::{Blob, FileList, HtmlInputElement, HtmlSelectElement};
 use std::cmp::Ordering;
 
 #[cfg(feature = "chart_plotly")]
+use std::collections::BTreeSet;
+
+#[cfg(feature = "chart_plotly")]
 use hc_curve::{
-    compute_curves, compute_gain_time, parse_records, Curves, GainTimeResult, HcError, Params,
+    compute_ascent_compare, compute_curves, compute_gain_time, list_ascent_algorithms, parse_records,
+    AscentAlgorithmConfig, AscentCompareAlgorithmEntry, AscentCompareReport, Curves, GainTimeResult,
+    HcError, Params,
 };
 
 #[cfg(feature = "chart_plotly")]
@@ -787,6 +792,73 @@ fn render_curve_plot(
 }
 
 #[cfg(feature = "chart_plotly")]
+fn render_ascent_compare_plot(report: &AscentCompareReport, ylog_climb: bool) {
+    let theme = current_plot_theme();
+    let data = js_sys::Array::new();
+
+    let palette = ["#1e90ff", "#228b22", "#c00564", "#ffa500", "#8a2be2", "#00bcd4"];
+    let mut palette_idx = 0usize;
+
+    let push_curve = |label: &str,
+                      curve: &[hc_curve::CurvePoint],
+                      color: &str,
+                      width: f64,
+                      dash: &str| {
+        let mut xs: Vec<f64> = Vec::new();
+        let mut ys: Vec<f64> = Vec::new();
+        for p in curve {
+            if (p.duration_s as f64) < MIN_DURATION_SECONDS {
+                continue;
+            }
+            xs.push(p.duration_s as f64 / 60.0);
+            ys.push(p.max_climb_m);
+        }
+        if xs.is_empty() {
+            return;
+        }
+        let trace = build_scatter_trace(label, "lines", &xs, &ys, None);
+        let obj = js_sys::Object::from(trace.clone());
+        if let Ok(line) = to_js(&serde_json::json!({ "width": width, "color": color, "dash": dash })) {
+            js_sys::Reflect::set(&obj, &JsValue::from_str("line"), &line).ok();
+        }
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("hovertemplate"),
+            &JsValue::from_str("Duration %{x:.1f} min<br>Climb %{y:.1f} m<extra></extra>"),
+        )
+        .ok();
+        data.push(&trace);
+    };
+
+    if let AscentCompareAlgorithmEntry::Ok { name, curve, .. } = &report.baseline {
+        push_curve(name.as_str(), curve, theme.fg.as_str(), 2.5, "solid");
+    }
+
+    for entry in &report.entries {
+        let AscentCompareAlgorithmEntry::Ok { name, curve, .. } = entry else {
+            continue;
+        };
+        let color = palette[palette_idx % palette.len()];
+        palette_idx += 1;
+        push_curve(name.as_str(), curve, color, 1.8, "solid");
+    }
+
+    let layout = serde_json::json!({
+        "title": "Algorithm Lab: Climb vs Duration",
+        "hovermode": "x unified",
+        "paper_bgcolor": theme.panel.clone(),
+        "plot_bgcolor": theme.panel.clone(),
+        "font": { "color": theme.fg.clone() },
+        "margin": { "l": 56, "r": 24, "t": 54, "b": 80 },
+        "xaxis": { "title": "Duration (min)", "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+        "yaxis": { "title": "Climb (m)", "type": if ylog_climb { "log" } else { "linear" }, "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+        "legend": { "orientation": "h", "y": -0.25, "x": 0 }
+    });
+    let layout_js = to_js(&layout).unwrap();
+    plot_xy("algo_plot", &data, &layout_js);
+}
+
+#[cfg(feature = "chart_plotly")]
 fn render_gain_plot(
     result: &GainTimeResult,
     mode: &str,
@@ -1007,6 +1079,22 @@ pub fn App() -> impl IntoView {
     let (diag_span_s, set_diag_span_s) = signal(0.0_f64);
     let (diag_gain_m, set_diag_gain_m) = signal(0.0_f64);
 
+    let (records_cache, set_records_cache) = signal(Option::<Vec<Vec<hc_curve::FitRecord>>>::None);
+    let (params_cache, set_params_cache) = signal(Option::<Params>::None);
+
+    let default_algo_set: BTreeSet<String> = [
+        "strava.altitude.threshold.v1",
+        "goldencheetah.altitude.hysteresis.v1",
+        "twonav.altitude.min_altitude_increase.v1",
+    ]
+    .into_iter()
+    .map(|id| id.to_string())
+    .collect();
+    let (algo_lab_enabled, set_algo_lab_enabled) = signal(false);
+    let (algo_baseline, set_algo_baseline) = signal(String::from("hc.altitude.canonical.v1"));
+    let (algo_selected, set_algo_selected) = signal(default_algo_set);
+    let (algo_report, set_algo_report) = signal(Option::<AscentCompareReport>::None);
+
     fn fmt_hms(secs: f64) -> String {
         let s = if secs.is_finite() && secs >= 0.0 { secs } else { 0.0 };
         let total = s.round() as i64;
@@ -1087,6 +1175,34 @@ pub fn App() -> impl IntoView {
         }
     });
 
+    // Re-render Algorithm Lab plot when report/theme changes
+    Effect::new({
+        let algo_report = algo_report.clone();
+        let curve_ylog_climb = curve_ylog_climb.clone();
+        let theme = theme.clone();
+        move |_| {
+            let _ = theme.get();
+            algo_report.with(|opt| {
+                if let Some(report) = opt {
+                    render_ascent_compare_plot(report, curve_ylog_climb.get());
+                } else {
+                    let empty = js_sys::Array::new();
+                    let theme = current_plot_theme();
+                    let layout = to_js(&serde_json::json!({
+                        "title": "Algorithm Lab",
+                        "paper_bgcolor": theme.panel.clone(),
+                        "plot_bgcolor": theme.panel.clone(),
+                        "font": { "color": theme.fg.clone() },
+                        "xaxis": { "title": "Duration (min)", "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+                        "yaxis": { "title": "Climb (m)", "gridcolor": theme.grid.clone(), "zerolinecolor": theme.grid.clone() },
+                    }))
+                    .unwrap_or(JsValue::UNDEFINED);
+                    plot_xy("algo_plot", &empty, &layout);
+                }
+            });
+        }
+    });
+
     // Compute handler
     let on_compute = move |_ev: leptos::ev::MouseEvent| {
         if busy.get_untracked() { return; }
@@ -1114,8 +1230,14 @@ pub fn App() -> impl IntoView {
         let set_diag_gain_cb = set_diag_gain_m.clone();
         set_curve_data.set(None);
         set_gain_data.set(None);
+        set_records_cache.set(None);
+        set_params_cache.set(None);
+        set_algo_report.set(None);
         let set_curve_data_cb = set_curve_data.clone();
         let set_gain_data_cb = set_gain_data.clone();
+        let set_records_cache_cb = set_records_cache.clone();
+        let set_params_cache_cb = set_params_cache.clone();
+        let set_algo_report_cb = set_algo_report.clone();
         spawn_local(async move {
             set_progress_cb.set(0.02);
             yield_to_browser().await;
@@ -1153,6 +1275,9 @@ pub fn App() -> impl IntoView {
                 "altitude" => hc_curve::Source::Altitude,
                 _ => hc_curve::Source::Auto,
             };
+            set_records_cache_cb.set(Some(records_by_file.clone()));
+            set_params_cache_cb.set(Some(params.clone()));
+            set_algo_report_cb.set(None);
 
             // Curves
             set_status_cb.set("Computing curves…".to_string());
@@ -1167,6 +1292,7 @@ pub fn App() -> impl IntoView {
                     return;
                 }
             };
+            set_params_cache_cb.set(Some(params_used.clone()));
             set_curve_data_cb.set(Some(curves.clone()));
             set_status_cb.set(format!(
                 "Curve computed: {} durations using {} source.",
@@ -1223,6 +1349,106 @@ pub fn App() -> impl IntoView {
             set_status_cb.set(msg);
             set_progress_cb.set(1.0);
             set_busy_cb.set(false);
+        });
+    };
+
+    let on_algo_compare = move |_ev: leptos::ev::MouseEvent| {
+        if busy.get_untracked() {
+            return;
+        }
+        let Some(records_by_file) = records_cache.get_untracked() else {
+            set_status.set("Run Compute first to parse files, then run Algorithm Lab.".to_string());
+            return;
+        };
+        let Some(params_used) = params_cache.get_untracked() else {
+            set_status.set("Run Compute first to establish parameters, then run Algorithm Lab.".to_string());
+            return;
+        };
+
+        let baseline_id = algo_baseline.get_untracked();
+        let selected = algo_selected.get_untracked();
+        if selected.is_empty() {
+            set_status.set("Select at least one algorithm for Algorithm Lab.".to_string());
+            return;
+        }
+
+        let durations_s = curve_data.get_untracked().map(|curves| {
+            curves
+                .points
+                .iter()
+                .map(|p| p.duration_s)
+                .collect::<Vec<u64>>()
+        });
+
+        set_busy.set(true);
+        set_progress.set(0.0);
+        set_status.set("Computing Algorithm Lab…".to_string());
+        set_algo_report.set(None);
+
+        let set_status_cb = set_status.clone();
+        let set_busy_cb = set_busy.clone();
+        let set_progress_cb = set_progress.clone();
+        let set_algo_report_cb = set_algo_report.clone();
+
+        spawn_local(async move {
+            set_progress_cb.set(0.1);
+            yield_to_browser().await;
+
+            let baseline_cfg = match AscentAlgorithmConfig::default_for_id(&baseline_id) {
+                Some(cfg) => cfg,
+                None => {
+                    set_status_cb.set(format!("Unknown baseline algorithm '{baseline_id}'."));
+                    set_progress_cb.set(0.0);
+                    set_busy_cb.set(false);
+                    return;
+                }
+            };
+
+            let mut algo_cfgs: Vec<AscentAlgorithmConfig> = Vec::new();
+            for algo_id in selected.iter() {
+                if let Some(cfg) = AscentAlgorithmConfig::default_for_id(algo_id) {
+                    algo_cfgs.push(cfg);
+                }
+            }
+            if algo_cfgs.is_empty() {
+                set_status_cb.set("No valid algorithms selected for Algorithm Lab.".to_string());
+                set_progress_cb.set(0.0);
+                set_busy_cb.set(false);
+                return;
+            }
+
+            set_progress_cb.set(0.2);
+            yield_to_browser().await;
+
+            match compute_ascent_compare(
+                records_by_file,
+                &params_used,
+                &baseline_cfg,
+                &algo_cfgs,
+                durations_s,
+            ) {
+                Ok(report) => {
+                    let n_ok = report
+                        .entries
+                        .iter()
+                        .filter(|e| matches!(e, AscentCompareAlgorithmEntry::Ok { .. }))
+                        .count();
+                    let n_err = report.entries.len().saturating_sub(n_ok);
+                    set_algo_report_cb.set(Some(report));
+                    if n_err > 0 {
+                        set_status_cb.set(format!("Algorithm Lab computed ({n_ok} ok, {n_err} errors)."));
+                    } else {
+                        set_status_cb.set(format!("Algorithm Lab computed ({n_ok} algorithms)."));
+                    }
+                    set_progress_cb.set(1.0);
+                    set_busy_cb.set(false);
+                }
+                Err(err) => {
+                    set_status_cb.set(format!("Algorithm Lab failed: {err}"));
+                    set_progress_cb.set(0.0);
+                    set_busy_cb.set(false);
+                }
+            }
         });
     };
 
@@ -1318,6 +1544,11 @@ pub fn App() -> impl IntoView {
                         if let Some(t)=ev.target(){ if let Ok(inp)=t.dyn_into::<web_sys::HtmlInputElement>(){ set_gain_ylog_time.set(inp.checked()); }}
                     }/>" Time axis log"</label>
                 </div>
+                <div class="control-row">
+                    <label><input type="checkbox" prop:checked=move || algo_lab_enabled.get() on:change=move |ev| {
+                        if let Some(t)=ev.target(){ if let Ok(inp)=t.dyn_into::<web_sys::HtmlInputElement>(){ set_algo_lab_enabled.set(inp.checked()); }}
+                    }/>" Algorithm Lab (compare ascent algorithms)"</label>
+                </div>
                 <button class="btn" on:click=on_compute disabled=move || busy.get()>"Compute"</button>
                 <Show when=move || busy.get()>
                     <progress class="progress" max="1" prop:value=move || progress.get().to_string()></progress>
@@ -1338,7 +1569,169 @@ pub fn App() -> impl IntoView {
             <section class="plots">
                 <div id="curve_plot" class="plot"></div>
                 <div id="gain_time_plot" class="plot"></div>
+                <Show when=move || algo_lab_enabled.get()>
+                    <div id="algo_plot" class="plot"></div>
+                </Show>
             </section>
+            <Show when=move || algo_lab_enabled.get()>
+                <section class="controls">
+                    <h3>"Algorithm Lab"</h3>
+                    <p class="note">"Compare ascent algorithms side-by-side on the same activity. Run Compute first to load your files, then choose a baseline and algorithms to compare."</p>
+	                    <div class="control-row">
+	                        <label class="note">"Baseline:"</label>
+	                        <select on:change=move |ev| {
+	                            if let Some(t)=ev.target(){ if let Ok(sel)=t.dyn_into::<HtmlSelectElement>(){ set_algo_baseline.set(sel.value()); }}
+	                        } prop:value=move || algo_baseline.get()>
+	                            {move || {
+	                                list_ascent_algorithms()
+	                                    .into_iter()
+	                                    .map(|alg| {
+	                                        let id = alg.id;
+	                                        let label = format!("{} ({})", alg.name, id);
+	                                        view! { <option value={id}>{label}</option> }
+	                                    })
+	                                    .collect_view()
+	                            }}
+	                        </select>
+	                    </div>
+	                    <div class="control-row">
+	                        <label class="note">"Algorithms:"</label>
+	                    </div>
+	                    {move || {
+	                        let baseline_id = algo_baseline.get();
+	                        list_ascent_algorithms()
+	                            .into_iter()
+	                            .filter(|alg| alg.id.as_str() != baseline_id.as_str())
+	                            .map(|alg| {
+	                                let id = alg.id;
+	                                let id_for_checked = id.clone();
+	                                let id_for_update = id.clone();
+	                                let name = alg.name;
+	                                let desc = alg.description;
+	                                let algo_selected = algo_selected.clone();
+	                                let set_algo_selected = set_algo_selected.clone();
+	                                view! {
+	                                    <div class="algo-choice">
+	                                        <label>
+	                                            <input
+	                                                type="checkbox"
+	                                                prop:checked=move || algo_selected.get().contains(&id_for_checked)
+	                                                on:change=move |ev| {
+	                                                    if let Some(t)=ev.target(){
+	                                                        if let Ok(inp)=t.dyn_into::<HtmlInputElement>(){
+	                                                            let checked = inp.checked();
+	                                                            set_algo_selected.update(|set| {
+	                                                                if checked { set.insert(id_for_update.clone()); } else { set.remove(&id_for_update); }
+	                                                            });
+	                                                        }
+	                                                    }
+	                                                }
+	                                            />
+	                                            <span>{name}</span>
+	                                            <span class="note">" "<code>{id}</code></span>
+	                                        </label>
+	                                        <div class="note">{desc}</div>
+	                                    </div>
+	                                }
+	                            })
+	                            .collect_view()
+	                    }}
+	                    <button class="btn secondary" on:click=on_algo_compare disabled=move || busy.get()>"Compute Algorithm Lab"</button>
+	                    <Show
+	                        when=move || algo_report.with(|opt| opt.is_some())
+	                        fallback=|| view! { <p class="note">"No Algorithm Lab results yet."</p> }
+	                    >
+	                        {move || algo_report.with(|opt| {
+	                            let report = opt.as_ref().expect("checked by Show");
+	
+	                            let baseline_row = match &report.baseline {
+	                                AscentCompareAlgorithmEntry::Ok {
+	                                    algorithm_id,
+	                                    name,
+	                                    total_gain_m,
+	                                    ..
+	                                } => view! {
+	                                    <tr>
+	                                        <td><span class="note">"baseline"</span></td>
+	                                        <td><span>{name.clone()}</span><div class="note"><code>{algorithm_id.clone()}</code></div></td>
+	                                        <td class="num">{format!("{:.1}", total_gain_m)}</td>
+	                                        <td class="num">{format!("{:.1}", 0.0)}</td>
+	                                        <td><span class="note">{String::from("ok")}</span></td>
+	                                    </tr>
+	                                },
+	                                AscentCompareAlgorithmEntry::Error {
+	                                    algorithm_id,
+	                                    name,
+	                                    error,
+	                                } => view! {
+	                                    <tr>
+	                                        <td><span class="note">"baseline"</span></td>
+	                                        <td><span>{name.clone()}</span><div class="note"><code>{algorithm_id.clone()}</code></div></td>
+	                                        <td class="num">{String::from("—")}</td>
+	                                        <td class="num">{String::from("—")}</td>
+	                                        <td><span class="note">{format!("error: {error}")}</span></td>
+	                                    </tr>
+	                                },
+	                            };
+	
+	                            let rows = report
+	                                .entries
+	                                .iter()
+	                                .map(|entry| match entry {
+	                                    AscentCompareAlgorithmEntry::Ok {
+	                                        algorithm_id,
+	                                        name,
+	                                        total_gain_m,
+	                                        delta_total_gain_m,
+	                                        ..
+	                                    } => view! {
+	                                        <tr>
+	                                            <td></td>
+	                                            <td><span>{name.clone()}</span><div class="note"><code>{algorithm_id.clone()}</code></div></td>
+	                                            <td class="num">{format!("{:.1}", total_gain_m)}</td>
+	                                            <td class="num">{format!("{:.1}", delta_total_gain_m)}</td>
+	                                            <td><span class="note">{String::from("ok")}</span></td>
+	                                        </tr>
+	                                    },
+	                                    AscentCompareAlgorithmEntry::Error {
+	                                        algorithm_id,
+	                                        name,
+	                                        error,
+	                                    } => view! {
+	                                        <tr>
+	                                            <td></td>
+	                                            <td><span>{name.clone()}</span><div class="note"><code>{algorithm_id.clone()}</code></div></td>
+	                                            <td class="num">{String::from("—")}</td>
+	                                            <td class="num">{String::from("—")}</td>
+	                                            <td><span class="note">{format!("error: {error}")}</span></td>
+	                                        </tr>
+	                                    },
+	                                })
+	                                .collect_view();
+	
+	                            view! {
+	                                <div class="algo-results">
+	                                    <table>
+	                                        <thead>
+	                                            <tr>
+	                                                <th></th>
+	                                                <th>"Algorithm"</th>
+	                                                <th class="num">"Gain (m)"</th>
+	                                                <th class="num">"Δ vs baseline (m)"</th>
+	                                                <th>"Status"</th>
+	                                            </tr>
+	                                        </thead>
+	                                        <tbody>
+	                                            {baseline_row}
+	                                            {rows}
+	                                        </tbody>
+	                                    </table>
+	                                </div>
+	                            }
+	                        })}
+	                    </Show>
+	                </section>
+	            </Show>
             <section class="files">
                 <p class="note">{"Source: "}{move || diag_source.get()} {" • Span: "}{move || fmt_hms(diag_span_s.get())} {" • Total gain: "}{move || format!("{:.1} m", diag_gain_m.get())}</p>
                 <p class="note">"Nothing leaves your device. All processing happens locally in your browser."</p>
@@ -1346,7 +1739,7 @@ pub fn App() -> impl IntoView {
             <section class="files">
                 <h3>"About & Help"</h3>
                 <p class="note">
-                    "Upload one or more FIT or GPX files. Choose a data source (auto/runn/altitude) and whether to compute the exact per-second curve (All windows) or the default exhaustive grid. Optionally set step and max duration, then use the chart controls to switch between combined/climb/rate hillclimb views and time/rate gain plots. Overlays for world records, personal goals, sessions, and magic markers can be toggled individually. Use the links below to download CSVs."
+                    "Upload one or more FIT or GPX files. Choose a data source (auto/runn/altitude) and whether to compute the exact per-second curve (All windows) or the default exhaustive grid. Optionally set step and max duration, then use the chart controls to switch between combined/climb/rate hillclimb views and time/rate gain plots. Overlays for world records, personal goals, sessions, and magic markers can be toggled individually. Enable Algorithm Lab to compare ascent algorithms side-by-side. Use the links below to download CSVs."
                 </p>
                 <p class="note">
                     "Tips: If a file fails to parse, it will be skipped and noted in the status line. EXPENSIVE modes on very long activities can take time—prefer Max duration and modest Step when experimenting."

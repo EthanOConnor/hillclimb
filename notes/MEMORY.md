@@ -88,3 +88,10 @@ Notes:
   - `hc_curve_cli ascent compare … --json` (baseline + multi-algorithm report with per-algorithm totals, per-duration curve deltas, and diagnostics)
 
 Rationale: provides a deterministic, scriptable comparison entrypoint for research and regression harnesses before the web UI is fully productized.
+
+### Algorithm Lab web UI surface
+- WASM web app exposes an “Algorithm Lab” mode (toggle) that runs `compute_ascent_compare` locally and shows:
+  - baseline selection + multi-select algorithms
+  - overlay plot + results table (totals + deltas)
+
+Rationale: gives PM/Design a concrete comparison UX to iterate on while we expand the algorithm catalog and explainability layer.

@@ -35,6 +35,11 @@
       .downloads { margin-top: 8px; display: flex; gap: 12px; }
       .downloads a { color: var(--accent); text-decoration: none; font-weight: 600; }
       .note { color: var(--muted); font-size: 13px; }
+      .algo-choice { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; background: var(--panel); margin: 8px 0; }
+      .algo-choice label { display: flex; flex-wrap: wrap; gap: 10px; align-items: baseline; }
+      .algo-results table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+      .algo-results th, .algo-results td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+      .algo-results th.num, .algo-results td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
       @media (min-width: 980px) {
         .plots { grid-template-columns: 1fr 1fr; }
