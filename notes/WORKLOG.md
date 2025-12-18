@@ -97,3 +97,6 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 ## 2025‑12‑18 – FIT parsing strategy + JSON output versioning
 - Added `docs/fit_parsing_strategy.md` documenting the Rust-only canonical parsing decision and the Python `python-fitparse` vs `fitdecode` recommendation.
 - Added `schema_version` and `parser` metadata to JSON sidecars (Python + Rust) to prevent silent ingestion/output drift as dependencies evolve.
+
+## 2025‑12‑18 – Personas + defaults
+- Added `docs/personas_defaults.md` defining primary personas (treadmill vs outdoor), recommended defaults, and user-facing copy for session gaps and idle detection.

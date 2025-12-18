@@ -41,7 +41,7 @@ See also: `docs/REVIEW_2025-12-18.md` (comprehensive handoff + decisions).
     - Python parser abstraction added and `fitdecode` evaluated as replacement default.
   - Acceptance: no silent behavior changes without a versioned output note in JSON.
 
-- [ ] **(PM/Product)** Personas + defaults + “what counts as ascent”
+- [x] **(PM/Product)** Personas + defaults + “what counts as ascent”
   - Acceptance: short doc defining primary personas (treadmill incline vs outdoor) and default settings per persona.
   - Acceptance: explicitly define the product stance on “session gaps” and “idle” in UI copy.
 
