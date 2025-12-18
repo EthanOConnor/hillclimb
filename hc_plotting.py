@@ -13,6 +13,7 @@ from hc_curve import (
     _convert_gain,
     _format_gain,
     _fmt_duration_label,
+    _interpolate_gain_time,
 )
 
 

@@ -96,3 +96,9 @@ Rationale: provides a deterministic, scriptable comparison entrypoint for resear
   - overlay plot + results table (totals + deltas)
 
 Rationale: gives PM/Design a concrete comparison UX to iterate on while we expand the algorithm catalog and explainability layer.
+
+### Python wrapper milestone (subprocess bridge)
+- Python CLI `hc_cli.py` now supports `--core python|rust` for `curve` and `time` (default remains `python` for now); `--core rust` delegates parsing + compute to the Rust CLI (`hc_curve_cli`) and reuses the existing Python CSV/Matplotlib outputs for continuity.
+- Rust CLI discovery order: `--rust-cli` path → `HC_RUST_CLI` env var → newest local build under `hc_curve_rs/target/{debug,release}/hc_curve_cli` → `cargo run -q --manifest-path hc_curve_rs/Cargo.toml -p hc_curve_cli --`.
+- Rust JSON sometimes represents non-finite gain-time values as `null`; the Python wrapper coerces these to `inf`/`nan` so downstream code can keep using `math.isfinite` checks.
+- Known minor delta: Python plots no longer shade inactivity gaps when using `--core rust` (Rust curve JSON doesn’t currently export inactivity gap ranges).

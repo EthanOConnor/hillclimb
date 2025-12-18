@@ -33,6 +33,9 @@ Examples (recommended):
 # Single file (fixed durations)
 .venv/bin/python hc_curve.py curve activity.fit -o curve.csv -d 60 120 300 600 1200 1800 3600 --split-plots --goal-min-seconds 120 --personal-min-seconds 60
 
+# Use the Rust core for parsing/compute (Python still writes CSV + Matplotlib plots)
+.venv/bin/python hc_curve.py curve Tracklogs/Treadmill/*.fit -o curve.csv --core rust
+
 # Multiple files merged (overlaps handled)
 .venv/bin/python hc_curve.py curve Tracklogs/Treadmill/file1.fit Tracklogs/Treadmill/file2.fit -o curve.csv -d 60 120 300 600 1200 1800 3600 --split-plots --goal-min-seconds 120 --personal-min-seconds 60
 
@@ -54,6 +57,8 @@ Examples (recommended):
 
 Options:
 - `--output, -o`: Output CSV path (default: `curve.csv`).
+- `--core`: Select core implementation for `curve`/`time`: `python` (default) or `rust` (delegates to `hc_curve_cli` via subprocess).
+- `--rust-cli`: Optional path to the Rust `hc_curve_cli` binary (otherwise uses the newest repo build under `hc_curve_rs/target/...` or falls back to `cargo run`). You can also set `HC_RUST_CLI`.
 - `--json/--no-json`: Write a JSON sidecar next to the CSV (same basename, `.json`) containing metadata and the computed curves.
 - `--clear-cache`: Clear the parsed FIT cache (`.cache/parsed_fit`) before running.
 - `--durations, -d`: Durations in seconds (default: 60, 120, 300, 600, 1200, 1800, 3600).

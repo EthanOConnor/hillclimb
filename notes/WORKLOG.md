@@ -127,3 +127,8 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 ## 2025‑12‑18 – Benchmark harness (`ascent bench`)
 - Added `hc_curve_cli ascent bench` to run ascent algorithm comparisons across many activities and write a summary-only JSON report (no raw series).
 - Bench output includes per-algorithm delta distributions vs a baseline (use baseline=`hc.source.runn_incline.v1` to compare treadmill incline integration vs altitude totals).
+
+## 2025‑12‑18 – Python CLI Rust-core wrapper (P1 milestone)
+- Added `--core python|rust` (plus `--rust-cli` / `HC_RUST_CLI`) to the Python `curve` and `time` commands so the Python CLI can delegate parsing + compute to the Rust CLI (`hc_curve_cli`) while keeping the existing CSV schema and Matplotlib plots.
+- Implemented subprocess execution + JSON parsing for curve/gain-time, including resample guardrail alignment (`--raw-sampling` mapping) and robust handling of Rust JSON `null` for non-finite gain-time times.
+- Fixed a plotting bug: `hc_plotting.py` now imports `_interpolate_gain_time` from `hc_curve` (was a NameError when plotting gain-time).

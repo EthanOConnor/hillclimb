@@ -3,6 +3,12 @@ from __future__ import annotations
 # CLI orchestration for hillclimb. Most heavy lifting lives in hc_curve (core)
 # and hc_plotting (matplotlib).
 
+from enum import Enum
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
 from hc_curve import *  # type: ignore
 from hc_curve import (
     _StageProfiler,
@@ -20,6 +26,7 @@ from hc_curve import (
     _is_uniform_1hz,
     _load_activity_series,
     _load_gain_tokens_from_file,
+    _normalize_source_label,
     _parse_gain_list,
     _parse_gain_token,
     _require_dependency,
@@ -47,6 +54,855 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_DURATIONS = [60, 120, 300, 600, 1200, 1800, 3600]
+
+
+class CoreBackend(str, Enum):
+    python = "python"
+    rust = "rust"
+
+
+def _resolve_hc_curve_cli_cmd(rust_cli: Optional[str]) -> List[str]:
+    """Resolve a runnable Rust CLI invocation (binary path or cargo run fallback)."""
+    if rust_cli:
+        path = Path(rust_cli).expanduser()
+        if path.is_file():
+            return [str(path)]
+        raise RuntimeError(f"Rust CLI not found at: {path}")
+
+    env_path = os.environ.get("HC_RUST_CLI")
+    if env_path:
+        path = Path(env_path).expanduser()
+        if path.is_file():
+            return [str(path)]
+        raise RuntimeError(f"HC_RUST_CLI points to missing file: {path}")
+
+    repo_candidates = [
+        Path("hc_curve_rs/target/release/hc_curve_cli"),
+        Path("hc_curve_rs/target/debug/hc_curve_cli"),
+    ]
+    built = [p for p in repo_candidates if p.is_file()]
+    if built:
+        newest = max(built, key=lambda p: p.stat().st_mtime)
+        return [str(newest)]
+
+    cargo = shutil.which("cargo")
+    if cargo:
+        return [
+            cargo,
+            "run",
+            "-q",
+            "--manifest-path",
+            "hc_curve_rs/Cargo.toml",
+            "-p",
+            "hc_curve_cli",
+            "--",
+        ]
+
+    raise RuntimeError(
+        "Unable to locate the Rust CLI (hc_curve_cli). Build it with "
+        "`cargo build -p hc_curve_cli --manifest-path hc_curve_rs/Cargo.toml` "
+        "or pass `--rust-cli` / set `HC_RUST_CLI`."
+    )
+
+
+def _run_rust_cli(cmd_prefix: List[str], args: List[str], *, verbose: bool) -> None:
+    proc = subprocess.run(
+        cmd_prefix + args,
+        capture_output=True,
+        text=True,
+    )
+    if verbose and (proc.stdout or proc.stderr):
+        if proc.stdout:
+            logging.info("[rust stdout]\n%s", proc.stdout.rstrip())
+        if proc.stderr:
+            logging.info("[rust stderr]\n%s", proc.stderr.rstrip())
+    if proc.returncode != 0:
+        details = proc.stderr.strip() or proc.stdout.strip() or "(no output)"
+        raise RuntimeError(f"Rust CLI failed (exit {proc.returncode}):\n{details}")
+
+
+def _parse_rust_curve_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    meta = payload.get("meta")
+    curves = payload.get("curves")
+    if not isinstance(meta, dict) or not isinstance(curves, dict):
+        raise RuntimeError("Rust curve JSON missing required top-level keys: meta/curves")
+    return meta, curves
+
+
+def _parse_rust_gain_time_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    meta = payload.get("meta")
+    gain_time = payload.get("gain_time")
+    if not isinstance(meta, dict) or not isinstance(gain_time, dict):
+        raise RuntimeError("Rust gain-time JSON missing required top-level keys: meta/gain_time")
+    return meta, gain_time
+
+
+def _coerce_float(value: Any, *, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _coerce_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _coerce_gain_time_point(data: Dict[str, Any]) -> GainTimePoint:
+    note_val = data.get("note")
+    note: Optional[str]
+    if note_val is None:
+        note = None
+    else:
+        note = str(note_val)
+
+    return GainTimePoint(
+        gain_m=_coerce_float(data.get("gain_m"), default=0.0),
+        # Rust JSON may represent non-finite values as null; keep Python semantics (inf => unachievable)
+        min_time_s=_coerce_float(data.get("min_time_s"), default=float("inf")),
+        avg_rate_m_per_hr=_coerce_float(data.get("avg_rate_m_per_hr"), default=float("nan")),
+        start_offset_s=_coerce_optional_float(data.get("start_offset_s")),
+        end_offset_s=_coerce_optional_float(data.get("end_offset_s")),
+        note=note,
+    )
+
+
+def _run_rust_curve(
+    fit_files: List[str],
+    output: str,
+    durations: List[int],
+    source: str,
+    verbose: bool,
+    *,
+    rust_cli: Optional[str] = None,
+    png: Optional[str] = None,
+    no_plot: bool = False,
+    exhaustive: bool = False,
+    step_s: int = 1,
+    max_duration_s: Optional[int] = None,
+    log_file: Optional[str] = None,
+    merge_eps_sec: float = 0.5,
+    overlap_policy: str = "file:last",
+    resample_1hz: bool = False,
+    resample_max_gap_sec: float = DEFAULT_RESAMPLE_MAX_GAP_SEC,
+    resample_max_points: int = DEFAULT_RESAMPLE_MAX_POINTS,
+    parse_workers: int = 0,
+    gain_eps: float = 0.5,
+    smooth_sec: float = 0.0,
+    session_gap_sec: float = 600.0,
+    all_windows: bool = False,
+    wr_profile: str = "overall",
+    wr_anchors_path: Optional[str] = None,
+    wr_min_seconds: float = 30.0,
+    wr_short_cap: str = "standard",
+    magic: Optional[str] = None,
+    plot_wr: bool = False,
+    plot_personal: bool = True,
+    goals_topk: int = 3,
+    score_output: Optional[str] = None,
+    split_plots: bool = True,
+    ylog_rate: bool = False,
+    ylog_climb: bool = False,
+    goal_min_seconds: float = 120.0,
+    personal_min_seconds: float = 60.0,
+    qc_enabled: bool = True,
+    qc_spec_path: Optional[str] = None,
+    concave_envelope: bool = True,
+    engine: str = "auto",
+    profile: bool = False,
+    fast_plot: bool = True,
+    json_sidecar: bool = False,
+    clear_cache: bool = False,
+) -> int:
+    _setup_logging(verbose, log_file=log_file)
+
+    # parse_workers is a Python parsing knob; ignore for Rust core
+    _ = parse_workers
+
+    if clear_cache:
+        _clear_parsed_fit_cache()
+
+    profiler = _StageProfiler(profile)
+    engine_mode = _resolve_engine(engine)
+
+    cmd_prefix = _resolve_hc_curve_cli_cmd(rust_cli)
+
+    with tempfile.TemporaryDirectory(prefix="hc_rust_curve_") as tmp_dir:
+        tmp_csv = os.path.join(tmp_dir, "curve.csv")
+        tmp_json = os.path.join(tmp_dir, "curve.json")
+
+        rust_args: List[str] = [
+            "curve",
+            "--output",
+            tmp_csv,
+            "--json",
+            "--no-plot",
+            "--source",
+            source,
+            "--session-gap",
+            str(session_gap_sec),
+            "--merge-eps",
+            str(merge_eps_sec),
+            "--overlap-policy",
+            overlap_policy,
+            "--resample-max-gap-sec",
+            str(resample_max_gap_sec),
+            "--resample-max-points",
+            str(resample_max_points),
+            "--gain-eps",
+            str(gain_eps),
+            "--smooth",
+            str(smooth_sec),
+            "--wr-profile",
+            wr_profile,
+            "--wr-min-seconds",
+            str(wr_min_seconds),
+            "--wr-short-cap",
+            wr_short_cap,
+            "--goals-topk",
+            str(goals_topk),
+            "--goal-min-seconds",
+            str(goal_min_seconds),
+            "--personal-min-seconds",
+            str(personal_min_seconds),
+            "--engine",
+            engine_mode,
+            "--step",
+            str(max(step_s, 1)),
+        ]
+
+        if clear_cache:
+            rust_args.append("--clear-cache")
+        if verbose:
+            rust_args.append("--verbose")
+        if profile:
+            rust_args.append("--profile")
+        if score_output:
+            rust_args.extend(["--score-output", score_output])
+        if wr_anchors_path:
+            rust_args.extend(["--wr-anchors", wr_anchors_path])
+        if qc_spec_path:
+            rust_args.extend(["--qc-spec", qc_spec_path])
+        if not qc_enabled:
+            rust_args.append("--no-qc")
+        if all_windows:
+            rust_args.append("--all")
+        if exhaustive:
+            rust_args.append("--exhaustive")
+        if max_duration_s is not None:
+            rust_args.extend(["--max-duration", str(max_duration_s)])
+        if magic:
+            rust_args.extend(["--magic", magic])
+        if not concave_envelope:
+            rust_args.append("--no-concave-envelope")
+
+        if not all_windows and not exhaustive:
+            base_durations = sorted({int(d) for d in durations if isinstance(d, int) and d > 0})
+            if base_durations and base_durations != sorted(DEFAULT_DURATIONS):
+                rust_args.extend(["--durations", ",".join(str(d) for d in base_durations)])
+
+        # Rust CLI defaults to resample_1hz=true unless --raw-sampling is set.
+        rust_raw_sampling = not resample_1hz
+        # Python all-windows path resamples to 1 Hz when needed; keep Rust aligned.
+        if all_windows:
+            rust_raw_sampling = False
+        if rust_raw_sampling:
+            rust_args.append("--raw-sampling")
+
+        rust_args.extend(list(fit_files))
+
+        try:
+            _run_rust_cli(cmd_prefix, rust_args, verbose=verbose)
+        except Exception as exc:
+            logging.error(str(exc))
+            return 2
+
+        profiler.lap("rust-core")
+
+        try:
+            payload = json.loads(Path(tmp_json).read_text(encoding="utf-8"))
+        except Exception as exc:
+            logging.error("Failed to read Rust JSON report: %s", exc)
+            return 2
+
+    try:
+        meta_rust, curves_rust = _parse_rust_curve_payload(payload)
+        points_raw = curves_rust.get("points")
+        if not isinstance(points_raw, list):
+            raise RuntimeError("Rust curves.points is missing or not a list")
+        curve: List[CurvePoint] = [CurvePoint(**pt) for pt in points_raw]
+    except Exception as exc:
+        logging.error("Failed to parse Rust curve report: %s", exc)
+        return 2
+
+    if not curve:
+        logging.error("Unable to compute curve for requested durations.")
+        return 2
+
+    selected_raw = str(curves_rust.get("selected_source") or meta_rust.get("selected_source") or "mixed")
+    selected_label = _normalize_source_label(selected_raw)
+
+    full_span_seconds = float(meta_rust.get("total_span_s") or 0.0)
+    total_gain_m = float(meta_rust.get("total_gain_m") or 0.0)
+    duration_grid = [cp.duration_s for cp in curve]
+
+    # Extract overlay curves/metadata
+    def _maybe_curve_tuple(value: Any) -> Optional[Tuple[List[int], List[float]]]:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)) and len(value) == 2 and isinstance(value[0], list) and isinstance(value[1], list):
+            return ([int(x) for x in value[0]], [float(y) for y in value[1]])
+        return None
+
+    wr_curve = _maybe_curve_tuple(curves_rust.get("wr_curve"))
+    wr_rates_env = curves_rust.get("wr_rates") if isinstance(curves_rust.get("wr_rates"), list) else None
+    personal_curve = _maybe_curve_tuple(curves_rust.get("personal_curve"))
+    goal_curve = _maybe_curve_tuple(curves_rust.get("goal_curve"))
+    envelope_curve = _maybe_curve_tuple(curves_rust.get("envelope_curve"))
+    magic_rows = curves_rust.get("magic_rows") if isinstance(curves_rust.get("magic_rows"), list) else None
+    session_curves_raw = curves_rust.get("session_curves")
+    session_curves: Optional[List[Dict[str, Any]]]
+    if isinstance(session_curves_raw, list) and len(session_curves_raw) > 1:
+        session_curves = [dict(item) for item in session_curves_raw if isinstance(item, dict)]
+    else:
+        session_curves = None
+
+    # Write CSV (keep Python schema for compatibility)
+    fieldnames = [
+        "duration_s",
+        "max_climb_m",
+        "climb_rate_m_per_hr",
+        "start_offset_s",
+        "end_offset_s",
+        "source",
+        "wr_climb_m",
+        "wr_rate_m_per_hr",
+    ]
+
+    wr_gain_arr: Optional[np.ndarray] = None
+    if wr_curve and wr_curve[0] and wr_curve[1]:
+        wr_durs_arr = np.asarray(wr_curve[0], dtype=np.float64)
+        wr_climbs_arr = np.asarray(wr_curve[1], dtype=np.float64)
+        cp_durations = np.asarray([cp.duration_s for cp in curve], dtype=np.float64)
+        wr_gain_arr = np.interp(
+            cp_durations,
+            wr_durs_arr,
+            wr_climbs_arr,
+            left=wr_climbs_arr[0],
+            right=wr_climbs_arr[-1],
+        )
+
+    with open(output, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(fieldnames)
+        rows_out: List[List[Any]] = []
+        for idx, cp in enumerate(curve):
+            wr_gain_val: Optional[float] = None
+            if wr_gain_arr is not None and idx < wr_gain_arr.size:
+                val = float(wr_gain_arr[idx])
+                if math.isfinite(val):
+                    wr_gain_val = val
+            wr_rate_val: Optional[float] = None
+            if wr_gain_val is not None and cp.duration_s > 0:
+                wr_rate_val = wr_gain_val / cp.duration_s * 3600.0
+            rows_out.append([
+                cp.duration_s,
+                round(cp.max_climb_m, 3),
+                round(cp.climb_rate_m_per_hr, 3),
+                round(cp.start_offset_s, 3),
+                round(cp.end_offset_s, 3),
+                selected_raw,
+                round(wr_gain_val, 3) if isinstance(wr_gain_val, float) else None,
+                round(wr_rate_val, 3) if isinstance(wr_rate_val, float) else None,
+            ])
+        writer.writerows(rows_out)
+
+    logging.info("Wrote: %s", output)
+    profiler.lap("csv")
+
+    if json_sidecar:
+        json_path = output[:-4] + ".json" if output.lower().endswith(".csv") else output + ".json"
+        try:
+            parser_meta = meta_rust.get("parser") if isinstance(meta_rust.get("parser"), dict) else {"name": "fitparser"}
+            parser_meta = dict(parser_meta)
+            parser_meta.setdefault("version", None)
+            parser_meta.setdefault("module", "fitparser")
+            meta = {
+                "schema_version": JSON_REPORT_SCHEMA_VERSION,
+                "command": "curve",
+                "inputs": list(fit_files),
+                "output_csv": output,
+                "selected_source": selected_label,
+                "selected_raw": selected_raw,
+                "used_sources": [selected_raw] if selected_raw != "mixed" else ["mixed"],
+                "n_samples": int(meta_rust.get("n_samples") or 0),
+                "full_span_s": full_span_seconds,
+                "total_gain_m": total_gain_m,
+                "engine": engine_mode,
+                "parser": parser_meta,
+                "params": {
+                    "durations_s": duration_grid,
+                    "exhaustive": exhaustive,
+                    "all_windows": all_windows,
+                    "step_s": step_s,
+                    "max_duration_s": max_duration_s,
+                    "resample_1hz": resample_1hz,
+                    "resample_max_gap_sec": resample_max_gap_sec,
+                    "resample_max_points": resample_max_points,
+                    "parse_workers": parse_workers,
+                    "gain_eps": gain_eps,
+                    "smooth_sec": smooth_sec,
+                    "session_gap_sec": session_gap_sec,
+                    "qc_enabled": qc_enabled,
+                    "qc_spec_path": qc_spec_path,
+                    "merge_eps_sec": merge_eps_sec,
+                    "overlap_policy": overlap_policy,
+                    "concave_envelope": concave_envelope,
+                    "wr_profile": wr_profile,
+                    "wr_min_seconds": wr_min_seconds,
+                    "wr_short_cap": wr_short_cap,
+                    "plot_wr": plot_wr,
+                    "plot_personal": plot_personal,
+                    "split_plots": split_plots,
+                    "ylog_rate": ylog_rate,
+                    "ylog_climb": ylog_climb,
+                    "goal_min_seconds": goal_min_seconds,
+                    "personal_min_seconds": personal_min_seconds,
+                    "fast_plot": fast_plot,
+                },
+            }
+            data = {
+                "points": [cp.__dict__ for cp in curve],
+                "wr_curve": wr_curve,
+                "wr_rates": wr_rates_env,
+                "personal_curve": personal_curve,
+                "goal_curve": goal_curve,
+                "magic_rows": magic_rows,
+                "envelope_curve": envelope_curve,
+                "session_curves": session_curves,
+            }
+            with open(json_path, "w", encoding="utf-8") as jf:
+                json.dump({"meta": meta, "curves": data}, jf, indent=2)
+            logging.info("Wrote JSON: %s", json_path)
+        except Exception as exc:
+            logging.warning("Failed to write JSON sidecar: %s", exc)
+
+    if not no_plot:
+        png_path = png
+        if png_path is None:
+            if output.lower().endswith(".csv"):
+                png_path = output[:-4] + ".png"
+            else:
+                png_path = output + ".png"
+        try:
+            if split_plots:
+                _plot_split(
+                    curve,
+                    png_path,
+                    selected_label,
+                    wr_curve=wr_curve if plot_wr else None,
+                    wr_rates=wr_rates_env if plot_wr else None,
+                    personal_curve=personal_curve if plot_personal else None,
+                    goal_curve=goal_curve,
+                    magic_rows=magic_rows,
+                    goals_topk=goals_topk,
+                    show_wr=plot_wr,
+                    show_personal=plot_personal,
+                    ylog_rate=ylog_rate,
+                    ylog_climb=ylog_climb,
+                    goal_min_seconds=goal_min_seconds,
+                    inactivity_gaps=None,
+                    full_span_seconds=full_span_seconds,
+                    session_curves=session_curves,
+                    envelope_curve=envelope_curve,
+                    fast_plot=fast_plot,
+                )
+                logging.info("Wrote plots: %s", png_path)
+            else:
+                _plot_curve(
+                    curve,
+                    png_path,
+                    selected_label,
+                    wr_curve=wr_curve if plot_wr else None,
+                    wr_rates=wr_rates_env if plot_wr else None,
+                    personal_curve=personal_curve if plot_personal else None,
+                    magic_rows=magic_rows,
+                    goals_topk=goals_topk,
+                    show_wr=plot_wr,
+                    show_personal=plot_personal,
+                    inactivity_gaps=None,
+                    full_span_seconds=full_span_seconds,
+                    session_curves=session_curves,
+                    envelope_curve=envelope_curve,
+                    fast_plot=fast_plot,
+                )
+                logging.info("Wrote plot: %s", png_path)
+        except Exception as exc:
+            logging.error("Plotting failed: %s", exc)
+
+    profiler.lap("plot")
+    return 0
+
+
+def _run_rust_gain_time(
+    fit_files: List[str],
+    output: str,
+    gains: List[str],
+    source: str,
+    verbose: bool,
+    *,
+    rust_cli: Optional[str] = None,
+    png: Optional[str] = None,
+    no_plot: bool = False,
+    all_windows: bool = True,
+    exhaustive: bool = False,
+    step_s: int = 1,
+    max_duration_s: Optional[int] = None,
+    log_file: Optional[str] = None,
+    merge_eps_sec: float = 0.5,
+    overlap_policy: str = "file:last",
+    resample_1hz: bool = False,
+    resample_max_gap_sec: float = DEFAULT_RESAMPLE_MAX_GAP_SEC,
+    resample_max_points: int = DEFAULT_RESAMPLE_MAX_POINTS,
+    parse_workers: int = 0,
+    gain_eps: float = 0.5,
+    smooth_sec: float = 0.0,
+    session_gap_sec: float = 600.0,
+    qc_enabled: bool = True,
+    qc_spec_path: Optional[str] = None,
+    wr_profile: str = "overall",
+    wr_anchors_path: Optional[str] = None,
+    wr_min_seconds: float = 30.0,
+    wr_short_cap: str = "standard",
+    plot_wr: bool = False,
+    plot_personal: bool = True,
+    split_plots: bool = True,
+    fast_plot: bool = True,
+    magic_gains: Optional[str] = DEFAULT_MAGIC_GAINS,
+    goals_topk: int = 3,
+    profile: bool = False,
+    gain_units: str = "m",
+    iso_rates: Sequence[float] = ISO_RATE_GUIDES,
+    engine: str = "auto",
+    concave_envelope: bool = True,
+    ylog_time: bool = False,
+    json_sidecar: bool = False,
+    clear_cache: bool = False,
+) -> int:
+    _setup_logging(verbose, log_file=log_file)
+
+    # parse_workers is a Python parsing knob; ignore for Rust core
+    _ = parse_workers
+    _ = goals_topk  # reserved in Python output, no Rust equivalent needed
+
+    if clear_cache:
+        _clear_parsed_fit_cache()
+
+    profiler = _StageProfiler(profile)
+    engine_mode = _resolve_engine(engine)
+
+    cmd_prefix = _resolve_hc_curve_cli_cmd(rust_cli)
+
+    with tempfile.TemporaryDirectory(prefix="hc_rust_gain_time_") as tmp_dir:
+        tmp_csv = os.path.join(tmp_dir, "gain_time.csv")
+        tmp_json = os.path.join(tmp_dir, "gain_time.json")
+
+        rust_args: List[str] = [
+            "gain-time",
+            "--output",
+            tmp_csv,
+            "--json",
+            "--no-plot",
+            "--source",
+            source,
+            "--session-gap",
+            str(session_gap_sec),
+            "--merge-eps",
+            str(merge_eps_sec),
+            "--overlap-policy",
+            overlap_policy,
+            "--resample-max-gap-sec",
+            str(resample_max_gap_sec),
+            "--resample-max-points",
+            str(resample_max_points),
+            "--gain-eps",
+            str(gain_eps),
+            "--smooth",
+            str(smooth_sec),
+            "--wr-profile",
+            wr_profile,
+            "--wr-min-seconds",
+            str(wr_min_seconds),
+            "--wr-short-cap",
+            wr_short_cap,
+            "--engine",
+            engine_mode,
+            "--step",
+            str(max(step_s, 1)),
+            "--gain-units",
+            gain_units,
+        ]
+
+        if clear_cache:
+            rust_args.append("--clear-cache")
+        if verbose:
+            rust_args.append("--verbose")
+        if profile:
+            rust_args.append("--profile")
+        if wr_anchors_path:
+            rust_args.extend(["--wr-anchors", wr_anchors_path])
+        if qc_spec_path:
+            rust_args.extend(["--qc-spec", qc_spec_path])
+        if not qc_enabled:
+            rust_args.append("--no-qc")
+        if all_windows:
+            rust_args.append("--all")
+        if exhaustive:
+            rust_args.append("--exhaustive")
+        if max_duration_s is not None:
+            rust_args.extend(["--max-duration", str(max_duration_s)])
+        if not concave_envelope:
+            rust_args.append("--no-concave-envelope")
+        if magic_gains:
+            rust_args.extend(["--magic-gains", magic_gains])
+
+        rust_raw_sampling = not resample_1hz
+        if all_windows:
+            rust_raw_sampling = False
+        if rust_raw_sampling:
+            rust_args.append("--raw-sampling")
+
+        if gains:
+            rust_args.extend(["--gains", ",".join(gains)])
+
+        rust_args.extend(list(fit_files))
+
+        try:
+            _run_rust_cli(cmd_prefix, rust_args, verbose=verbose)
+        except Exception as exc:
+            logging.error(str(exc))
+            return 2
+
+        profiler.lap("rust-core")
+
+        try:
+            payload = json.loads(Path(tmp_json).read_text(encoding="utf-8"))
+        except Exception as exc:
+            logging.error("Failed to read Rust JSON report: %s", exc)
+            return 2
+
+    try:
+        meta_rust, gt_rust = _parse_rust_gain_time_payload(payload)
+        curve_raw = gt_rust.get("curve")
+        targets_raw = gt_rust.get("targets")
+        if not isinstance(curve_raw, list) or not isinstance(targets_raw, list):
+            raise RuntimeError("Rust gain_time.curve/targets missing or not lists")
+        curve_points: List[GainTimePoint] = [
+            _coerce_gain_time_point(pt) for pt in curve_raw if isinstance(pt, dict)
+        ]
+        merged_points: List[GainTimePoint] = [
+            _coerce_gain_time_point(pt) for pt in targets_raw if isinstance(pt, dict)
+        ]
+    except Exception as exc:
+        logging.error("Failed to parse Rust gain-time report: %s", exc)
+        return 2
+
+    selected_raw = str(gt_rust.get("selected_source") or meta_rust.get("selected_source") or "mixed")
+    selected_label = _normalize_source_label(selected_raw)
+    full_span_seconds = float(gt_rust.get("total_span_s") or meta_rust.get("total_span_s") or 0.0)
+    total_gain_m = float(gt_rust.get("total_gain_m") or meta_rust.get("total_gain_m") or 0.0)
+
+    gain_curve = GainTimeCurve(points=curve_points, source_label=selected_label, total_span_s=full_span_seconds)
+
+    wr_gain_curve: Optional[GainTimeCurve] = None
+    wr_curve_raw = gt_rust.get("wr_curve")
+    if isinstance(wr_curve_raw, list):
+        wr_gain_curve = GainTimeCurve(
+            points=[_coerce_gain_time_point(pt) for pt in wr_curve_raw if isinstance(pt, dict)],
+            source_label="WR",
+            total_span_s=full_span_seconds,
+        )
+
+    personal_gain_curve: Optional[GainTimeCurve] = None
+    personal_curve_raw = gt_rust.get("personal_curve")
+    if isinstance(personal_curve_raw, list):
+        personal_gain_curve = GainTimeCurve(
+            points=[
+                _coerce_gain_time_point(pt) for pt in personal_curve_raw if isinstance(pt, dict)
+            ],
+            source_label="Personal",
+            total_span_s=full_span_seconds,
+        )
+
+    gain_unit_norm = gain_units.lower()
+    gain_label = "ft" if gain_unit_norm == "ft" else "m"
+    summary_lines = [f"Gain Time Report (source: {selected_raw})"]
+    total_gain_display = _format_gain(total_gain_m, gain_unit_norm)
+    for pt in merged_points:
+        gain_str = _format_gain(pt.gain_m, gain_unit_norm)
+        if not math.isfinite(pt.min_time_s) or pt.min_time_s <= 0:
+            summary_lines.append(f"- {gain_str}: unachievable (max gain {total_gain_display})")
+            continue
+        rate_str = _fmt_rate_mph(pt.avg_rate_m_per_hr)
+        window_start = _fmt_time_hms(pt.start_offset_s or 0.0)
+        window_end = _fmt_time_hms(pt.end_offset_s or 0.0)
+        note_suffix = f" [{pt.note}]" if pt.note else ""
+        summary_lines.append(
+            f"- {gain_str}: {_fmt_time_hms(pt.min_time_s)} ({rate_str}) window {window_start}–{window_end}{note_suffix}"
+        )
+
+    for line in summary_lines:
+        print(line)
+
+    fieldnames = [
+        "gain_m",
+        "min_time_s",
+        "avg_rate_m_per_hr",
+        "start_offset_s",
+        "end_offset_s",
+        "source",
+        "note",
+    ]
+    with open(output, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(fieldnames)
+        for pt in merged_points:
+            writer.writerow([
+                round(pt.gain_m, 3),
+                round(pt.min_time_s, 3) if math.isfinite(pt.min_time_s) else None,
+                round(pt.avg_rate_m_per_hr, 3) if math.isfinite(pt.avg_rate_m_per_hr) else None,
+                round(pt.start_offset_s, 3) if isinstance(pt.start_offset_s, (int, float)) and math.isfinite(pt.start_offset_s) else None,
+                round(pt.end_offset_s, 3) if isinstance(pt.end_offset_s, (int, float)) and math.isfinite(pt.end_offset_s) else None,
+                selected_raw,
+                pt.note or "",
+            ])
+
+    logging.info("Wrote: %s", output)
+    profiler.lap("csv")
+
+    if json_sidecar:
+        json_path = output[:-4] + ".json" if output.lower().endswith(".csv") else output + ".json"
+        try:
+            parser_meta = meta_rust.get("parser") if isinstance(meta_rust.get("parser"), dict) else {"name": "fitparser"}
+            parser_meta = dict(parser_meta)
+            parser_meta.setdefault("version", None)
+            parser_meta.setdefault("module", "fitparser")
+            meta = {
+                "schema_version": JSON_REPORT_SCHEMA_VERSION,
+                "command": "time",
+                "inputs": list(fit_files),
+                "output_csv": output,
+                "selected_source": selected_label,
+                "selected_raw": selected_raw,
+                "used_sources": [selected_raw] if selected_raw != "mixed" else ["mixed"],
+                "n_samples": int(meta_rust.get("n_samples") or 0),
+                "full_span_s": full_span_seconds,
+                "total_gain_m": total_gain_m,
+                "engine": engine_mode,
+                "parser": parser_meta,
+                "params": {
+                    "all_windows": all_windows,
+                    "exhaustive": exhaustive,
+                    "step_s": step_s,
+                    "max_duration_s": max_duration_s,
+                    "resample_1hz": resample_1hz,
+                    "resample_max_gap_sec": resample_max_gap_sec,
+                    "resample_max_points": resample_max_points,
+                    "parse_workers": parse_workers,
+                    "gain_eps": gain_eps,
+                    "smooth_sec": smooth_sec,
+                    "session_gap_sec": session_gap_sec,
+                    "qc_enabled": qc_enabled,
+                    "qc_spec_path": qc_spec_path,
+                    "merge_eps_sec": merge_eps_sec,
+                    "overlap_policy": overlap_policy,
+                    "wr_profile": wr_profile,
+                    "wr_min_seconds": wr_min_seconds,
+                    "wr_short_cap": wr_short_cap,
+                    "plot_wr": plot_wr,
+                    "plot_personal": plot_personal,
+                    "split_plots": split_plots,
+                    "fast_plot": fast_plot,
+                    "gain_units": gain_units,
+                    "magic_gains": magic_gains,
+                    "iso_rates": list(iso_rates),
+                    "concave_envelope": concave_envelope,
+                    "ylog_time": ylog_time,
+                },
+            }
+            data = {
+                "gain_curve": [pt.__dict__ for pt in gain_curve.points],
+                "targets": [pt.__dict__ for pt in merged_points],
+                "wr_curve": [pt.__dict__ for pt in wr_gain_curve.points] if wr_gain_curve else None,
+                "personal_curve": [pt.__dict__ for pt in personal_gain_curve.points] if personal_gain_curve else None,
+            }
+            with open(json_path, "w", encoding="utf-8") as jf:
+                json.dump({"meta": meta, "gain_time": data}, jf, indent=2)
+            logging.info("Wrote JSON: %s", json_path)
+        except Exception as exc:
+            logging.warning("Failed to write JSON sidecar: %s", exc)
+
+    if not no_plot:
+        png_path = png
+        if png_path is None:
+            if output.lower().endswith(".csv"):
+                png_path = output[:-4] + ".png"
+            else:
+                png_path = output + ".png"
+        gain_magic_values: List[float] = []
+        magic_tokens = magic_gains.split(",") if magic_gains else []
+        for token in magic_tokens:
+            val = _parse_gain_token(token, default_unit=gain_unit_norm)
+            if val is None or val <= 0:
+                continue
+            gain_magic_values.append(val)
+        gain_magic_values = sorted({round(val, 6) for val in gain_magic_values})
+        gain_magic = [float(val) for val in gain_magic_values]
+
+        if split_plots:
+            _plot_gain_time_split(
+                gain_curve,
+                png_path,
+                selected_label,
+                merged_points,
+                wr_curve=wr_gain_curve,
+                personal_curve=personal_gain_curve,
+                magic_gains=gain_magic,
+                show_wr=plot_wr,
+                show_personal=plot_personal,
+                unit=gain_label,
+                fast_plot=fast_plot,
+                iso_rates=iso_rates,
+                ylog_time=ylog_time,
+            )
+            logging.info("Wrote plots: %s", png_path)
+        else:
+            _plot_gain_time(
+                gain_curve,
+                png_path,
+                selected_label,
+                merged_points,
+                wr_curve=wr_gain_curve,
+                personal_curve=personal_gain_curve,
+                magic_gains=gain_magic,
+                show_wr=plot_wr,
+                show_personal=plot_personal,
+                unit=gain_label,
+                fast_plot=fast_plot,
+                iso_rates=iso_rates,
+                ylog_time=ylog_time,
+            )
+            logging.info("Wrote plot: %s", png_path)
+
+    profiler.lap("plot")
+    return 0
 
 
 def _run(
@@ -989,53 +1845,103 @@ def _build_typer_app():  # pragma: no cover
         fast_plot: bool = typer.Option(True, "--fast-plot/--no-fast-plot", help="Skip heavy plot annotations for faster rendering"),
         json_sidecar: bool = typer.Option(False, "--json/--no-json", help="Write JSON report next to the CSV"),
         clear_cache: bool = typer.Option(False, "--clear-cache", help="Clear parsed FIT cache before running"),
+        core: CoreBackend = typer.Option(CoreBackend.python, "--core", help="Compute core: python|rust", show_default=True),
+        rust_cli: Optional[str] = typer.Option(None, "--rust-cli", help="Optional path to Rust `hc_curve_cli` (env: HC_RUST_CLI)"),
     ) -> None:
         """Compute the critical hill climb rate curve and save to CSV."""
-        code = _run(
-            fit_files,
-            output,
-            durations,
-            source,
-            verbose,
-            png=png,
-            no_plot=no_plot,
-            exhaustive=exhaustive,
-            step_s=step_s,
-            max_duration_s=max_duration_s,
-            log_file=log_file,
-            merge_eps_sec=merge_eps_sec,
-            overlap_policy=overlap_policy,
-            resample_1hz=resample_1hz,
-            resample_max_gap_sec=resample_max_gap_sec,
-            resample_max_points=resample_max_points,
-            parse_workers=parse_workers,
-            gain_eps=gain_eps,
-            smooth_sec=smooth_sec,
-            session_gap_sec=session_gap_sec,
-            all_windows=all_windows,
-            wr_profile=wr_profile,
-            wr_anchors_path=wr_anchors,
-            wr_min_seconds=wr_min_seconds,
-            wr_short_cap=wr_short_cap,
-            magic=magic,
-            plot_wr=plot_wr,
-            plot_personal=plot_personal,
-            goals_topk=goals_topk,
-            score_output=score_output,
-            split_plots=split_plots,
-            ylog_rate=ylog_rate,
-            ylog_climb=ylog_climb,
-            goal_min_seconds=goal_min_seconds,
-            personal_min_seconds=personal_min_seconds,
-            qc_enabled=qc,
-            qc_spec_path=qc_spec,
-            concave_envelope=concave_envelope,
-            engine=engine,
-            profile=profile,
-            fast_plot=fast_plot,
-            json_sidecar=json_sidecar,
-            clear_cache=clear_cache,
-        )
+        if core == CoreBackend.rust:
+            code = _run_rust_curve(
+                fit_files,
+                output,
+                durations,
+                source,
+                verbose,
+                rust_cli=rust_cli,
+                png=png,
+                no_plot=no_plot,
+                exhaustive=exhaustive,
+                step_s=step_s,
+                max_duration_s=max_duration_s,
+                log_file=log_file,
+                merge_eps_sec=merge_eps_sec,
+                overlap_policy=overlap_policy,
+                resample_1hz=resample_1hz,
+                resample_max_gap_sec=resample_max_gap_sec,
+                resample_max_points=resample_max_points,
+                parse_workers=parse_workers,
+                gain_eps=gain_eps,
+                smooth_sec=smooth_sec,
+                session_gap_sec=session_gap_sec,
+                all_windows=all_windows,
+                wr_profile=wr_profile,
+                wr_anchors_path=wr_anchors,
+                wr_min_seconds=wr_min_seconds,
+                wr_short_cap=wr_short_cap,
+                magic=magic,
+                plot_wr=plot_wr,
+                plot_personal=plot_personal,
+                goals_topk=goals_topk,
+                score_output=score_output,
+                split_plots=split_plots,
+                ylog_rate=ylog_rate,
+                ylog_climb=ylog_climb,
+                goal_min_seconds=goal_min_seconds,
+                personal_min_seconds=personal_min_seconds,
+                qc_enabled=qc,
+                qc_spec_path=qc_spec,
+                concave_envelope=concave_envelope,
+                engine=engine,
+                profile=profile,
+                fast_plot=fast_plot,
+                json_sidecar=json_sidecar,
+                clear_cache=clear_cache,
+            )
+        else:
+            code = _run(
+                fit_files,
+                output,
+                durations,
+                source,
+                verbose,
+                png=png,
+                no_plot=no_plot,
+                exhaustive=exhaustive,
+                step_s=step_s,
+                max_duration_s=max_duration_s,
+                log_file=log_file,
+                merge_eps_sec=merge_eps_sec,
+                overlap_policy=overlap_policy,
+                resample_1hz=resample_1hz,
+                resample_max_gap_sec=resample_max_gap_sec,
+                resample_max_points=resample_max_points,
+                parse_workers=parse_workers,
+                gain_eps=gain_eps,
+                smooth_sec=smooth_sec,
+                session_gap_sec=session_gap_sec,
+                all_windows=all_windows,
+                wr_profile=wr_profile,
+                wr_anchors_path=wr_anchors,
+                wr_min_seconds=wr_min_seconds,
+                wr_short_cap=wr_short_cap,
+                magic=magic,
+                plot_wr=plot_wr,
+                plot_personal=plot_personal,
+                goals_topk=goals_topk,
+                score_output=score_output,
+                split_plots=split_plots,
+                ylog_rate=ylog_rate,
+                ylog_climb=ylog_climb,
+                goal_min_seconds=goal_min_seconds,
+                personal_min_seconds=personal_min_seconds,
+                qc_enabled=qc,
+                qc_spec_path=qc_spec,
+                concave_envelope=concave_envelope,
+                engine=engine,
+                profile=profile,
+                fast_plot=fast_plot,
+                json_sidecar=json_sidecar,
+                clear_cache=clear_cache,
+            )
         if code != 0:
             raise typer.Exit(code)
 
@@ -1105,9 +2011,9 @@ def _build_typer_app():  # pragma: no cover
         ylog_time: bool = typer.Option(False, "--ylog-time/--no-ylog-time", help="Use log scale for time axis"),
         json_sidecar: bool = typer.Option(False, "--json/--no-json", help="Write JSON report next to the CSV"),
         clear_cache: bool = typer.Option(False, "--clear-cache", help="Clear parsed FIT cache before running"),
+        core: CoreBackend = typer.Option(CoreBackend.python, "--core", help="Compute core: python|rust", show_default=True),
+        rust_cli: Optional[str] = typer.Option(None, "--rust-cli", help="Optional path to Rust `hc_curve_cli` (env: HC_RUST_CLI)"),
     ) -> None:
-        _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
-        _check_fitparse_version()
         units_norm = gain_units.lower()
         if units_norm not in ("m", "ft"):
             raise typer.BadParameter("gain-units must be 'm' or 'ft'")
@@ -1127,48 +2033,95 @@ def _build_typer_app():  # pragma: no cover
                 filtered_files.append(token)
         if not filtered_files:
             raise typer.BadParameter("Provide at least one FIT file after gain tokens.")
-        code = _run_gain_time(
-            filtered_files,
-            output,
-            gains_list,
-            source,
-            verbose,
-            png=png,
-            no_plot=no_plot,
-            all_windows=all_windows,
-            exhaustive=exhaustive,
-            step_s=step_s,
-            max_duration_s=max_duration_s,
-            log_file=log_file,
-            merge_eps_sec=merge_eps_sec,
-            overlap_policy=overlap_policy,
-            resample_1hz=resample_1hz,
-            resample_max_gap_sec=resample_max_gap_sec,
-            resample_max_points=resample_max_points,
-            parse_workers=parse_workers,
-            gain_eps=gain_eps,
-            smooth_sec=smooth_sec,
-            session_gap_sec=session_gap_sec,
-            qc_enabled=qc,
-            qc_spec_path=qc_spec,
-            wr_profile=wr_profile,
-            wr_anchors_path=wr_anchors,
-            wr_min_seconds=wr_min_seconds,
-            wr_short_cap=wr_short_cap,
-            plot_wr=plot_wr,
-            plot_personal=plot_personal,
-            split_plots=split_plots,
-            fast_plot=fast_plot,
-            magic_gains=magic_gain_tokens,
-            goals_topk=goals_topk,
-            profile=profile,
-            gain_units=units_norm,
-            engine=engine,
-            concave_envelope=concave_envelope,
-            ylog_time=ylog_time,
-            json_sidecar=json_sidecar,
-            clear_cache=clear_cache,
-        )
+        if core == CoreBackend.rust:
+            code = _run_rust_gain_time(
+                filtered_files,
+                output,
+                gains_list,
+                source,
+                verbose,
+                rust_cli=rust_cli,
+                png=png,
+                no_plot=no_plot,
+                all_windows=all_windows,
+                exhaustive=exhaustive,
+                step_s=step_s,
+                max_duration_s=max_duration_s,
+                log_file=log_file,
+                merge_eps_sec=merge_eps_sec,
+                overlap_policy=overlap_policy,
+                resample_1hz=resample_1hz,
+                resample_max_gap_sec=resample_max_gap_sec,
+                resample_max_points=resample_max_points,
+                parse_workers=parse_workers,
+                gain_eps=gain_eps,
+                smooth_sec=smooth_sec,
+                session_gap_sec=session_gap_sec,
+                qc_enabled=qc,
+                qc_spec_path=qc_spec,
+                wr_profile=wr_profile,
+                wr_anchors_path=wr_anchors,
+                wr_min_seconds=wr_min_seconds,
+                wr_short_cap=wr_short_cap,
+                plot_wr=plot_wr,
+                plot_personal=plot_personal,
+                split_plots=split_plots,
+                fast_plot=fast_plot,
+                magic_gains=magic_gain_tokens,
+                goals_topk=goals_topk,
+                profile=profile,
+                gain_units=units_norm,
+                engine=engine,
+                concave_envelope=concave_envelope,
+                ylog_time=ylog_time,
+                json_sidecar=json_sidecar,
+                clear_cache=clear_cache,
+            )
+        else:
+            _require_dependency(FitFile, "fitparse", "pip install python-fitparse")
+            _check_fitparse_version()
+            code = _run_gain_time(
+                filtered_files,
+                output,
+                gains_list,
+                source,
+                verbose,
+                png=png,
+                no_plot=no_plot,
+                all_windows=all_windows,
+                exhaustive=exhaustive,
+                step_s=step_s,
+                max_duration_s=max_duration_s,
+                log_file=log_file,
+                merge_eps_sec=merge_eps_sec,
+                overlap_policy=overlap_policy,
+                resample_1hz=resample_1hz,
+                resample_max_gap_sec=resample_max_gap_sec,
+                resample_max_points=resample_max_points,
+                parse_workers=parse_workers,
+                gain_eps=gain_eps,
+                smooth_sec=smooth_sec,
+                session_gap_sec=session_gap_sec,
+                qc_enabled=qc,
+                qc_spec_path=qc_spec,
+                wr_profile=wr_profile,
+                wr_anchors_path=wr_anchors,
+                wr_min_seconds=wr_min_seconds,
+                wr_short_cap=wr_short_cap,
+                plot_wr=plot_wr,
+                plot_personal=plot_personal,
+                split_plots=split_plots,
+                fast_plot=fast_plot,
+                magic_gains=magic_gain_tokens,
+                goals_topk=goals_topk,
+                profile=profile,
+                gain_units=units_norm,
+                engine=engine,
+                concave_envelope=concave_envelope,
+                ylog_time=ylog_time,
+                json_sidecar=json_sidecar,
+                clear_cache=clear_cache,
+            )
         if code != 0:
             raise typer.Exit(code)
 

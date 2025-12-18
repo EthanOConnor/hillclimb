@@ -75,7 +75,7 @@ See also: `docs/REVIEW_2025-12-18.md` (comprehensive handoff + decisions).
   - Acceptance: harness runs algorithms on `Tracklogs/` and stores summary metrics (not raw data) for regressions.
   - Acceptance: can compare “treadmill incline integration” vs altitude-derived totals and report delta distributions.
 
-- [ ] **(ENG/Senior)** Python wrapper over Rust core (first milestone)
+- [x] **(ENG/Senior)** Python wrapper over Rust core (first milestone)
   - Acceptance: Python CLI can run curves/gain-time via Rust core and still produce the same CSV/plots as before (within tolerance), with a feature flag to fall back.
 
 ## P2 (Later / Strategic)

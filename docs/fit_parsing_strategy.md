@@ -59,8 +59,8 @@ The project relies on developer/custom fields (e.g., treadmill/Runn-derived tota
   - canonical series export
   - curve + gain-time + (future) ascent algorithm registry
 - Add a feature flag in Python to choose:
-  - `--backend rust` (default once stable), or
-  - `--backend python` (compat mode)
+  - `--core rust` (default once stable), or
+  - `--core python` (compat mode)
 
 ### P2 (later)
 - Ship Python wheels bundling the Rust core (maturin) so users don’t need a Rust toolchain.
