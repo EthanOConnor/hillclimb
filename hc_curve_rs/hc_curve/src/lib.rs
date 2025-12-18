@@ -1964,15 +1964,25 @@ struct AltitudeAscentDiagnostics {
     resample_skipped_reason: Option<String>,
 }
 
-fn build_altitude_ascent(
+#[derive(Clone, Debug)]
+struct AltitudePreprocess {
+    times: Vec<f64>,
+    altitude_eff: Vec<f64>,
+    altitude_idle_hold: Vec<f64>,
+    moving_mask: Vec<bool>,
+    idle_time_pct: f64,
+    resample_applied: bool,
+    resample_skipped_reason: Option<String>,
+}
+
+fn preprocess_altitude(
     records: &[MergedRecord],
     t0: f64,
     resample_1hz_requested: bool,
     resample_max_gap_sec: f64,
     resample_max_points: usize,
     smooth_sec: f64,
-    gain_eps_m: f64,
-) -> Result<(Vec<f64>, Vec<f64>, AltitudeAscentDiagnostics), HcError> {
+) -> Result<AltitudePreprocess, HcError> {
     let mut points: Vec<(f64, f64)> = records
         .iter()
         .filter_map(|r| r.alt.map(|alt| (r.time_s - t0, alt)))
@@ -2015,20 +2025,49 @@ fn build_altitude_ascent(
         altitude_eff = rolling_median_time(&times_raw, &altitude_eff, smooth_sec);
     }
 
-    let (altitude_adj, moving_mask, _idle_mask) =
+    let (altitude_idle_hold, moving_mask, _idle_mask) =
         apply_idle_detection(records, t0, &times_raw, &altitude_eff);
 
     let idle_time_pct = compute_idle_time_pct(&times_raw, &moving_mask);
 
-    let gain = cumulative_ascent_from_altitude(&altitude_adj, gain_eps_m, &moving_mask);
+    Ok(AltitudePreprocess {
+        times: times_raw,
+        altitude_eff,
+        altitude_idle_hold,
+        moving_mask,
+        idle_time_pct,
+        resample_applied,
+        resample_skipped_reason,
+    })
+}
+
+fn build_altitude_ascent(
+    records: &[MergedRecord],
+    t0: f64,
+    resample_1hz_requested: bool,
+    resample_max_gap_sec: f64,
+    resample_max_points: usize,
+    smooth_sec: f64,
+    gain_eps_m: f64,
+) -> Result<(Vec<f64>, Vec<f64>, AltitudeAscentDiagnostics), HcError> {
+    let pre = preprocess_altitude(
+        records,
+        t0,
+        resample_1hz_requested,
+        resample_max_gap_sec,
+        resample_max_points,
+        smooth_sec,
+    )?;
+
+    let gain = cumulative_ascent_from_altitude(&pre.altitude_idle_hold, gain_eps_m, &pre.moving_mask);
 
     Ok((
-        times_raw,
+        pre.times,
         gain,
         AltitudeAscentDiagnostics {
-            idle_time_pct,
-            resample_applied,
-            resample_skipped_reason,
+            idle_time_pct: pre.idle_time_pct,
+            resample_applied: pre.resample_applied,
+            resample_skipped_reason: pre.resample_skipped_reason,
         },
     ))
 }

@@ -60,6 +60,12 @@ pub enum AscentAlgorithmConfig {
     RunnInclineV1,
     #[serde(rename = "hc.altitude.canonical.v1")]
     AltitudeCanonicalV1 { gain_eps_m: f64, smooth_sec: f64 },
+    #[serde(rename = "strava.altitude.threshold.v1")]
+    StravaThresholdV1 { threshold_m: f64, smooth_sec: f64 },
+    #[serde(rename = "goldencheetah.altitude.hysteresis.v1")]
+    GoldenCheetahHysteresisV1 { hysteresis_m: f64, smooth_sec: f64 },
+    #[serde(rename = "twonav.altitude.min_altitude_increase.v1")]
+    TwoNavMinAltitudeIncreaseV1 { min_increase_m: f64, smooth_sec: f64 },
 }
 
 impl AscentAlgorithmConfig {
@@ -68,6 +74,13 @@ impl AscentAlgorithmConfig {
             AscentAlgorithmConfig::RunnTotalGainV1 => "hc.source.runn_total_gain.v1",
             AscentAlgorithmConfig::RunnInclineV1 => "hc.source.runn_incline.v1",
             AscentAlgorithmConfig::AltitudeCanonicalV1 { .. } => "hc.altitude.canonical.v1",
+            AscentAlgorithmConfig::StravaThresholdV1 { .. } => "strava.altitude.threshold.v1",
+            AscentAlgorithmConfig::GoldenCheetahHysteresisV1 { .. } => {
+                "goldencheetah.altitude.hysteresis.v1"
+            }
+            AscentAlgorithmConfig::TwoNavMinAltitudeIncreaseV1 { .. } => {
+                "twonav.altitude.min_altitude_increase.v1"
+            }
         }
     }
 
@@ -76,6 +89,13 @@ impl AscentAlgorithmConfig {
             AscentAlgorithmConfig::RunnTotalGainV1 => "Runn total gain",
             AscentAlgorithmConfig::RunnInclineV1 => "Runn incline integration",
             AscentAlgorithmConfig::AltitudeCanonicalV1 { .. } => "Canonical altitude (Hillclimb)",
+            AscentAlgorithmConfig::StravaThresholdV1 { .. } => "Strava-style thresholding (altitude)",
+            AscentAlgorithmConfig::GoldenCheetahHysteresisV1 { .. } => {
+                "GoldenCheetah-style hysteresis (altitude)"
+            }
+            AscentAlgorithmConfig::TwoNavMinAltitudeIncreaseV1 { .. } => {
+                "TwoNav min altitude increase (altitude)"
+            }
         }
     }
 
@@ -86,6 +106,15 @@ impl AscentAlgorithmConfig {
             AscentAlgorithmConfig::AltitudeCanonicalV1 { .. } => {
                 "Effective altitude path + smoothing + idle gating + hysteresis."
             }
+            AscentAlgorithmConfig::StravaThresholdV1 { .. } => {
+                "Strava-style: require a minimum continuous climb before counting ascent (parameterized)."
+            }
+            AscentAlgorithmConfig::GoldenCheetahHysteresisV1 { .. } => {
+                "GoldenCheetah-style hysteresis thresholding to ignore small elevation noise (parameterized)."
+            }
+            AscentAlgorithmConfig::TwoNavMinAltitudeIncreaseV1 { .. } => {
+                "TwoNav-style minimum altitude increase thresholding to ignore small elevation oscillations (parameterized)."
+            }
         }
     }
 
@@ -93,7 +122,12 @@ impl AscentAlgorithmConfig {
         match self {
             AscentAlgorithmConfig::RunnTotalGainV1 => &[AscentRequirement::TotalGain],
             AscentAlgorithmConfig::RunnInclineV1 => &[AscentRequirement::Incline, AscentRequirement::Distance],
-            AscentAlgorithmConfig::AltitudeCanonicalV1 { .. } => &[AscentRequirement::Altitude],
+            AscentAlgorithmConfig::AltitudeCanonicalV1 { .. }
+            | AscentAlgorithmConfig::StravaThresholdV1 { .. }
+            | AscentAlgorithmConfig::GoldenCheetahHysteresisV1 { .. }
+            | AscentAlgorithmConfig::TwoNavMinAltitudeIncreaseV1 { .. } => {
+                &[AscentRequirement::Altitude]
+            }
         }
     }
 
@@ -106,6 +140,22 @@ impl AscentAlgorithmConfig {
                 gain_eps_m: 0.5,
                 smooth_sec: 0.0,
             }),
+            "strava.altitude.threshold.v1" => Some(AscentAlgorithmConfig::StravaThresholdV1 {
+                threshold_m: 2.0,
+                smooth_sec: 0.0,
+            }),
+            "goldencheetah.altitude.hysteresis.v1" => {
+                Some(AscentAlgorithmConfig::GoldenCheetahHysteresisV1 {
+                    hysteresis_m: 3.0,
+                    smooth_sec: 0.0,
+                })
+            }
+            "twonav.altitude.min_altitude_increase.v1" => {
+                Some(AscentAlgorithmConfig::TwoNavMinAltitudeIncreaseV1 {
+                    min_increase_m: 5.0,
+                    smooth_sec: 0.0,
+                })
+            }
             _ => None,
         }
     }
@@ -126,6 +176,18 @@ pub fn list_ascent_algorithms() -> Vec<AscentAlgorithmInfo> {
         AscentAlgorithmConfig::RunnInclineV1,
         AscentAlgorithmConfig::AltitudeCanonicalV1 {
             gain_eps_m: 0.5,
+            smooth_sec: 0.0,
+        },
+        AscentAlgorithmConfig::StravaThresholdV1 {
+            threshold_m: 2.0,
+            smooth_sec: 0.0,
+        },
+        AscentAlgorithmConfig::GoldenCheetahHysteresisV1 {
+            hysteresis_m: 3.0,
+            smooth_sec: 0.0,
+        },
+        AscentAlgorithmConfig::TwoNavMinAltitudeIncreaseV1 {
+            min_increase_m: 5.0,
             smooth_sec: 0.0,
         },
     ];
@@ -202,6 +264,75 @@ pub fn compute_ascent_algorithm(
             diagnostics.resample_skipped_reason = diag.resample_skipped_reason;
             (t, g)
         }
+        AscentAlgorithmConfig::StravaThresholdV1 {
+            threshold_m,
+            smooth_sec,
+        } => {
+            let any_alt = merged.iter().any(|r| r.alt.is_some());
+            if !any_alt {
+                return Err(HcError::InsufficientData);
+            }
+            let pre = super::preprocess_altitude(
+                &merged,
+                t0,
+                params.resample_1hz,
+                params.resample_max_gap_sec,
+                params.resample_max_points,
+                *smooth_sec,
+            )?;
+            diagnostics.idle_time_pct = Some(pre.idle_time_pct);
+            diagnostics.smooth_sec = Some(*smooth_sec);
+            diagnostics.resample_applied = Some(pre.resample_applied);
+            diagnostics.resample_skipped_reason = pre.resample_skipped_reason;
+            let gain = cumulative_ascent_uprun_threshold(&pre.altitude_eff, *threshold_m);
+            (pre.times, gain)
+        }
+        AscentAlgorithmConfig::GoldenCheetahHysteresisV1 {
+            hysteresis_m,
+            smooth_sec,
+        } => {
+            let any_alt = merged.iter().any(|r| r.alt.is_some());
+            if !any_alt {
+                return Err(HcError::InsufficientData);
+            }
+            let pre = super::preprocess_altitude(
+                &merged,
+                t0,
+                params.resample_1hz,
+                params.resample_max_gap_sec,
+                params.resample_max_points,
+                *smooth_sec,
+            )?;
+            diagnostics.idle_time_pct = Some(pre.idle_time_pct);
+            diagnostics.smooth_sec = Some(*smooth_sec);
+            diagnostics.resample_applied = Some(pre.resample_applied);
+            diagnostics.resample_skipped_reason = pre.resample_skipped_reason;
+            let gain = cumulative_ascent_hysteresis_threshold(&pre.altitude_eff, *hysteresis_m);
+            (pre.times, gain)
+        }
+        AscentAlgorithmConfig::TwoNavMinAltitudeIncreaseV1 {
+            min_increase_m,
+            smooth_sec,
+        } => {
+            let any_alt = merged.iter().any(|r| r.alt.is_some());
+            if !any_alt {
+                return Err(HcError::InsufficientData);
+            }
+            let pre = super::preprocess_altitude(
+                &merged,
+                t0,
+                params.resample_1hz,
+                params.resample_max_gap_sec,
+                params.resample_max_points,
+                *smooth_sec,
+            )?;
+            diagnostics.idle_time_pct = Some(pre.idle_time_pct);
+            diagnostics.smooth_sec = Some(*smooth_sec);
+            diagnostics.resample_applied = Some(pre.resample_applied);
+            diagnostics.resample_skipped_reason = pre.resample_skipped_reason;
+            let gain = cumulative_ascent_hysteresis_threshold(&pre.altitude_eff, *min_increase_m);
+            (pre.times, gain)
+        }
     };
 
     if times.len() < 2 || times.len() != gain.len() {
@@ -236,6 +367,63 @@ pub fn compute_ascent_algorithm(
     })
 }
 
+fn cumulative_ascent_uprun_threshold(altitude: &[f64], threshold_m: f64) -> Vec<f64> {
+    if altitude.is_empty() {
+        return Vec::new();
+    }
+    let threshold = threshold_m.max(0.0);
+    let n = altitude.len();
+    let mut out = Vec::with_capacity(n);
+    let mut cum = 0.0;
+    let mut run_gain = 0.0;
+    out.push(0.0);
+    for i in 1..n {
+        let dv = altitude[i] - altitude[i - 1];
+        if dv > 0.0 {
+            run_gain += dv;
+        } else if run_gain > 0.0 {
+            if run_gain >= threshold {
+                cum += run_gain;
+            }
+            run_gain = 0.0;
+        }
+        out.push(cum);
+    }
+    if run_gain > 0.0 && run_gain >= threshold {
+        let last = out.last_mut().unwrap();
+        *last = cum + run_gain;
+    }
+    out
+}
+
+fn cumulative_ascent_hysteresis_threshold(altitude: &[f64], threshold_m: f64) -> Vec<f64> {
+    if altitude.is_empty() {
+        return Vec::new();
+    }
+    let threshold = threshold_m.max(0.0);
+    let n = altitude.len();
+    let mut out = Vec::with_capacity(n);
+    let mut cum = 0.0;
+    let mut reference = altitude[0];
+    out.push(0.0);
+    for i in 1..n {
+        let z = altitude[i];
+        if threshold <= 0.0 {
+            let dv = z - altitude[i - 1];
+            if dv > 0.0 {
+                cum += dv;
+            }
+        } else if z >= reference + threshold {
+            cum += z - reference;
+            reference = z;
+        } else if z <= reference - threshold {
+            reference = z;
+        }
+        out.push(cum);
+    }
+    out
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
@@ -245,4 +433,3 @@ fn sha256_hex(bytes: &[u8]) -> String {
     }
     out
 }
-

@@ -108,3 +108,10 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 - Added a Rust core ascent algorithm registry (`list_ascent_algorithms`) and a versioned config object with stable IDs + SHA‑256 parameter hashing.
 - Added `compute_ascent_algorithm` (Rust core) returning a per-algorithm ascent series plus diagnostics (QC removed, idle %, resample applied/skipped).
 - Documented the JSON shapes in `docs/ascent_algorithm_schema.md`.
+
+## 2025‑12‑18 – Initial reference ascent profiles
+- Implemented initial named external/reference altitude profiles in Rust core:
+  - `strava.altitude.threshold.v1` (parameterized threshold)
+  - `goldencheetah.altitude.hysteresis.v1` (3 m default)
+  - `twonav.altitude.min_altitude_increase.v1` (5 m default)
+- Added `docs/ascent_reference_algorithms.md` documenting sources and modeled behavior.

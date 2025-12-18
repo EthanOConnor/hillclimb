@@ -68,6 +68,7 @@ Rationale: supports reproducible algorithm comparisons and prevents silent outpu
 Implementation notes:
 - Rust core: `hc_curve_rs/hc_curve/src/ascent.rs` (registry + config + parameter hashing).
 - Schema doc: `docs/ascent_algorithm_schema.md`.
+- Reference profiles doc: `docs/ascent_reference_algorithms.md` (Strava/GoldenCheetah/TwoNav initial set).
 
 ### FIT parser strategy (python-fitparse vs fitdecode)
 - Short term: keep `python-fitparse` in Python because it’s integrated and stable enough for current workflows.

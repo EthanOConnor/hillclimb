@@ -9,6 +9,9 @@ Algorithms have stable string IDs (examples):
 - `hc.source.runn_total_gain.v1`
 - `hc.source.runn_incline.v1`
 - `hc.altitude.canonical.v1`
+- `strava.altitude.threshold.v1`
+- `goldencheetah.altitude.hysteresis.v1`
+- `twonav.altitude.min_altitude_increase.v1`
 
 IDs are:
 - stable across releases (new behavior → new ID suffix `.v2`, etc.)
@@ -84,4 +87,3 @@ Algorithm Lab “compare” reports will wrap multiple `AscentAlgorithmResult` o
 - optional downsampled series and curve overlays
 
 This will remain `schema_version = 1` until the top-level shape changes.
-
