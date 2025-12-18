@@ -22,3 +22,25 @@ Critical review and risk tracking. Record concerns about correctness, performanc
 ### Caching correctness
 - **Low:** FIT cache keys on mtime/size only; parsing‑logic changes won’t invalidate cached records.
   - Status: cache payloads now include a schema version and both CLIs expose `--clear-cache`.
+
+## 2025‑12‑18 – Algorithm correctness and scale risks
+
+### Python vs Rust semantic drift
+- **High:** Two full “truth” implementations exist (Python + Rust). Even with parity intent, semantics can diverge (gap handling, idle gating meaning, QC removal reporting, and concave envelope rules), silently changing results.
+  - Mitigation: make Rust `hc_curve` canonical and migrate Python to wrapper/plot role; add cross-impl verification tests while both exist.
+
+### “Inactivity gaps” definition mismatch
+- **High:** Rust can represent inactivity as idle segments; Python auto mode currently infers inactivity gaps primarily from timestamp gaps. This affects window skipping and envelope shaping, especially around breaks.
+  - Mitigation: write and enforce a single spec for gaps/idle/sessions; add targeted tests and JSON diagnostics.
+
+### Resampling blow-ups on large gaps
+- **High:** Python `--resample-1hz` currently fills the entire time span, which can explode memory/time on multi-file multi-day timelines with large gaps.
+  - Mitigation: segment-aware resampling or max-gap guardrails; tests that simulate worst-case gaps.
+
+### FIT parser maintenance risk (Python)
+- **Medium:** `python-fitparse` upstream warns about maintainer bandwidth and recommends `fitdecode`. Staying pinned without a plan risks forced migration later.
+  - Mitigation: migrate Python to call Rust core (preferred), or add a parser abstraction and validate `fitdecode` compatibility on fixtures.
+
+### Web dependency drift / CDN reliance
+- **Medium:** Web app relies on Plotly via CDN; upgrades can break charts or introduce subtle behavior changes.
+  - Mitigation: pin versions intentionally, add “known good” smoke checks (build + basic run instructions), and consider an offline/local-dev fallback plan if needed.

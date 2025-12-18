@@ -48,3 +48,27 @@ Rationale: reduce monolith size while keeping CLI parity and import stability.
 - `--smooth` is an optional, off-by-default extra smoothing pass for altitude-derived ascent only.
 - Implementation: apply a rolling-median window (seconds) to the *effective altitude path* before idle detection and ascent integration. This lives alongside (not replacing) the existing spike repair, morphological closing, and local-polynomial smoothing.
 - `--gain-eps` remains the ascent hysteresis threshold (meters) used when converting altitude deltas into cumulative ascent.
+
+## 2025‑12‑18 – Canonical core + ascent algorithm program
+
+### Canonical implementation (“single source of truth”)
+- The Rust crate `hc_curve_rs/hc_curve` is the canonical implementation for parsing, preprocessing (QC/idle/smoothing), ascent algorithms, curve/gain-time computation, and JSON schema.
+- The Python implementation remains supported for CLI ergonomics and Matplotlib plotting, but should transition to calling Rust (PyO3/maturin wheel preferred; subprocess wrapper acceptable as an interim step).
+
+Rationale: duplicated full implementations (Python + Rust) inevitably drift, and the long-term goal (“implement many ascent algorithms”) requires strict comparability and a single authority.
+
+### AscentAlgorithm interface (versioned)
+- Ascent logic should be modeled as an explicit `AscentAlgorithm` interface (Rust-first) that consumes canonical samples + metadata and produces:
+  - cumulative gain series `gain(t)`
+  - diagnostics and parameterization
+  - stable algorithm IDs and parameter hashing in JSON output
+
+Rationale: supports reproducible algorithm comparisons and prevents silent output shifts as thresholds/tuning change.
+
+### FIT parser strategy (python-fitparse vs fitdecode)
+- Short term: keep `python-fitparse` in Python because it’s integrated and stable enough for current workflows.
+- Medium term: avoid being locked to a single Python FIT parser:
+  - preferred path: Rust parsing exposed to Python via bindings (making Python parser choice largely irrelevant)
+  - fallback path: add a Python parser abstraction and evaluate `fitdecode` as the default backend if Python parsing remains first-class
+
+Rationale: `python-fitparse` maintainership is explicitly flagged upstream; plan for a controlled migration rather than a forced scramble later.

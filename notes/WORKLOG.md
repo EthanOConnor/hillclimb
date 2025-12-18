@@ -75,3 +75,9 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 - Updated `AGENTS.md` to reflect the current Python module layout and dependency naming.
 - Refreshed `docs/web_mvp_spec.md` and `docs/handoff_prompt_next_agent.md` so they reflect the post‑MVP web app.
 - Captured remaining follow‑ups (CI smoke checks, Rust warnings, repo hygiene) in `notes/BACKLOG.md` and updated `notes/SCRUTINY.md`.
+
+## 2025‑12‑18 – Comprehensive repo review + ticketization
+- Added a comprehensive, cross-functional review handoff doc: `docs/REVIEW_2025-12-18.md`.
+- Reworked `notes/BACKLOG.md` into a prioritized, owner-assigned ticket list with acceptance criteria.
+- Recorded strategic direction: Rust `hc_curve` should become the canonical “source of truth”, with Python moving toward a wrapper/plotting role.
+- Documented parser strategy guidance (python-fitparse vs fitdecode) and the recommended migration path.
