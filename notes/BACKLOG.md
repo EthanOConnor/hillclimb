@@ -5,29 +5,29 @@ Detailed technical backlog / roadmap. Prefer adding items here over TODOs in cod
 See also: `docs/REVIEW_2025-12-18.md` (comprehensive handoff + decisions).
 
 ## P0 (Now — next 1–2 sprints)
-- [ ] **(ENG/Senior)** ADR: Rust is canonical core; Python is wrapper
+- [x] **(ENG/Senior)** ADR: Rust is canonical core; Python is wrapper
   - Acceptance: `notes/MEMORY.md` updated with the decision, migration milestones, and deprecation plan for Python “truth”.
   - Acceptance: one “thin wrapper” path chosen and documented (PyO3/maturin preferred; subprocess acceptable interim).
 
-- [ ] **(ENG/Junior)** CI smoke checks for Python + Rust + WASM
+- [x] **(ENG/Junior)** CI smoke checks for Python + Rust + WASM
   - Acceptance: new workflow under `.github/workflows/` runs on PR/push:
     - Python: install requirements; run unit tests.
     - Rust: `cargo test --workspace` (or `cargo check` as minimum).
     - WASM: `cargo check -p hc_curve_web --target wasm32-unknown-unknown`.
   - Acceptance: repo badges/docs updated only if needed (keep minimal).
 
-- [ ] **(ENG/Senior)** Semantics spec: gaps, idle, sessions, overlaps (single definition)
+- [x] **(ENG/Senior)** Semantics spec: gaps, idle, sessions, overlaps (single definition)
   - Acceptance: new spec doc in `docs/` defining:
     - whether windows may span idle time and/or session gaps
     - what “inactivity gaps” means (timestamp gaps vs idle segments vs both)
     - overlap policy semantics and guarantees
   - Acceptance: Python and Rust match this spec (tests cover the edge cases).
 
-- [ ] **(ENG/Junior)** Guardrails for `--resample-1hz` on large gaps
+- [x] **(ENG/Junior)** Guardrails for `--resample-1hz` on large gaps
   - Acceptance: resampling no longer fills multi-hour/day gaps by default (segment-aware or max-gap guard).
   - Acceptance: tests reproduce the previous failure mode (huge gap) and confirm bounded behavior.
 
-- [ ] **(ENG/Junior)** Rust warnings cleanup (“cargo check is quiet”)
+- [x] **(ENG/Junior)** Rust warnings cleanup (“cargo check is quiet”)
   - Acceptance: `cargo check --workspace` produces no warnings in default configuration.
   - Acceptance: if feasible, CI enforces `RUSTFLAGS="-Dwarnings"` for core crates.
 

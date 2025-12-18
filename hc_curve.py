@@ -500,6 +500,9 @@ QC_DEFAULT_SPEC: Dict[float, float] = {
     3600.0: 900.0,
 }
 
+DEFAULT_RESAMPLE_MAX_GAP_SEC = 2 * 3600.0
+DEFAULT_RESAMPLE_MAX_POINTS = 500_000
+
 
 def _export_series_command(
     fit_files: List[str],
@@ -517,6 +520,8 @@ def _export_series_command(
     overlap_policy: str,
     log_file: Optional[str],
     profile: bool,
+    resample_max_gap_sec: float = DEFAULT_RESAMPLE_MAX_GAP_SEC,
+    resample_max_points: int = DEFAULT_RESAMPLE_MAX_POINTS,
     json_sidecar: bool = False,
 ) -> int:
     _setup_logging(verbose, log_file=log_file)
@@ -531,6 +536,8 @@ def _export_series_command(
             qc_enabled=qc_enabled,
             qc_spec_path=qc_spec_path,
             resample_1hz=resample_1hz,
+            resample_max_gap_sec=resample_max_gap_sec,
+            resample_max_points=resample_max_points,
             merge_eps_sec=merge_eps_sec,
             overlap_policy=overlap_policy,
             parse_workers=parse_workers,
@@ -568,6 +575,8 @@ def _export_series_command(
                 "params": {
                     "source": source,
                     "resample_1hz": resample_1hz,
+                    "resample_max_gap_sec": resample_max_gap_sec,
+                    "resample_max_points": resample_max_points,
                     "parse_workers": parse_workers,
                     "gain_eps": gain_eps,
                     "smooth_sec": smooth_sec,
@@ -3259,12 +3268,42 @@ def _build_canonical_timeseries(
     return times, canonical, used_sources, gaps
 
 
-def _resample_to_1hz(times: List[float], values: List[float]) -> Tuple[List[float], List[float]]:
+def _resample_to_1hz(
+    times: List[float],
+    values: List[float],
+    *,
+    max_gap_sec: float = DEFAULT_RESAMPLE_MAX_GAP_SEC,
+    max_points: int = DEFAULT_RESAMPLE_MAX_POINTS,
+) -> Tuple[List[float], List[float]]:
     if not times:
         return [], []
     import bisect
+    # Guardrails: prevent pathological resample allocations when the timeline has
+    # very large gaps (e.g., device pause, bad timestamps, or merged sessions).
+    # These defaults are intentionally conservative for Python lists.
+    if len(times) >= 2 and max_gap_sec > 0:
+        max_gap = 0.0
+        last_t = times[0]
+        for t in times[1:]:
+            dt = t - last_t
+            if dt > max_gap:
+                max_gap = dt
+            last_t = t
+        if max_gap > max_gap_sec:
+            raise RuntimeError(
+                f"Refusing 1 Hz resample: max timestamp gap {max_gap:.0f}s exceeds guard {max_gap_sec:.0f}s. "
+                "Disable --resample-1hz or increase --resample-max-gap-sec."
+            )
     t_start = int(times[0])
     t_end = int(times[-1])
+    if t_end < t_start:
+        raise RuntimeError("Refusing 1 Hz resample: invalid time ordering (end before start).")
+    n_points = (t_end - t_start) + 1
+    if max_points > 0 and n_points > max_points:
+        raise RuntimeError(
+            f"Refusing 1 Hz resample: would allocate {n_points} points (> {max_points}). "
+            "Disable --resample-1hz or increase --resample-max-points."
+        )
     new_times = [float(t) for t in range(t_start, t_end + 1)]
     new_vals: List[float] = []
     for t in new_times:
@@ -3334,9 +3373,11 @@ def _load_activity_series(
     qc_enabled: bool,
     qc_spec_path: Optional[str],
     resample_1hz: bool,
-    merge_eps_sec: float,
-    overlap_policy: str,
-    parse_workers: int,
+    resample_max_gap_sec: float = DEFAULT_RESAMPLE_MAX_GAP_SEC,
+    resample_max_points: int = DEFAULT_RESAMPLE_MAX_POINTS,
+    merge_eps_sec: float = 0.5,
+    overlap_policy: str = "file:last",
+    parse_workers: int = 0,
     profiler: Optional[_StageProfiler] = None,
 ) -> ActivitySeries:
     logging.info("Reading %d FIT file(s)...", len(fit_files))
@@ -3427,10 +3468,6 @@ def _load_activity_series(
                     )
         _assert_monotonic_non_decreasing(values, name="cumulative gain after QC")
 
-    if resample_1hz:
-        times, values = _resample_to_1hz(times, values)
-        _assert_monotonic_non_decreasing(values, name="cumulative gain after resample")
-
     session_gap_list = _find_gaps(times, session_gap_sec)
     if session_gap_list:
         preview = ", ".join(_fmt_duration_label(int(round(g.length))) for g in session_gap_list[:5])
@@ -3442,6 +3479,15 @@ def _load_activity_series(
             session_gap_sec,
             preview,
         )
+
+    if resample_1hz:
+        times, values = _resample_to_1hz(
+            times,
+            values,
+            max_gap_sec=resample_max_gap_sec,
+            max_points=resample_max_points,
+        )
+        _assert_monotonic_non_decreasing(values, name="cumulative gain after resample")
 
     full_span_seconds = max(0.0, times[-1] - times[0]) if len(times) > 1 else 0.0
 

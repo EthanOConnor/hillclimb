@@ -134,6 +134,14 @@ struct CurveArgs {
     #[arg(long, action = ArgAction::SetTrue)]
     raw_sampling: bool,
 
+    /// Guardrail: refuse to fill timestamp gaps longer than this when resampling to 1 Hz
+    #[arg(long, default_value_t = 2.0 * 3600.0)]
+    resample_max_gap_sec: f64,
+
+    /// Guardrail: refuse to allocate more than this many 1 Hz samples when resampling
+    #[arg(long, default_value_t = 500_000)]
+    resample_max_points: usize,
+
     /// Disable QC censoring
     #[arg(long, action = ArgAction::SetTrue)]
     no_qc: bool,
@@ -320,6 +328,14 @@ struct GainTimeArgs {
     #[arg(long, action = ArgAction::SetTrue)]
     raw_sampling: bool,
 
+    /// Guardrail: refuse to fill timestamp gaps longer than this when resampling to 1 Hz
+    #[arg(long, default_value_t = 2.0 * 3600.0)]
+    resample_max_gap_sec: f64,
+
+    /// Guardrail: refuse to allocate more than this many 1 Hz samples when resampling
+    #[arg(long, default_value_t = 500_000)]
+    resample_max_points: usize,
+
     /// Disable QC censoring
     #[arg(long, action = ArgAction::SetTrue)]
     no_qc: bool,
@@ -430,6 +446,14 @@ struct ExportSeriesArgs {
     /// Keep native sampling (skip 1 Hz resample)
     #[arg(long, action = ArgAction::SetTrue)]
     raw_sampling: bool,
+
+    /// Guardrail: refuse to fill timestamp gaps longer than this when resampling to 1 Hz
+    #[arg(long, default_value_t = 2.0 * 3600.0)]
+    resample_max_gap_sec: f64,
+
+    /// Guardrail: refuse to allocate more than this many 1 Hz samples when resampling
+    #[arg(long, default_value_t = 500_000)]
+    resample_max_points: usize,
 
     /// Disable QC censoring
     #[arg(long, action = ArgAction::SetTrue)]
@@ -575,6 +599,8 @@ fn handle_curve(args: CurveArgs) -> Result<()> {
     params.merge_eps_sec = args.merge_eps;
     params.overlap_policy = args.overlap_policy.clone();
     params.resample_1hz = !args.raw_sampling;
+    params.resample_max_gap_sec = args.resample_max_gap_sec;
+    params.resample_max_points = args.resample_max_points;
     params.qc_enabled = !args.no_qc;
     params.max_duration_s = args.max_duration;
     params.step_s = args.step.max(1);
@@ -847,6 +873,8 @@ fn handle_gain_time(args: GainTimeArgs) -> Result<()> {
     params.merge_eps_sec = args.merge_eps;
     params.overlap_policy = args.overlap_policy.clone();
     params.resample_1hz = !args.raw_sampling;
+    params.resample_max_gap_sec = args.resample_max_gap_sec;
+    params.resample_max_points = args.resample_max_points;
     params.qc_enabled = !args.no_qc;
     params.exhaustive = args.exhaustive;
     params.all_windows = args.all;
@@ -1085,6 +1113,8 @@ fn handle_export_series(args: ExportSeriesArgs) -> Result<()> {
     params.merge_eps_sec = args.merge_eps;
     params.overlap_policy = args.overlap_policy.clone();
     params.resample_1hz = !args.raw_sampling;
+    params.resample_max_gap_sec = args.resample_max_gap_sec;
+    params.resample_max_points = args.resample_max_points;
     params.qc_enabled = !args.no_qc;
     params.source = args.source.into();
     params.all_windows = false;

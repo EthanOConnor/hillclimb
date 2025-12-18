@@ -84,3 +84,9 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 - Added a CI smoke workflow (`.github/workflows/ci-smoke.yml`) to run Python unit tests, Rust workspace tests, and a WASM compile check on PR/push.
 - Cleaned up Rust build warnings so `cargo check --workspace` is quiet (cfg-gated `mount_to_body`, removed unused `mut`, simplified unused `MagicPoint` fields).
 - Added `docs/compute_semantics.md` and aligned Rust gap/idle semantics to match the documented behavior (session gaps are timestamp gaps; gap-only windows are skipped; idle segments gate altitude ascent but don’t define session gaps).
+
+## 2025‑12‑18 – Resample guardrails (large gaps)
+- Added guardrails for 1 Hz resampling to prevent huge allocations when timelines contain large timestamp gaps.
+- Exposed overrides in both CLIs: `--resample-max-gap-sec` and `--resample-max-points`; JSON sidecars now record these settings.
+- Rust altitude pipeline now skips resampling (with a warning) when guardrails trigger; all-windows modes return a clear error instead.
+- Added unit tests in Python and Rust covering guardrail behavior and overrides.

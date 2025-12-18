@@ -114,6 +114,8 @@ pub struct Params {
     pub merge_eps_sec: f64,
     pub overlap_policy: String,
     pub resample_1hz: bool,
+    pub resample_max_gap_sec: f64,
+    pub resample_max_points: usize,
     pub qc_enabled: bool,
     pub qc_spec: Option<HashMap<OrderedFloat<f64>, f64>>,
     pub wr_profile: String,
@@ -145,6 +147,8 @@ impl Default for Params {
             merge_eps_sec: 0.5,
             overlap_policy: "file:last".to_string(),
             resample_1hz: true,
+            resample_max_gap_sec: 2.0 * 3600.0,
+            resample_max_points: 500_000,
             qc_enabled: true,
             qc_spec: None,
             wr_profile: "overall".to_string(),
@@ -566,13 +570,22 @@ pub fn compute_timeseries_export(
             .zip(timeseries.gain.iter())
             .map(|(&t, &g)| (t, g))
             .collect();
-        let (mut t_resampled, mut g_resampled) = resample_1hz(&samples);
-        normalize_timeseries(
-            &mut t_resampled,
-            &mut g_resampled,
-            Option::<&mut Vec<bool>>::None,
-        );
-        (t_resampled, g_resampled)
+        if let Some(reason) = resample_guard_reason(
+            &samples,
+            params.resample_max_gap_sec,
+            params.resample_max_points,
+        ) {
+            tracing::warn!("Skipping 1 Hz resample: {}", reason);
+            (timeseries.times.clone(), timeseries.gain.clone())
+        } else {
+            let (mut t_resampled, mut g_resampled) = resample_1hz(&samples);
+            normalize_timeseries(
+                &mut t_resampled,
+                &mut g_resampled,
+                Option::<&mut Vec<bool>>::None,
+            );
+            (t_resampled, g_resampled)
+        }
     } else {
         (timeseries.times.clone(), timeseries.gain.clone())
     };
@@ -652,6 +665,16 @@ pub fn compute_curves(
                 .zip(timeseries.gain.iter())
                 .map(|(&t, &g)| (t, g))
                 .collect();
+            if let Some(reason) = resample_guard_reason(
+                &pairs,
+                params.resample_max_gap_sec,
+                params.resample_max_points,
+            ) {
+                return Err(HcError::InvalidParameter(format!(
+                    "1 Hz resample blocked ({}); use --raw-sampling or increase --resample-max-gap-sec/--resample-max-points",
+                    reason
+                )));
+            }
             let (mut t_resampled, mut g_resampled) = resample_1hz(&pairs);
             normalize_timeseries(
                 &mut t_resampled,
@@ -795,14 +818,22 @@ pub fn compute_gain_time(
     if params.all_windows {
         let step = params.step_s.max(1);
         let (series_times, series_gain) = if params.resample_1hz {
-            (timeseries.times.clone(), timeseries.gain.clone())
-        } else {
             let samples: Vec<(f64, f64)> = timeseries
                 .times
                 .iter()
                 .zip(timeseries.gain.iter())
                 .map(|(&t, &g)| (t, g))
                 .collect();
+            if let Some(reason) = resample_guard_reason(
+                &samples,
+                params.resample_max_gap_sec,
+                params.resample_max_points,
+            ) {
+                return Err(HcError::InvalidParameter(format!(
+                    "1 Hz resample blocked ({}); use --raw-sampling or increase --resample-max-gap-sec/--resample-max-points",
+                    reason
+                )));
+            }
             let (mut t_resampled, mut g_resampled) = resample_1hz(&samples);
             normalize_timeseries(
                 &mut t_resampled,
@@ -810,6 +841,8 @@ pub fn compute_gain_time(
                 Option::<&mut Vec<bool>>::None,
             );
             (t_resampled, g_resampled)
+        } else {
+            (timeseries.times.clone(), timeseries.gain.clone())
         };
 
         ensure_uniform_sampling(&series_times)?;
@@ -1919,7 +1952,16 @@ fn build_timeseries_from_altitude(
     points.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-6);
 
     let (times_raw, altitude_raw) = if params.resample_1hz {
-        resample_1hz(&points)
+        if let Some(reason) = resample_guard_reason(
+            &points,
+            params.resample_max_gap_sec,
+            params.resample_max_points,
+        ) {
+            tracing::warn!("Skipping 1 Hz altitude resample: {}", reason);
+            points.into_iter().unzip()
+        } else {
+            resample_1hz(&points)
+        }
     } else {
         points.into_iter().unzip()
     };
@@ -3021,6 +3063,42 @@ fn detect_gaps(times: &[f64], gap_sec: f64) -> Vec<Gap> {
         }
     }
     gaps
+}
+
+fn resample_guard_reason(points: &[(f64, f64)], max_gap_sec: f64, max_points: usize) -> Option<String> {
+    if points.len() < 2 {
+        return None;
+    }
+
+    if max_gap_sec > 0.0 {
+        let mut max_gap = 0.0;
+        for window in points.windows(2) {
+            let dt = window[1].0 - window[0].0;
+            if dt > max_gap {
+                max_gap = dt;
+            }
+        }
+        if max_gap > max_gap_sec {
+            return Some(format!(
+                "max timestamp gap {:.0}s exceeds resample_max_gap_sec {:.0}s",
+                max_gap, max_gap_sec
+            ));
+        }
+    }
+
+    if max_points > 0 {
+        let start = points[0].0.floor();
+        let end = points.last().unwrap().0.ceil();
+        let len = (end - start).max(0.0) as usize + 1;
+        if len > max_points {
+            return Some(format!(
+                "would allocate {} points (> resample_max_points {})",
+                len, max_points
+            ));
+        }
+    }
+
+    None
 }
 
 fn resample_1hz(points: &[(f64, f64)]) -> (Vec<f64>, Vec<f64>) {
@@ -4195,5 +4273,19 @@ mod tests {
         }
         assert!((map.get(&1).copied().unwrap_or_default() - 20.0).abs() < 1e-6);
         assert!((map.get(&2).copied().unwrap_or_default() - 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_resample_guard_reason_flags_large_gaps_and_allocations() {
+        let points = vec![(0.0, 0.0), (1.0, 0.0), (10_000.0, 10.0)];
+
+        let reason_gap = resample_guard_reason(&points, 2.0 * 3600.0, 500_000);
+        assert!(reason_gap.is_some());
+
+        let reason_points = resample_guard_reason(&points, 0.0, 5_000);
+        assert!(reason_points.is_some());
+
+        let ok = resample_guard_reason(&points, 0.0, 20_000);
+        assert!(ok.is_none());
     }
 }

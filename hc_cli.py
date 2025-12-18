@@ -64,6 +64,8 @@ def _run(
     merge_eps_sec: float = 0.5,
     overlap_policy: str = "file:last",
     resample_1hz: bool = False,
+    resample_max_gap_sec: float = DEFAULT_RESAMPLE_MAX_GAP_SEC,
+    resample_max_points: int = DEFAULT_RESAMPLE_MAX_POINTS,
     parse_workers: int = 0,
     gain_eps: float = 0.5,
     smooth_sec: float = 0.0,
@@ -112,6 +114,8 @@ def _run(
             qc_enabled=qc_enabled,
             qc_spec_path=qc_spec_path,
             resample_1hz=resample_1hz,
+            resample_max_gap_sec=resample_max_gap_sec,
+            resample_max_points=resample_max_points,
             merge_eps_sec=merge_eps_sec,
             overlap_policy=overlap_policy,
             parse_workers=parse_workers,
@@ -149,7 +153,12 @@ def _run(
                 if abs(offset) > 1e-9:
                     times = [float(t - offset) for t in times]
             else:
-                times, values = _resample_to_1hz(times, values)
+                times, values = _resample_to_1hz(
+                    times,
+                    values,
+                    max_gap_sec=resample_max_gap_sec,
+                    max_points=resample_max_points,
+                )
         curve = all_windows_curve(times, values, step=step_for_all)
         duration_grid = [cp.duration_s for cp in curve]
         profiler.lap("curve")
@@ -365,6 +374,8 @@ def _run(
                     "step_s": step_s,
                     "max_duration_s": max_duration_s,
                     "resample_1hz": resample_1hz,
+                    "resample_max_gap_sec": resample_max_gap_sec,
+                    "resample_max_points": resample_max_points,
                     "parse_workers": parse_workers,
                     "gain_eps": gain_eps,
                     "smooth_sec": smooth_sec,
@@ -486,6 +497,8 @@ def _run_gain_time(
     merge_eps_sec: float = 0.5,
     overlap_policy: str = "file:last",
     resample_1hz: bool = False,
+    resample_max_gap_sec: float = DEFAULT_RESAMPLE_MAX_GAP_SEC,
+    resample_max_points: int = DEFAULT_RESAMPLE_MAX_POINTS,
     parse_workers: int = 0,
     gain_eps: float = 0.5,
     smooth_sec: float = 0.0,
@@ -529,6 +542,8 @@ def _run_gain_time(
             qc_enabled=qc_enabled,
             qc_spec_path=qc_spec_path,
             resample_1hz=resample_1hz,
+            resample_max_gap_sec=resample_max_gap_sec,
+            resample_max_points=resample_max_points,
             merge_eps_sec=merge_eps_sec,
             overlap_policy=overlap_policy,
             parse_workers=parse_workers,
@@ -567,7 +582,17 @@ def _run_gain_time(
     if all_windows:
         step_for_all = step_s if step_s > 0 else 1
         if not resample_1hz:
-            times, values = _resample_to_1hz(times, values)
+            if _is_uniform_1hz(times):
+                offset = times[0]
+                if abs(offset) > 1e-9:
+                    times = [float(t - offset) for t in times]
+            else:
+                times, values = _resample_to_1hz(
+                    times,
+                    values,
+                    max_gap_sec=resample_max_gap_sec,
+                    max_points=resample_max_points,
+                )
         curve = all_windows_curve(times, values, step=step_for_all)
         duration_grid = [cp.duration_s for cp in curve]
     else:
@@ -804,6 +829,8 @@ def _run_gain_time(
                     "step_s": step_s,
                     "max_duration_s": max_duration_s,
                     "resample_1hz": resample_1hz,
+                    "resample_max_gap_sec": resample_max_gap_sec,
+                    "resample_max_points": resample_max_points,
                     "parse_workers": parse_workers,
                     "gain_eps": gain_eps,
                     "smooth_sec": smooth_sec,
@@ -919,6 +946,18 @@ def _build_typer_app():  # pragma: no cover
         merge_eps_sec: float = typer.Option(0.5, "--merge-eps-sec", help="Coalesce tolerance (seconds) for overlapping timestamps"),
         overlap_policy: str = typer.Option("file:last", "--overlap-policy", help="Overlap precedence for tg: file:first|file:last"),
         resample_1hz: bool = typer.Option(False, "--resample-1hz", help="Resample cumulative series to 1 Hz"),
+        resample_max_gap_sec: float = typer.Option(
+            DEFAULT_RESAMPLE_MAX_GAP_SEC,
+            "--resample-max-gap-sec",
+            help="Guardrail: refuse to fill timestamp gaps longer than this when resampling to 1 Hz",
+            show_default=True,
+        ),
+        resample_max_points: int = typer.Option(
+            DEFAULT_RESAMPLE_MAX_POINTS,
+            "--resample-max-points",
+            help="Guardrail: refuse to allocate more than this many 1 Hz samples when resampling",
+            show_default=True,
+        ),
         parse_workers: int = typer.Option(0, "--parse-workers", help="Number of worker threads for FIT parsing (0=auto, 1=serial)"),
         gain_eps: float = typer.Option(0.5, "--gain-eps", help="Altitude hysteresis (m) for ascent from altitude"),
         smooth_sec: float = typer.Option(0.0, "--smooth", help="Additional altitude smoothing window (seconds), applied after the effective altitude path", show_default=True),
@@ -963,6 +1002,8 @@ def _build_typer_app():  # pragma: no cover
             merge_eps_sec=merge_eps_sec,
             overlap_policy=overlap_policy,
             resample_1hz=resample_1hz,
+            resample_max_gap_sec=resample_max_gap_sec,
+            resample_max_points=resample_max_points,
             parse_workers=parse_workers,
             gain_eps=gain_eps,
             smooth_sec=smooth_sec,
@@ -1025,6 +1066,18 @@ def _build_typer_app():  # pragma: no cover
         merge_eps_sec: float = typer.Option(0.5, "--merge-eps-sec", help="Coalesce tolerance (seconds) for overlapping timestamps"),
         overlap_policy: str = typer.Option("file:last", "--overlap-policy", help="Overlap precedence: file:first|file:last"),
         resample_1hz: bool = typer.Option(False, "--resample-1hz", help="Resample cumulative series to 1 Hz"),
+        resample_max_gap_sec: float = typer.Option(
+            DEFAULT_RESAMPLE_MAX_GAP_SEC,
+            "--resample-max-gap-sec",
+            help="Guardrail: refuse to fill timestamp gaps longer than this when resampling to 1 Hz",
+            show_default=True,
+        ),
+        resample_max_points: int = typer.Option(
+            DEFAULT_RESAMPLE_MAX_POINTS,
+            "--resample-max-points",
+            help="Guardrail: refuse to allocate more than this many 1 Hz samples when resampling",
+            show_default=True,
+        ),
         parse_workers: int = typer.Option(0, "--parse-workers", help="Number of worker threads for FIT parsing (0=auto, 1=serial)"),
         gain_eps: float = typer.Option(0.5, "--gain-eps", help="Altitude hysteresis (m) for ascent from altitude"),
         smooth_sec: float = typer.Option(0.0, "--smooth", help="Additional altitude smoothing window (seconds), applied after the effective altitude path", show_default=True),
@@ -1086,6 +1139,8 @@ def _build_typer_app():  # pragma: no cover
             merge_eps_sec=merge_eps_sec,
             overlap_policy=overlap_policy,
             resample_1hz=resample_1hz,
+            resample_max_gap_sec=resample_max_gap_sec,
+            resample_max_points=resample_max_points,
             parse_workers=parse_workers,
             gain_eps=gain_eps,
             smooth_sec=smooth_sec,
@@ -1129,6 +1184,18 @@ def _build_typer_app():  # pragma: no cover
         ),
         verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
         resample_1hz: bool = typer.Option(False, "--resample-1hz", help="Resample cumulative series to 1 Hz"),
+        resample_max_gap_sec: float = typer.Option(
+            DEFAULT_RESAMPLE_MAX_GAP_SEC,
+            "--resample-max-gap-sec",
+            help="Guardrail: refuse to fill timestamp gaps longer than this when resampling to 1 Hz",
+            show_default=True,
+        ),
+        resample_max_points: int = typer.Option(
+            DEFAULT_RESAMPLE_MAX_POINTS,
+            "--resample-max-points",
+            help="Guardrail: refuse to allocate more than this many 1 Hz samples when resampling",
+            show_default=True,
+        ),
         parse_workers: int = typer.Option(0, "--parse-workers", help="Number of worker threads for FIT parsing (0=auto, 1=serial)"),
         gain_eps: float = typer.Option(0.5, "--gain-eps", help="Altitude hysteresis (m) for ascent from altitude"),
         smooth_sec: float = typer.Option(0.0, "--smooth", help="Additional altitude smoothing window (seconds), applied after the effective altitude path", show_default=True),
@@ -1147,22 +1214,24 @@ def _build_typer_app():  # pragma: no cover
         if clear_cache:
             _clear_parsed_fit_cache()
         code = _export_series_command(
-            fit_files,
-            output,
-            source,
-            verbose,
-            resample_1hz,
-            parse_workers,
-            gain_eps,
-            smooth_sec,
-            session_gap_sec,
-            qc,
-            qc_spec,
-            merge_eps_sec,
-            overlap_policy,
-            log_file,
-            profile,
-            json_sidecar,
+            fit_files=fit_files,
+            output=output,
+            source=source,
+            verbose=verbose,
+            resample_1hz=resample_1hz,
+            resample_max_gap_sec=resample_max_gap_sec,
+            resample_max_points=resample_max_points,
+            parse_workers=parse_workers,
+            gain_eps=gain_eps,
+            smooth_sec=smooth_sec,
+            session_gap_sec=session_gap_sec,
+            qc_enabled=qc,
+            qc_spec_path=qc_spec,
+            merge_eps_sec=merge_eps_sec,
+            overlap_policy=overlap_policy,
+            log_file=log_file,
+            profile=profile,
+            json_sidecar=json_sidecar,
         )
         if code != 0:
             raise typer.Exit(code)

@@ -46,5 +46,20 @@ class TestFitParsingHelpers(unittest.TestCase):
         self.assertAlmostEqual(merged[0]["dist"], 12.0)
 
 
+class TestResampleGuardrails(unittest.TestCase):
+    def test_resample_rejects_large_gaps_by_default(self) -> None:
+        times = [0.0, 1.0, 10_000.0]
+        gains = [0.0, 0.0, 10.0]
+        with self.assertRaises(RuntimeError):
+            hc_curve._resample_to_1hz(times, gains)
+
+    def test_resample_allows_override_of_gap_guard(self) -> None:
+        times = [0.0, 1.0, 10_000.0]
+        gains = [0.0, 0.0, 10.0]
+        t_out, g_out = hc_curve._resample_to_1hz(times, gains, max_gap_sec=0.0, max_points=20_000)
+        self.assertEqual(len(t_out), 10_001)
+        self.assertEqual(len(g_out), 10_001)
+
+
 if __name__ == "__main__":
     unittest.main()
