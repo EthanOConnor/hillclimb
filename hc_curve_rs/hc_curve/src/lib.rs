@@ -15,8 +15,9 @@ use wr::build_wr_envelope;
 
 mod ascent;
 pub use ascent::{
-    compute_ascent_algorithm, list_ascent_algorithms, AscentAlgorithmConfig, AscentAlgorithmInfo,
-    AscentAlgorithmResult, AscentDiagnostics, AscentRequirement, AscentSeries,
+    compute_ascent_algorithm, compute_ascent_compare, list_ascent_algorithms, AscentAlgorithmConfig,
+    AscentAlgorithmInfo, AscentAlgorithmResult, AscentCompareAlgorithmEntry, AscentCompareReport,
+    AscentDiagnostics, AscentRequirement, AscentSeries,
 };
 
 const DEFAULT_DURATIONS: &[u64] = &[60, 120, 300, 600, 1_200, 1_800, 3_600];

@@ -56,7 +56,7 @@ See also: `docs/REVIEW_2025-12-18.md` (comprehensive handoff + decisions).
   - Acceptance: Rust core exposes a registry of ascent algorithms with stable IDs and parameter hashing in JSON sidecars.
   - Acceptance: outputs include per-algorithm diagnostics (idle %, smoothing applied, thresholds, removed ascent from QC).
 
-- [ ] **(ENG/Senior)** Add “Algorithm Lab” CLI commands
+- [x] **(ENG/Senior)** Add “Algorithm Lab” CLI commands
   - Acceptance: `hc_curve_cli ascent compare … --json` (or similar) produces a multi-algorithm report for a single activity.
   - Acceptance: report includes algorithm-by-algorithm totals + curve deltas + summary table.
 
@@ -64,7 +64,7 @@ See also: `docs/REVIEW_2025-12-18.md` (comprehensive handoff + decisions).
   - Acceptance: multi-select algorithms, recompute, and render overlays + a results table.
   - Acceptance: UI communicates “local processing” and “definitions” clearly; error states are actionable.
 
-- [ ] **(ENG/Senior)** Implement initial external/reference ascent behaviors
+- [x] **(ENG/Senior)** Implement initial external/reference ascent behaviors
   - Acceptance: add at least 3 named profiles with documented parameterization:
     - Strava-style thresholding (parameterized; behavior documented in `docs/`).
     - GoldenCheetah-style hysteresis thresholding.

@@ -85,6 +85,7 @@ The Rust rewrite (`hc_curve_rs/hc_curve_cli`) mirrors the Python features while 
 - `--ylog-rate` / `--ylog-climb` now clamp the lower bound so flat sessions (zero or negative ascent) render without errors.
 - FIT/GPX inputs are parsed in parallel and cached on disk under `.cache/parsed_fit/`, keyed by path, size, and mtime; cached entries are re-keyed to the current file ordering so multi-run workflows stay correct.
 - `--profile` emits parse/compute/CSV/plot timing just like the Python CLI. Combine with `--verbose` for more granular tracing.
+- Algorithm Lab CLI: `ascent list` prints stable algorithm IDs; `ascent compare … --json -o ascent_compare.json` runs multiple ascent algorithms on the same activity and reports deltas vs a baseline.
 - All other flags mirror the Python names; see `hc_curve_rs/README.md` for a concise summary of the Rust-specific options and behaviour.
 
 CSV columns

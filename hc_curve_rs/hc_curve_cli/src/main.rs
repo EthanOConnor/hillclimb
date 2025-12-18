@@ -12,8 +12,10 @@ use fitparser::de::from_bytes;
 use fitparser::profile::MesgNum;
 use fitparser::Value as FitValue;
 use hc_curve::{
-    compute_curves, compute_gain_time, compute_timeseries_export, parse_duration_token,
-    parse_records, Curves, Engine, GainTimePoint, GainTimeResult, Params, Source, TimeseriesExport,
+    compute_ascent_compare, compute_curves, compute_gain_time, compute_timeseries_export,
+    list_ascent_algorithms, parse_duration_token, parse_records, AscentAlgorithmConfig,
+    AscentCompareAlgorithmEntry, Curves, Engine, GainTimePoint, GainTimeResult, Params, Source,
+    TimeseriesExport,
 };
 use ordered_float::OrderedFloat;
 use plotters::prelude::IntoLogRange;
@@ -63,6 +65,8 @@ enum Command {
     GainTime(GainTimeArgs),
     /// Export canonical cumulative gain series for external tooling
     ExportSeries(ExportSeriesArgs),
+    /// Algorithm Lab helpers: list and compare ascent algorithms
+    Ascent(AscentArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -497,6 +501,100 @@ struct ExportSeriesArgs {
     log_file: Option<PathBuf>,
 }
 
+#[derive(Parser, Debug)]
+struct AscentArgs {
+    #[command(subcommand)]
+    command: AscentCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum AscentCommand {
+    /// List available ascent algorithms (IDs + descriptions)
+    List,
+    /// Compare multiple ascent algorithms on a single activity
+    Compare(AscentCompareArgs),
+}
+
+#[derive(Parser, Debug)]
+struct AscentCompareArgs {
+    /// FIT/GPX files to ingest
+    #[arg(required = true, value_hint = ValueHint::FilePath)]
+    inputs: Vec<PathBuf>,
+
+    /// Write JSON report
+    #[arg(long, action = ArgAction::SetTrue)]
+    json: bool,
+
+    /// JSON output path (only used with --json)
+    #[arg(short, long, default_value = "ascent_compare.json", value_hint = ValueHint::FilePath)]
+    output: PathBuf,
+
+    /// Baseline algorithm ID (for delta columns)
+    #[arg(long, default_value = "hc.altitude.canonical.v1")]
+    baseline: String,
+
+    /// Algorithm IDs to run (comma separated)
+    #[arg(
+        long,
+        value_delimiter = ',',
+        num_args = 1..,
+        default_value = "strava.altitude.threshold.v1,goldencheetah.altitude.hysteresis.v1,twonav.altitude.min_altitude_increase.v1"
+    )]
+    algorithms: Vec<String>,
+
+    /// Optional durations list (comma separated seconds)
+    #[arg(long)]
+    durations: Option<String>,
+
+    /// Gap threshold (seconds) for session segmentation
+    #[arg(long, default_value_t = 600.0)]
+    session_gap: f64,
+
+    /// Timestamp merge tolerance (seconds)
+    #[arg(long, default_value_t = 0.5)]
+    merge_eps: f64,
+
+    /// Overlap precedence policy for total gain
+    #[arg(long, default_value = "file:last")]
+    overlap_policy: String,
+
+    /// Keep native sampling (skip 1 Hz resample)
+    #[arg(long, action = ArgAction::SetTrue)]
+    raw_sampling: bool,
+
+    /// Guardrail: refuse to fill timestamp gaps longer than this when resampling to 1 Hz
+    #[arg(long, default_value_t = 2.0 * 3600.0)]
+    resample_max_gap_sec: f64,
+
+    /// Guardrail: refuse to allocate more than this many 1 Hz samples when resampling
+    #[arg(long, default_value_t = 500_000)]
+    resample_max_points: usize,
+
+    /// Disable QC censoring
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_qc: bool,
+
+    /// Optional QC override JSON path
+    #[arg(long, value_hint = ValueHint::FilePath)]
+    qc_spec: Option<PathBuf>,
+
+    /// Curve engine for per-duration deltas (auto|numpy|numba|stride)
+    #[arg(long, value_enum, default_value_t = EngineOpt::Auto)]
+    engine: EngineOpt,
+
+    /// Clear parsed FIT cache before running
+    #[arg(long, action = ArgAction::SetTrue)]
+    clear_cache: bool,
+
+    /// Verbose logging
+    #[arg(long, action = ArgAction::SetTrue)]
+    verbose: bool,
+
+    /// Profile major stages with timings
+    #[arg(long, action = ArgAction::SetTrue)]
+    profile: bool,
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum SourceOpt {
     Auto,
@@ -572,6 +670,16 @@ fn main() -> Result<()> {
                 "info"
             }
         }
+        Command::Ascent(args) => match &args.command {
+            AscentCommand::List => "info",
+            AscentCommand::Compare(compare) => {
+                if compare.verbose {
+                    "debug"
+                } else {
+                    "info"
+                }
+            }
+        },
     };
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
@@ -585,6 +693,7 @@ fn main() -> Result<()> {
         Command::Diagnose(args) => handle_diagnose(args),
         Command::GainTime(args) => handle_gain_time(args),
         Command::ExportSeries(args) => handle_export_series(args),
+        Command::Ascent(args) => handle_ascent(args),
     }
 }
 
@@ -1236,6 +1345,187 @@ fn handle_export_series(args: ExportSeriesArgs) -> Result<()> {
                 .with_context(|| format!("failed to write {}", json_path.display()))?;
             info!("Wrote JSON: {}", json_path.display());
         }
+    }
+
+    Ok(())
+}
+
+fn handle_ascent(args: AscentArgs) -> Result<()> {
+    match args.command {
+        AscentCommand::List => {
+            for alg in list_ascent_algorithms() {
+                println!("{:<40} {}", alg.id, alg.description);
+            }
+            Ok(())
+        }
+        AscentCommand::Compare(compare) => handle_ascent_compare(compare),
+    }
+}
+
+fn handle_ascent_compare(args: AscentCompareArgs) -> Result<()> {
+    if args.inputs.is_empty() {
+        return Err(anyhow!("no input files supplied"));
+    }
+
+    let mut params = Params::default();
+    params.session_gap_sec = args.session_gap;
+    params.merge_eps_sec = args.merge_eps;
+    params.overlap_policy = args.overlap_policy.clone();
+    params.resample_1hz = !args.raw_sampling;
+    params.resample_max_gap_sec = args.resample_max_gap_sec;
+    params.resample_max_points = args.resample_max_points;
+    params.qc_enabled = !args.no_qc;
+    params.engine = args.engine.into();
+
+    if let Some(spec_path) = args.qc_spec.as_ref() {
+        params.qc_spec = Some(load_qc_spec(spec_path)?);
+    }
+
+    let baseline_cfg = AscentAlgorithmConfig::default_for_id(&args.baseline)
+        .ok_or_else(|| anyhow!("Unknown baseline algorithm '{}'. Run: hc_curve_cli ascent list", args.baseline))?;
+
+    let mut algo_cfgs: Vec<AscentAlgorithmConfig> = Vec::new();
+    let mut algo_ids_run: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let _ = seen.insert(baseline_cfg.id());
+    for id in &args.algorithms {
+        let cfg = AscentAlgorithmConfig::default_for_id(id).ok_or_else(|| {
+            anyhow!(
+                "Unknown algorithm '{}'. Run: hc_curve_cli ascent list",
+                id
+            )
+        })?;
+        let cfg_id = cfg.id();
+        if !seen.insert(cfg_id) {
+            continue;
+        }
+        algo_ids_run.push(cfg_id.to_string());
+        algo_cfgs.push(cfg);
+    }
+
+    let durations_s = if let Some(durations_str) = args.durations.as_ref() {
+        let durations = parse_duration_list(durations_str)?;
+        if durations.is_empty() {
+            return Err(anyhow!("--durations list was empty"));
+        }
+        Some(durations)
+    } else {
+        None
+    };
+
+    let cache_dir = PathBuf::from(".cache").join("parsed_fit");
+    if args.clear_cache {
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+    let _ = fs::create_dir_all(&cache_dir);
+
+    let t_parse = Instant::now();
+    let inputs: Vec<(usize, PathBuf)> = args.inputs.iter().cloned().enumerate().collect();
+
+    let mut records: Vec<(usize, Vec<hc_curve::FitRecord>)> = inputs
+        .par_iter()
+        .map(
+            |(file_id, path)| -> Result<(usize, Vec<hc_curve::FitRecord>)> {
+                let key = cache_key(path)?;
+                if let Some(mut cached) = read_cache(&cache_dir, &key) {
+                    for record in &mut cached {
+                        record.file_id = *file_id;
+                    }
+                    return Ok((*file_id, cached));
+                }
+                let data =
+                    fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+                let hint = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("fit");
+                let parsed = parse_records(&data, *file_id, hint)
+                    .with_context(|| format!("failed to parse {}", path.display()))?;
+                let _ = write_cache(&cache_dir, &key, &parsed);
+                Ok((*file_id, parsed))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+
+    records.sort_by_key(|(id, _)| *id);
+    let records: Vec<Vec<hc_curve::FitRecord>> = records.into_iter().map(|(_, r)| r).collect();
+
+    if args.profile || args.verbose {
+        info!(
+            "Parse stage: {:.1} ms",
+            t_parse.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    let t_compute = Instant::now();
+    let report = compute_ascent_compare(records, &params, &baseline_cfg, &algo_cfgs, durations_s)?;
+    if args.profile || args.verbose {
+        info!(
+            "Compute stage: {:.1} ms ({} algorithms)",
+            t_compute.elapsed().as_secs_f64() * 1000.0,
+            report.entries.len() + 1
+        );
+    }
+
+    // Print a compact summary table to stdout.
+    println!("Baseline: {}", report.baseline_algorithm_id);
+    match &report.baseline {
+        AscentCompareAlgorithmEntry::Ok {
+            name,
+            total_gain_m,
+            ..
+        } => println!("  {}: {:.1} m", name, total_gain_m),
+        AscentCompareAlgorithmEntry::Error { error, .. } => println!("  ERROR: {}", error),
+    }
+
+    println!();
+    println!("{:<40} {:>10} {:>10}", "algorithm_id", "gain_m", "delta_m");
+    println!("{}", "-".repeat(64));
+
+    for entry in &report.entries {
+        match entry {
+            AscentCompareAlgorithmEntry::Ok {
+                algorithm_id,
+                total_gain_m,
+                delta_total_gain_m,
+                ..
+            } => println!("{:<40} {:>10.1} {:>10.1}", algorithm_id, total_gain_m, delta_total_gain_m),
+            AscentCompareAlgorithmEntry::Error {
+                algorithm_id, error, ..
+            } => println!("{:<40} {:>10} {:>10}", algorithm_id, "ERR", error),
+        }
+    }
+
+    if args.json {
+        let meta = json!({
+            "schema_version": JSON_REPORT_SCHEMA_VERSION,
+            "command": "ascent-compare",
+            "app_version": env!("CARGO_PKG_VERSION"),
+            "parser": { "name": "fitparser" },
+            "inputs": args.inputs.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+            "baseline_algorithm_id": report.baseline_algorithm_id.clone(),
+            "algorithms": algo_ids_run,
+            "durations_s": report.durations_s.clone(),
+            "qc_enabled": params.qc_enabled,
+            "qc_spec": args.qc_spec.as_ref().map(|p| p.to_string_lossy()),
+            "resample_1hz": params.resample_1hz,
+            "resample_max_gap_sec": params.resample_max_gap_sec,
+            "resample_max_points": params.resample_max_points,
+            "session_gap_sec": params.session_gap_sec,
+            "merge_eps_sec": params.merge_eps_sec,
+            "overlap_policy": params.overlap_policy,
+            "engine": format!("{:?}", params.engine).to_lowercase(),
+        });
+
+        let payload = json!({
+            "meta": meta,
+            "compare": report,
+        });
+
+        let text = serde_json::to_string_pretty(&payload)?;
+        fs::write(&args.output, text)
+            .with_context(|| format!("failed to write {}", args.output.display()))?;
+        info!("Wrote JSON: {}", args.output.display());
     }
 
     Ok(())

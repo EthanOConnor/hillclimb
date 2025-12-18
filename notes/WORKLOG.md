@@ -115,3 +115,7 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
   - `goldencheetah.altitude.hysteresis.v1` (3 m default)
   - `twonav.altitude.min_altitude_increase.v1` (5 m default)
 - Added `docs/ascent_reference_algorithms.md` documenting sources and modeled behavior.
+
+## 2025‑12‑18 – Algorithm Lab CLI (`ascent list` / `ascent compare`)
+- Added `hc_curve_cli ascent list` and `hc_curve_cli ascent compare` for side-by-side ascent algorithm comparison on a single activity.
+- `ascent compare` prints a compact table (gain + delta vs baseline) and optionally writes a versioned JSON report including per-algorithm diagnostics and curve deltas.

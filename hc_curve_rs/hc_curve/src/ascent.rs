@@ -52,6 +52,36 @@ pub struct AscentAlgorithmResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AscentCompareAlgorithmEntry {
+    Ok {
+        algorithm_id: String,
+        name: String,
+        params_hash: String,
+        params: JsonValue,
+        diagnostics: AscentDiagnostics,
+        total_span_s: f64,
+        total_gain_m: f64,
+        curve: Vec<super::CurvePoint>,
+        delta_total_gain_m: f64,
+        delta_curve_climb_m: Vec<f64>,
+    },
+    Error {
+        algorithm_id: String,
+        name: String,
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AscentCompareReport {
+    pub baseline_algorithm_id: String,
+    pub durations_s: Vec<u64>,
+    pub baseline: AscentCompareAlgorithmEntry,
+    pub entries: Vec<AscentCompareAlgorithmEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "id", content = "params")]
 pub enum AscentAlgorithmConfig {
     #[serde(rename = "hc.source.runn_total_gain.v1")]
@@ -367,6 +397,85 @@ pub fn compute_ascent_algorithm(
     })
 }
 
+pub fn compute_ascent_compare(
+    records_by_file: Vec<Vec<FitRecord>>,
+    params: &Params,
+    baseline: &AscentAlgorithmConfig,
+    algorithms: &[AscentAlgorithmConfig],
+    durations_s: Option<Vec<u64>>,
+) -> Result<AscentCompareReport, HcError> {
+    let durations: Vec<u64> = durations_s
+        .unwrap_or_else(|| super::DEFAULT_DURATIONS.to_vec())
+        .into_iter()
+        .filter(|&d| d > 0)
+        .collect();
+    if durations.is_empty() {
+        return Err(HcError::InvalidParameter("no durations available".into()));
+    }
+
+    let baseline_ascent = compute_ascent_algorithm(records_by_file.clone(), params, baseline)?;
+    let baseline_curve = compute_curve_for_ascent(&baseline_ascent, params, &durations);
+    let baseline_total = baseline_ascent.total_gain_m;
+    let baseline_climbs = climbs_by_duration(&baseline_curve);
+
+    let baseline_entry = AscentCompareAlgorithmEntry::Ok {
+        algorithm_id: baseline.id().to_string(),
+        name: baseline.name().to_string(),
+        params_hash: baseline_ascent.params_hash.clone(),
+        params: baseline_ascent.params.clone(),
+        diagnostics: baseline_ascent.diagnostics.clone(),
+        total_span_s: baseline_ascent.total_span_s,
+        total_gain_m: baseline_total,
+        curve: baseline_curve,
+        delta_total_gain_m: 0.0,
+        delta_curve_climb_m: vec![0.0; durations.len()],
+    };
+
+    let mut entries = Vec::with_capacity(algorithms.len());
+    let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let _ = seen.insert(baseline.id());
+    for algo in algorithms {
+        let algo_id = algo.id();
+        if !seen.insert(algo_id) {
+            continue;
+        }
+        match compute_ascent_algorithm(records_by_file.clone(), params, algo) {
+            Ok(ascent) => {
+                let curve = compute_curve_for_ascent(&ascent, params, &durations);
+                let climbs = climbs_by_duration(&curve);
+                let delta_curve = durations
+                    .iter()
+                    .map(|d| climbs.get(d).copied().unwrap_or(0.0) - baseline_climbs.get(d).copied().unwrap_or(0.0))
+                    .collect::<Vec<f64>>();
+                entries.push(AscentCompareAlgorithmEntry::Ok {
+                    algorithm_id: algo_id.to_string(),
+                    name: algo.name().to_string(),
+                    params_hash: ascent.params_hash.clone(),
+                    params: ascent.params.clone(),
+                    diagnostics: ascent.diagnostics.clone(),
+                    total_span_s: ascent.total_span_s,
+                    total_gain_m: ascent.total_gain_m,
+                    curve,
+                    delta_total_gain_m: ascent.total_gain_m - baseline_total,
+                    delta_curve_climb_m: delta_curve,
+                });
+            }
+            Err(err) => entries.push(AscentCompareAlgorithmEntry::Error {
+                algorithm_id: algo_id.to_string(),
+                name: algo.name().to_string(),
+                error: err.to_string(),
+            }),
+        }
+    }
+
+    Ok(AscentCompareReport {
+        baseline_algorithm_id: baseline.id().to_string(),
+        durations_s: durations,
+        baseline: baseline_entry,
+        entries,
+    })
+}
+
 fn cumulative_ascent_uprun_threshold(altitude: &[f64], threshold_m: f64) -> Vec<f64> {
     if altitude.is_empty() {
         return Vec::new();
@@ -420,6 +529,32 @@ fn cumulative_ascent_hysteresis_threshold(altitude: &[f64], threshold_m: f64) ->
             reference = z;
         }
         out.push(cum);
+    }
+    out
+}
+
+fn compute_curve_for_ascent(
+    ascent: &AscentAlgorithmResult,
+    params: &Params,
+    durations: &[u64],
+) -> Vec<super::CurvePoint> {
+    let span = ascent.series.times_s.last().copied().unwrap_or(0.0);
+    let series = super::Timeseries {
+        times: ascent.series.times_s.clone(),
+        gain: ascent.series.gain_m.clone(),
+        source: super::SourceKind::Altitude,
+        gaps: ascent.gaps.clone(),
+        inactivity_gaps: Vec::new(),
+        span,
+        used_sources: Default::default(),
+    };
+    super::compute_curve_points(&series, durations, params)
+}
+
+fn climbs_by_duration(points: &[super::CurvePoint]) -> std::collections::BTreeMap<u64, f64> {
+    let mut out = std::collections::BTreeMap::new();
+    for point in points {
+        out.insert(point.duration_s, point.max_climb_m);
     }
     out
 }
