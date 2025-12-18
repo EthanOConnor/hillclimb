@@ -13,6 +13,12 @@ use thiserror::Error;
 mod wr;
 use wr::build_wr_envelope;
 
+mod ascent;
+pub use ascent::{
+    compute_ascent_algorithm, list_ascent_algorithms, AscentAlgorithmConfig, AscentAlgorithmInfo,
+    AscentAlgorithmResult, AscentDiagnostics, AscentRequirement, AscentSeries,
+};
+
 const DEFAULT_DURATIONS: &[u64] = &[60, 120, 300, 600, 1_200, 1_800, 3_600];
 
 const DEFAULT_GAIN_TARGETS: &[f64] = &[50.0, 100.0, 150.0, 200.0, 300.0, 500.0, 750.0, 1_000.0];
@@ -1939,6 +1945,34 @@ fn build_timeseries_from_altitude(
     t0: f64,
     params: &Params,
 ) -> Result<(Vec<f64>, Vec<f64>), HcError> {
+    let (times_raw, gain, _diag) = build_altitude_ascent(
+        records,
+        t0,
+        params.resample_1hz,
+        params.resample_max_gap_sec,
+        params.resample_max_points,
+        params.smooth_sec,
+        params.gain_eps_m,
+    )?;
+    Ok((times_raw, gain))
+}
+
+#[derive(Clone, Debug)]
+struct AltitudeAscentDiagnostics {
+    idle_time_pct: f64,
+    resample_applied: bool,
+    resample_skipped_reason: Option<String>,
+}
+
+fn build_altitude_ascent(
+    records: &[MergedRecord],
+    t0: f64,
+    resample_1hz_requested: bool,
+    resample_max_gap_sec: f64,
+    resample_max_points: usize,
+    smooth_sec: f64,
+    gain_eps_m: f64,
+) -> Result<(Vec<f64>, Vec<f64>, AltitudeAscentDiagnostics), HcError> {
     let mut points: Vec<(f64, f64)> = records
         .iter()
         .filter_map(|r| r.alt.map(|alt| (r.time_s - t0, alt)))
@@ -1951,15 +1985,18 @@ fn build_timeseries_from_altitude(
     points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
     points.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-6);
 
-    let (times_raw, altitude_raw) = if params.resample_1hz {
-        if let Some(reason) = resample_guard_reason(
-            &points,
-            params.resample_max_gap_sec,
-            params.resample_max_points,
-        ) {
+    let mut resample_applied = false;
+    let mut resample_skipped_reason: Option<String> = None;
+
+    let (times_raw, altitude_raw) = if resample_1hz_requested {
+        if let Some(reason) =
+            resample_guard_reason(&points, resample_max_gap_sec, resample_max_points)
+        {
             tracing::warn!("Skipping 1 Hz altitude resample: {}", reason);
+            resample_skipped_reason = Some(reason);
             points.into_iter().unzip()
         } else {
+            resample_applied = true;
             resample_1hz(&points)
         }
     } else {
@@ -1974,16 +2011,46 @@ fn build_timeseries_from_altitude(
     let grade_med = estimate_session_grade(records);
 
     let mut altitude_eff = effective_altitude_path(&times_raw, &altitude_raw, speed_med, grade_med);
-    if params.smooth_sec > 0.0 {
-        altitude_eff = rolling_median_time(&times_raw, &altitude_eff, params.smooth_sec);
+    if smooth_sec > 0.0 {
+        altitude_eff = rolling_median_time(&times_raw, &altitude_eff, smooth_sec);
     }
 
     let (altitude_adj, moving_mask, _idle_mask) =
         apply_idle_detection(records, t0, &times_raw, &altitude_eff);
 
-    let gain = cumulative_ascent_from_altitude(&altitude_adj, params.gain_eps_m, &moving_mask);
+    let idle_time_pct = compute_idle_time_pct(&times_raw, &moving_mask);
 
-    Ok((times_raw, gain))
+    let gain = cumulative_ascent_from_altitude(&altitude_adj, gain_eps_m, &moving_mask);
+
+    Ok((
+        times_raw,
+        gain,
+        AltitudeAscentDiagnostics {
+            idle_time_pct,
+            resample_applied,
+            resample_skipped_reason,
+        },
+    ))
+}
+
+fn compute_idle_time_pct(times: &[f64], moving_mask: &[bool]) -> f64 {
+    if times.len() < 2 || moving_mask.len() != times.len() {
+        return 0.0;
+    }
+    let mut total = 0.0;
+    let mut moving = 0.0;
+    for i in 0..(times.len() - 1) {
+        let dt = (times[i + 1] - times[i]).max(0.0);
+        total += dt;
+        if moving_mask[i] {
+            moving += dt;
+        }
+    }
+    if total <= 0.0 {
+        0.0
+    } else {
+        ((total - moving).max(0.0) / total).clamp(0.0, 1.0)
+    }
 }
 
 fn estimate_session_speed(records: &[MergedRecord], t0: f64) -> f64 {

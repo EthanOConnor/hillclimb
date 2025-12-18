@@ -27,6 +27,7 @@ log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "std", "env-filter"] }
 ordered-float = { version = "4", features = ["serde"] }
+sha2 = "0.10"
 
 [workspace.metadata]
 description = "Hillclimb curve computation in Rust"

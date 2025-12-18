@@ -52,7 +52,7 @@ See also: `docs/REVIEW_2025-12-18.md` (comprehensive handoff + decisions).
     - exposing advanced settings without overwhelming default users
 
 ## P1 (Next)
-- [ ] **(ENG/Senior)** `AscentAlgorithm` interface + JSON schema (versioned)
+- [x] **(ENG/Senior)** `AscentAlgorithm` interface + JSON schema (versioned)
   - Acceptance: Rust core exposes a registry of ascent algorithms with stable IDs and parameter hashing in JSON sidecars.
   - Acceptance: outputs include per-algorithm diagnostics (idle %, smoothing applied, thresholds, removed ascent from QC).
 

@@ -103,3 +103,8 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 
 ## 2025‑12‑18 – Algorithm Lab UX spec
 - Added `docs/algorithm_lab_ux.md` with wireframe-level layout + copy + explainability requirements for multi-algorithm ascent comparison.
+
+## 2025‑12‑18 – AscentAlgorithm registry + schema
+- Added a Rust core ascent algorithm registry (`list_ascent_algorithms`) and a versioned config object with stable IDs + SHA‑256 parameter hashing.
+- Added `compute_ascent_algorithm` (Rust core) returning a per-algorithm ascent series plus diagnostics (QC removed, idle %, resample applied/skipped).
+- Documented the JSON shapes in `docs/ascent_algorithm_schema.md`.

@@ -65,6 +65,10 @@ Rationale: duplicated full implementations (Python + Rust) inevitably drift, and
 
 Rationale: supports reproducible algorithm comparisons and prevents silent output shifts as thresholds/tuning change.
 
+Implementation notes:
+- Rust core: `hc_curve_rs/hc_curve/src/ascent.rs` (registry + config + parameter hashing).
+- Schema doc: `docs/ascent_algorithm_schema.md`.
+
 ### FIT parser strategy (python-fitparse vs fitdecode)
 - Short term: keep `python-fitparse` in Python because it’s integrated and stable enough for current workflows.
 - Medium term: avoid being locked to a single Python FIT parser:

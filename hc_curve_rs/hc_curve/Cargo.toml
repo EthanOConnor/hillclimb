@@ -21,6 +21,7 @@ log.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ordered-float.workspace = true
+sha2.workspace = true
 
 [features]
 default = ["parallel"]
