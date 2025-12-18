@@ -1898,7 +1898,7 @@ where
     DB: DrawingBackend,
     DB::ErrorType: 'static,
 {
-    let mut area = root;
+    let area = root;
     area.fill(&WHITE)?;
 
     let gains_display: Vec<f64> = result
@@ -2109,7 +2109,7 @@ where
     DB: DrawingBackend,
     DB::ErrorType: 'static,
 {
-    let mut area = root;
+    let area = root;
     area.fill(&WHITE)?;
 
     let gains_display: Vec<f64> = result
@@ -2210,10 +2210,6 @@ where
 struct MagicPoint {
     duration_s: f64,
     user_gain: f64,
-    goal_gain: Option<f64>,
-    personal_gain: Option<f64>,
-    wr_gain: Option<f64>,
-    score_pct: Option<f64>,
 }
 
 enum ChartKind {
@@ -2345,17 +2341,9 @@ fn collect_magic_points(curves: &Curves) -> Vec<MagicPoint> {
             if duration <= 0.0 || user_gain <= 0.0 {
                 continue;
             }
-            let goal_gain = row.get("goal_gain_m").copied();
-            let personal_gain = row.get("personal_gain_m").copied();
-            let wr_gain = row.get("wr_gain_m").copied();
-            let score_pct = row.get("score_pct").copied();
             points.push(MagicPoint {
                 duration_s: duration,
                 user_gain,
-                goal_gain,
-                personal_gain,
-                wr_gain,
-                score_pct,
             });
         }
     }

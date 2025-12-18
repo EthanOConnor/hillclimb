@@ -1,6 +1,8 @@
 use leptos::prelude::*;
-use leptos::mount::mount_to_body;
 use leptos::task::spawn_local;
+
+#[cfg(target_arch = "wasm32")]
+use leptos::mount::mount_to_body;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_COMMIT: &str = env!("GIT_COMMIT_HASH");
