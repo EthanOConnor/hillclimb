@@ -36,7 +36,7 @@ Rust-only parsing supports this by:
 ## Python `python-fitparse` vs `fitdecode` (what’s true as of 2025‑12‑18)
 
 ### Maintenance / currency
-- `python-fitparse` is current on PyPI (2.0.4, Jul 2025) but the project description notes maintainer bandwidth constraints and suggests `fitdecode` as an alternative.
+- `python-fitparse` is current on PyPI (2.0.5, Dec 2025) but the project description notes maintainer bandwidth constraints and suggests `fitdecode` as an alternative.
 - The PyPI package name `fitparse` is *not* the same thing (it is older/dormant); this repo intentionally depends on `python-fitparse`.
 - `fitdecode` is current on PyPI (0.11.0, Aug 2025) and explicitly tracks recent FIT SDK profile versions, including developer-data handling switches.
 

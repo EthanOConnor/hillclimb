@@ -12,6 +12,7 @@ Usage
 -----
 
 Requirements: `python-fitparse` (imported as `fitparse`), `typer`, `matplotlib`, `numpy` (see `requirements.txt` for supported ranges).
+Known-good as of 2025‑12‑18: `python-fitparse` 2.0.5, `typer` 0.20.0, `matplotlib` 3.10.8, `numpy` 2.3.5.
 
 Optional extras:
 - `numba` for ~5× faster exhaustive/all‑windows kernels (auto‑detected).

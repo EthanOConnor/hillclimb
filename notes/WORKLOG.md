@@ -132,3 +132,6 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 - Added `--core python|rust` (plus `--rust-cli` / `HC_RUST_CLI`) to the Python `curve` and `time` commands so the Python CLI can delegate parsing + compute to the Rust CLI (`hc_curve_cli`) while keeping the existing CSV schema and Matplotlib plots.
 - Implemented subprocess execution + JSON parsing for curve/gain-time, including resample guardrail alignment (`--raw-sampling` mapping) and robust handling of Rust JSON `null` for non-finite gain-time times.
 - Fixed a plotting bug: `hc_plotting.py` now imports `_interpolate_gain_time` from `hc_curve` (was a NameError when plotting gain-time).
+
+## 2025‑12‑18 – Dependency currency sweep (web-verified)
+- Updated `requirements.txt` minimum for `python-fitparse` to 2.0.5 and refreshed docs to reflect current package versions as of 2025‑12‑18.
