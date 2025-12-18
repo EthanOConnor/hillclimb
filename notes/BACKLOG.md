@@ -31,7 +31,7 @@ See also: `docs/REVIEW_2025-12-18.md` (comprehensive handoff + decisions).
   - Acceptance: `cargo check --workspace` produces no warnings in default configuration.
   - Acceptance: if feasible, CI enforces `RUSTFLAGS="-Dwarnings"` for core crates.
 
-- [ ] **(ENG/Junior)** Repo hygiene (untracked local files)
+- [x] **(ENG/Junior)** Repo hygiene (untracked local files)
   - Acceptance: decide fate of `AGENTS.md.old` and `docs/gain_time_spec.md` (delete, ignore, or commit as canonical docs).
   - Acceptance: `.gitignore` remains correct (never track `outputs/`, `.cache/`, `.mplconfig/`, etc.).
 

@@ -6,8 +6,11 @@ __pycache__/
 .DS_Store
 
 # Outputs
+outputs/
 *.csv
 *.png
 fit_diagnostics.txt
 
 # Local data
+AGENTS.md.old
+~$*.xlsx

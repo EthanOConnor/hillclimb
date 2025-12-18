@@ -90,3 +90,6 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 - Exposed overrides in both CLIs: `--resample-max-gap-sec` and `--resample-max-points`; JSON sidecars now record these settings.
 - Rust altitude pipeline now skips resampling (with a warning) when guardrails trigger; all-windows modes return a clear error instead.
 - Added unit tests in Python and Rust covering guardrail behavior and overrides.
+
+## 2025‑12‑18 – Repo hygiene
+- Added explicit ignores for `outputs/`, `AGENTS.md.old`, and Office temp files (`~$*.xlsx`).
