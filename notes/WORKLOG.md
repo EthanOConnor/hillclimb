@@ -100,3 +100,6 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 
 ## 2025‑12‑18 – Personas + defaults
 - Added `docs/personas_defaults.md` defining primary personas (treadmill vs outdoor), recommended defaults, and user-facing copy for session gaps and idle detection.
+
+## 2025‑12‑18 – Algorithm Lab UX spec
+- Added `docs/algorithm_lab_ux.md` with wireframe-level layout + copy + explainability requirements for multi-algorithm ascent comparison.

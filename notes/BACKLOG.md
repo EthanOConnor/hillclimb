@@ -45,7 +45,7 @@ See also: `docs/REVIEW_2025-12-18.md` (comprehensive handoff + decisions).
   - Acceptance: short doc defining primary personas (treadmill incline vs outdoor) and default settings per persona.
   - Acceptance: explicitly define the product stance on “session gaps” and “idle” in UI copy.
 
-- [ ] **(Design/UX)** “Algorithm Lab” UX spec (comparison + explainability)
+- [x] **(Design/UX)** “Algorithm Lab” UX spec (comparison + explainability)
   - Acceptance: wireframes + copy for:
     - selecting algorithms
     - showing deltas and “why different” explanations
