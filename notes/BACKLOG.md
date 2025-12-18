@@ -71,7 +71,7 @@ See also: `docs/REVIEW_2025-12-18.md` (comprehensive handoff + decisions).
     - TwoNav minimum altitude increase thresholding.
   - Acceptance: each algorithm produces deterministic output and is included in `ascent compare`.
 
-- [ ] **(ENG/Senior)** Benchmark harness + regression suite
+- [x] **(ENG/Senior)** Benchmark harness + regression suite
   - Acceptance: harness runs algorithms on `Tracklogs/` and stores summary metrics (not raw data) for regressions.
   - Acceptance: can compare “treadmill incline integration” vs altitude-derived totals and report delta distributions.
 

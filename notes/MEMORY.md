@@ -86,6 +86,7 @@ Notes:
 - Rust CLI exposes “Algorithm Lab” commands:
   - `hc_curve_cli ascent list` (discover available stable algorithm IDs)
   - `hc_curve_cli ascent compare … --json` (baseline + multi-algorithm report with per-algorithm totals, per-duration curve deltas, and diagnostics)
+  - `hc_curve_cli ascent bench … -o ascent_bench.json` (run comparisons across many activities and write summary-only regression metrics + delta distributions)
 
 Rationale: provides a deterministic, scriptable comparison entrypoint for research and regression harnesses before the web UI is fully productized.
 

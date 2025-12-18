@@ -123,3 +123,7 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 ## 2025‑12‑18 – Algorithm Lab web UI (multi-algorithm comparison)
 - Added an Algorithm Lab mode to the WASM web app: baseline + multi-select algorithms, a comparison plot, and a results table.
 - Web comparison uses the Rust core `compute_ascent_compare` output so CLI/Web share the same canonical semantics.
+
+## 2025‑12‑18 – Benchmark harness (`ascent bench`)
+- Added `hc_curve_cli ascent bench` to run ascent algorithm comparisons across many activities and write a summary-only JSON report (no raw series).
+- Bench output includes per-algorithm delta distributions vs a baseline (use baseline=`hc.source.runn_incline.v1` to compare treadmill incline integration vs altitude totals).

@@ -513,6 +513,8 @@ enum AscentCommand {
     List,
     /// Compare multiple ascent algorithms on a single activity
     Compare(AscentCompareArgs),
+    /// Benchmark ascent algorithms across many activities (summary metrics only)
+    Bench(AscentBenchArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -585,6 +587,81 @@ struct AscentCompareArgs {
     /// Clear parsed FIT cache before running
     #[arg(long, action = ArgAction::SetTrue)]
     clear_cache: bool,
+
+    /// Verbose logging
+    #[arg(long, action = ArgAction::SetTrue)]
+    verbose: bool,
+
+    /// Profile major stages with timings
+    #[arg(long, action = ArgAction::SetTrue)]
+    profile: bool,
+}
+
+#[derive(Parser, Debug)]
+struct AscentBenchArgs {
+    /// FIT/GPX files to ingest (each file treated as one activity)
+    #[arg(required = true, value_hint = ValueHint::FilePath)]
+    inputs: Vec<PathBuf>,
+
+    /// JSON output path
+    #[arg(short, long, default_value = "ascent_bench.json", value_hint = ValueHint::FilePath)]
+    output: PathBuf,
+
+    /// Baseline algorithm ID (for delta columns)
+    #[arg(long, default_value = "hc.altitude.canonical.v1")]
+    baseline: String,
+
+    /// Algorithm IDs to run (comma separated). If omitted, runs all known algorithms except the baseline.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    algorithms: Vec<String>,
+
+    /// Optional durations list (comma separated seconds) for per-duration delta stats
+    #[arg(long)]
+    durations: Option<String>,
+
+    /// Gap threshold (seconds) for session segmentation
+    #[arg(long, default_value_t = 600.0)]
+    session_gap: f64,
+
+    /// Timestamp merge tolerance (seconds)
+    #[arg(long, default_value_t = 0.5)]
+    merge_eps: f64,
+
+    /// Overlap precedence policy for total gain
+    #[arg(long, default_value = "file:last")]
+    overlap_policy: String,
+
+    /// Keep native sampling (skip 1 Hz resample)
+    #[arg(long, action = ArgAction::SetTrue)]
+    raw_sampling: bool,
+
+    /// Guardrail: refuse to fill timestamp gaps longer than this when resampling to 1 Hz
+    #[arg(long, default_value_t = 2.0 * 3600.0)]
+    resample_max_gap_sec: f64,
+
+    /// Guardrail: refuse to allocate more than this many 1 Hz samples when resampling
+    #[arg(long, default_value_t = 500_000)]
+    resample_max_points: usize,
+
+    /// Disable QC censoring
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_qc: bool,
+
+    /// Optional QC override JSON path
+    #[arg(long, value_hint = ValueHint::FilePath)]
+    qc_spec: Option<PathBuf>,
+
+    /// Curve engine for per-duration deltas (auto|numpy|numba|stride)
+    #[arg(long, value_enum, default_value_t = EngineOpt::Auto)]
+    engine: EngineOpt,
+
+    /// Clear parsed FIT cache before running
+    #[arg(long, action = ArgAction::SetTrue)]
+    clear_cache: bool,
+
+    /// Fail the command if any input file fails to parse or compute
+    #[arg(long, action = ArgAction::SetTrue)]
+    strict: bool,
 
     /// Verbose logging
     #[arg(long, action = ArgAction::SetTrue)]
@@ -674,6 +751,13 @@ fn main() -> Result<()> {
             AscentCommand::List => "info",
             AscentCommand::Compare(compare) => {
                 if compare.verbose {
+                    "debug"
+                } else {
+                    "info"
+                }
+            }
+            AscentCommand::Bench(bench) => {
+                if bench.verbose {
                     "debug"
                 } else {
                     "info"
@@ -1359,6 +1443,7 @@ fn handle_ascent(args: AscentArgs) -> Result<()> {
             Ok(())
         }
         AscentCommand::Compare(compare) => handle_ascent_compare(compare),
+        AscentCommand::Bench(bench) => handle_ascent_bench(bench),
     }
 }
 
@@ -1529,6 +1614,569 @@ fn handle_ascent_compare(args: AscentCompareArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum AscentBenchAlgorithmEntry {
+    Ok {
+        algorithm_id: String,
+        name: String,
+        params_hash: String,
+        diagnostics: hc_curve::AscentDiagnostics,
+        total_gain_m: f64,
+        delta_total_gain_m: f64,
+        delta_curve_climb_m: Vec<f64>,
+    },
+    Error {
+        algorithm_id: String,
+        name: String,
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum AscentBenchActivityEntry {
+    Ok {
+        input: String,
+        baseline_algorithm_id: String,
+        baseline_name: String,
+        total_span_s: f64,
+        baseline_total_gain_m: f64,
+        algorithms: Vec<AscentBenchAlgorithmEntry>,
+    },
+    Error {
+        input: String,
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ScalarStats {
+    count: usize,
+    min: Option<f64>,
+    p05: Option<f64>,
+    median: Option<f64>,
+    p95: Option<f64>,
+    max: Option<f64>,
+    mean: Option<f64>,
+    std: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AscentBenchAlgorithmSummary {
+    algorithm_id: String,
+    name: String,
+    n_ok: usize,
+    n_error: usize,
+    total_gain_m: ScalarStats,
+    delta_total_gain_m: ScalarStats,
+    delta_curve_climb_m: Vec<ScalarStats>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AscentBenchSummary {
+    baseline_total_gain_m: ScalarStats,
+    algorithms: Vec<AscentBenchAlgorithmSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AscentBenchReport {
+    baseline_algorithm_id: String,
+    algorithms: Vec<String>,
+    durations_s: Vec<u64>,
+    activities: Vec<AscentBenchActivityEntry>,
+    summary: AscentBenchSummary,
+}
+
+fn handle_ascent_bench(args: AscentBenchArgs) -> Result<()> {
+    if args.inputs.is_empty() {
+        return Err(anyhow!("no input files supplied"));
+    }
+
+    let mut params = Params::default();
+    params.session_gap_sec = args.session_gap;
+    params.merge_eps_sec = args.merge_eps;
+    params.overlap_policy = args.overlap_policy.clone();
+    params.resample_1hz = !args.raw_sampling;
+    params.resample_max_gap_sec = args.resample_max_gap_sec;
+    params.resample_max_points = args.resample_max_points;
+    params.qc_enabled = !args.no_qc;
+    params.engine = args.engine.into();
+
+    if let Some(spec_path) = args.qc_spec.as_ref() {
+        params.qc_spec = Some(load_qc_spec(spec_path)?);
+    }
+
+    let baseline_cfg = AscentAlgorithmConfig::default_for_id(&args.baseline).ok_or_else(|| {
+        anyhow!(
+            "Unknown baseline algorithm '{}'. Run: hc_curve_cli ascent list",
+            args.baseline
+        )
+    })?;
+
+    let mut algo_cfgs: Vec<AscentAlgorithmConfig> = Vec::new();
+    let mut algo_ids_run: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let _ = seen.insert(baseline_cfg.id());
+
+    let requested_ids: Vec<String> = if args.algorithms.is_empty() {
+        list_ascent_algorithms()
+            .into_iter()
+            .map(|info| info.id)
+            .collect()
+    } else {
+        args.algorithms.clone()
+    };
+
+    for id in requested_ids {
+        let cfg = match AscentAlgorithmConfig::default_for_id(&id) {
+            Some(cfg) => cfg,
+            None => {
+                warn!(
+                    "Unknown algorithm '{}' (skipping). Run: hc_curve_cli ascent list",
+                    id
+                );
+                continue;
+            }
+        };
+        let cfg_id = cfg.id();
+        if !seen.insert(cfg_id) {
+            continue;
+        }
+        algo_ids_run.push(cfg_id.to_string());
+        algo_cfgs.push(cfg);
+    }
+
+    let durations_s = if let Some(durations_str) = args.durations.as_ref() {
+        let durations = parse_duration_list(durations_str)?;
+        if durations.is_empty() {
+            return Err(anyhow!("--durations list was empty"));
+        }
+        Some(durations)
+    } else {
+        None
+    };
+
+    let cache_dir = PathBuf::from(".cache").join("parsed_fit");
+    if args.clear_cache {
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+    let _ = fs::create_dir_all(&cache_dir);
+
+    let inputs: Vec<(usize, PathBuf)> = args.inputs.iter().cloned().enumerate().collect();
+
+    let t_total = Instant::now();
+    let mut computed: Vec<(usize, Option<Vec<u64>>, AscentBenchActivityEntry)> = inputs
+        .par_iter()
+        .map(|(idx, path)| {
+            let input_str = path.to_string_lossy().to_string();
+            let key = match cache_key(path) {
+                Ok(key) => key,
+                Err(err) => {
+                    return (
+                        *idx,
+                        None,
+                        AscentBenchActivityEntry::Error {
+                            input: input_str,
+                            error: err.to_string(),
+                        },
+                    );
+                }
+            };
+
+            let records = if let Some(mut cached) = read_cache(&cache_dir, &key) {
+                for record in &mut cached {
+                    record.file_id = 0;
+                }
+                cached
+            } else {
+                let data = match fs::read(path) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        return (
+                            *idx,
+                            None,
+                            AscentBenchActivityEntry::Error {
+                                input: input_str,
+                                error: err.to_string(),
+                            },
+                        );
+                    }
+                };
+                let hint = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("fit");
+                let parsed = match parse_records(&data, 0, hint) {
+                    Ok(records) => records,
+                    Err(err) => {
+                        return (
+                            *idx,
+                            None,
+                            AscentBenchActivityEntry::Error {
+                                input: input_str,
+                                error: err.to_string(),
+                            },
+                        );
+                    }
+                };
+                let _ = write_cache(&cache_dir, &key, &parsed);
+                parsed
+            };
+
+            let report = match compute_ascent_compare(
+                vec![records],
+                &params,
+                &baseline_cfg,
+                &algo_cfgs,
+                durations_s.clone(),
+            ) {
+                Ok(report) => report,
+                Err(err) => {
+                    return (
+                        *idx,
+                        None,
+                        AscentBenchActivityEntry::Error {
+                            input: input_str,
+                            error: err.to_string(),
+                        },
+                    );
+                }
+            };
+
+            let (baseline_name, baseline_span_s, baseline_total_gain_m) = match &report.baseline {
+                AscentCompareAlgorithmEntry::Ok {
+                    name,
+                    total_span_s,
+                    total_gain_m,
+                    ..
+                } => (name.clone(), *total_span_s, *total_gain_m),
+                AscentCompareAlgorithmEntry::Error { error, .. } => {
+                    return (
+                        *idx,
+                        None,
+                        AscentBenchActivityEntry::Error {
+                            input: input_str,
+                            error: error.clone(),
+                        },
+                    );
+                }
+            };
+
+            let algorithms = report
+                .entries
+                .into_iter()
+                .map(|entry| match entry {
+                    AscentCompareAlgorithmEntry::Ok {
+                        algorithm_id,
+                        name,
+                        params_hash,
+                        diagnostics,
+                        total_gain_m,
+                        delta_total_gain_m,
+                        delta_curve_climb_m,
+                        ..
+                    } => AscentBenchAlgorithmEntry::Ok {
+                        algorithm_id,
+                        name,
+                        params_hash,
+                        diagnostics,
+                        total_gain_m,
+                        delta_total_gain_m,
+                        delta_curve_climb_m,
+                    },
+                    AscentCompareAlgorithmEntry::Error {
+                        algorithm_id,
+                        name,
+                        error,
+                    } => AscentBenchAlgorithmEntry::Error {
+                        algorithm_id,
+                        name,
+                        error,
+                    },
+                })
+                .collect::<Vec<_>>();
+
+            (
+                *idx,
+                Some(report.durations_s.clone()),
+                AscentBenchActivityEntry::Ok {
+                    input: input_str,
+                    baseline_algorithm_id: report.baseline_algorithm_id,
+                    baseline_name,
+                    total_span_s: baseline_span_s,
+                    baseline_total_gain_m,
+                    algorithms,
+                },
+            )
+        })
+        .collect();
+
+    computed.sort_by_key(|(idx, _, _)| *idx);
+    let resolved_durations: Vec<u64> = durations_s.unwrap_or_else(|| {
+        computed
+            .iter()
+            .find_map(|(_, durations, entry)| match entry {
+                AscentBenchActivityEntry::Ok { .. } => durations.clone(),
+                AscentBenchActivityEntry::Error { .. } => None,
+            })
+            .unwrap_or_default()
+    });
+
+    let activities: Vec<AscentBenchActivityEntry> =
+        computed.into_iter().map(|(_, _, entry)| entry).collect();
+
+    let baseline_totals: Vec<f64> = activities
+        .iter()
+        .filter_map(|entry| match entry {
+            AscentBenchActivityEntry::Ok {
+                baseline_total_gain_m,
+                ..
+            } => Some(*baseline_total_gain_m),
+            AscentBenchActivityEntry::Error { .. } => None,
+        })
+        .collect();
+    let baseline_total_gain_m_stats = compute_scalar_stats(&baseline_totals);
+
+    let mut algo_aggs: BTreeMap<String, AlgoAgg> = BTreeMap::new();
+    for entry in &activities {
+        let AscentBenchActivityEntry::Ok { algorithms, .. } = entry else {
+            continue;
+        };
+        for alg in algorithms {
+            match alg {
+                AscentBenchAlgorithmEntry::Ok {
+                    algorithm_id,
+                    name,
+                    total_gain_m,
+                    delta_total_gain_m,
+                    delta_curve_climb_m,
+                    ..
+                } => {
+                    let agg = algo_aggs
+                        .entry(algorithm_id.clone())
+                        .or_insert_with(|| AlgoAgg::new(name.clone(), resolved_durations.len()));
+                    agg.total_gain_m.push(*total_gain_m);
+                    agg.delta_total_gain_m.push(*delta_total_gain_m);
+                    agg.push_delta_curve(delta_curve_climb_m);
+                }
+                AscentBenchAlgorithmEntry::Error {
+                    algorithm_id,
+                    name,
+                    ..
+                } => {
+                    let agg = algo_aggs
+                        .entry(algorithm_id.clone())
+                        .or_insert_with(|| AlgoAgg::new(name.clone(), resolved_durations.len()));
+                    agg.n_error += 1;
+                }
+            }
+        }
+    }
+
+    let mut summaries: Vec<AscentBenchAlgorithmSummary> = Vec::new();
+    for (algorithm_id, agg) in algo_aggs {
+        let n_ok = agg.delta_total_gain_m.len();
+        let n_error = agg.n_error;
+        let delta_curve_stats = agg
+            .delta_curve_climb_m
+            .iter()
+            .map(|vals| compute_scalar_stats(vals))
+            .collect::<Vec<_>>();
+        summaries.push(AscentBenchAlgorithmSummary {
+            algorithm_id,
+            name: agg.name,
+            n_ok,
+            n_error,
+            total_gain_m: compute_scalar_stats(&agg.total_gain_m),
+            delta_total_gain_m: compute_scalar_stats(&agg.delta_total_gain_m),
+            delta_curve_climb_m: delta_curve_stats,
+        });
+    }
+
+    let report = AscentBenchReport {
+        baseline_algorithm_id: baseline_cfg.id().to_string(),
+        algorithms: algo_ids_run,
+        durations_s: resolved_durations.clone(),
+        activities: activities.clone(),
+        summary: AscentBenchSummary {
+            baseline_total_gain_m: baseline_total_gain_m_stats,
+            algorithms: summaries.clone(),
+        },
+    };
+
+    println!(
+        "Ascent bench: {} activity(s) in {:.1} ms",
+        report.activities.len(),
+        t_total.elapsed().as_secs_f64() * 1000.0
+    );
+    println!("Baseline: {}", report.baseline_algorithm_id);
+    println!(
+        "Baseline total gain stats (m): count={} median={}",
+        report.summary.baseline_total_gain_m.count,
+        report
+            .summary
+            .baseline_total_gain_m
+            .median
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "n/a".to_string())
+    );
+    println!();
+    println!(
+        "{:<40} {:>6} {:>6} {:>10} {:>10} {:>10}",
+        "algorithm_id", "ok", "err", "meanΔ", "p50Δ", "p95Δ"
+    );
+    println!("{}", "-".repeat(86));
+    for summary in &report.summary.algorithms {
+        let mean = summary
+            .delta_total_gain_m
+            .mean
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "n/a".to_string());
+        let median = summary
+            .delta_total_gain_m
+            .median
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "n/a".to_string());
+        let p95 = summary
+            .delta_total_gain_m
+            .p95
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "n/a".to_string());
+        println!(
+            "{:<40} {:>6} {:>6} {:>10} {:>10} {:>10}",
+            summary.algorithm_id, summary.n_ok, summary.n_error, mean, median, p95
+        );
+    }
+
+    let meta = json!({
+        "schema_version": JSON_REPORT_SCHEMA_VERSION,
+        "command": "ascent-bench",
+        "app_version": env!("CARGO_PKG_VERSION"),
+        "generated_at": Utc::now().to_rfc3339(),
+        "parser": { "name": "fitparser" },
+        "inputs": args.inputs.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+        "baseline_algorithm_id": baseline_cfg.id(),
+        "algorithms": report.algorithms.clone(),
+        "durations_s": report.durations_s.clone(),
+        "qc_enabled": params.qc_enabled,
+        "qc_spec": args.qc_spec.as_ref().map(|p| p.to_string_lossy()),
+        "resample_1hz": params.resample_1hz,
+        "resample_max_gap_sec": params.resample_max_gap_sec,
+        "resample_max_points": params.resample_max_points,
+        "session_gap_sec": params.session_gap_sec,
+        "merge_eps_sec": params.merge_eps_sec,
+        "overlap_policy": params.overlap_policy,
+        "engine": format!("{:?}", params.engine).to_lowercase(),
+    });
+
+    let payload = json!({
+        "meta": meta,
+        "bench": report,
+    });
+
+    let text = serde_json::to_string_pretty(&payload)?;
+    fs::write(&args.output, text)
+        .with_context(|| format!("failed to write {}", args.output.display()))?;
+    info!("Wrote JSON: {}", args.output.display());
+
+    let any_errors = activities.iter().any(|entry| matches!(entry, AscentBenchActivityEntry::Error { .. }));
+    let any_success = activities.iter().any(|entry| matches!(entry, AscentBenchActivityEntry::Ok { .. }));
+    if !any_success {
+        return Err(anyhow!("No activities completed successfully (see JSON for details)."));
+    }
+    if args.strict && any_errors {
+        return Err(anyhow!("One or more activities failed (strict mode)."));
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct AlgoAgg {
+    name: String,
+    total_gain_m: Vec<f64>,
+    delta_total_gain_m: Vec<f64>,
+    delta_curve_climb_m: Vec<Vec<f64>>,
+    n_error: usize,
+}
+
+impl AlgoAgg {
+    fn new(name: String, durations_len: usize) -> Self {
+        Self {
+            name,
+            total_gain_m: Vec::new(),
+            delta_total_gain_m: Vec::new(),
+            delta_curve_climb_m: vec![Vec::new(); durations_len],
+            n_error: 0,
+        }
+    }
+
+    fn push_delta_curve(&mut self, delta: &[f64]) {
+        for (idx, &val) in delta.iter().enumerate() {
+            if let Some(bucket) = self.delta_curve_climb_m.get_mut(idx) {
+                bucket.push(val);
+            }
+        }
+    }
+}
+
+fn compute_scalar_stats(values: &[f64]) -> ScalarStats {
+    let count = values.len();
+    if count == 0 {
+        return ScalarStats {
+            count: 0,
+            min: None,
+            p05: None,
+            median: None,
+            p95: None,
+            max: None,
+            mean: None,
+            std: None,
+        };
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let mean = sorted.iter().sum::<f64>() / count as f64;
+    let var = sorted
+        .iter()
+        .map(|v| {
+            let d = v - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / count as f64;
+    let std = var.sqrt();
+    ScalarStats {
+        count,
+        min: sorted.first().copied(),
+        p05: Some(quantile_sorted(&sorted, 0.05)),
+        median: Some(quantile_sorted(&sorted, 0.5)),
+        p95: Some(quantile_sorted(&sorted, 0.95)),
+        max: sorted.last().copied(),
+        mean: Some(mean),
+        std: Some(std),
+    }
+}
+
+fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let clamped = q.clamp(0.0, 1.0);
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let idx = clamped * (sorted.len() - 1) as f64;
+    let lo = idx.floor() as usize;
+    let hi = idx.ceil() as usize;
+    if lo == hi {
+        return sorted[lo];
+    }
+    let w = idx - lo as f64;
+    sorted[lo] * (1.0 - w) + sorted[hi] * w
 }
 
 fn cache_key(path: &Path) -> Result<String> {
