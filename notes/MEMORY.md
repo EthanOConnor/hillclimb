@@ -72,3 +72,7 @@ Rationale: supports reproducible algorithm comparisons and prevents silent outpu
   - fallback path: add a Python parser abstraction and evaluate `fitdecode` as the default backend if Python parsing remains first-class
 
 Rationale: `python-fitparse` maintainership is explicitly flagged upstream; plan for a controlled migration rather than a forced scramble later.
+
+Notes:
+- Canonical doc: `docs/fit_parsing_strategy.md` (package status + decision + timeline).
+- JSON sidecars should always include a stable `schema_version` and a `parser` identifier to prevent silent ingestion drift.

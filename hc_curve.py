@@ -59,6 +59,7 @@ if "XDG_CACHE_HOME" not in os.environ:
 
 _PARSED_FIT_CACHE_DIR = os.path.join(_BASE_DIR, ".cache", "parsed_fit")
 _FIT_CACHE_SCHEMA_VERSION = 1
+JSON_REPORT_SCHEMA_VERSION = 1
 
 _FITPARSE_VERSION_CHECKED = False
 
@@ -563,6 +564,7 @@ def _export_series_command(
         json_path = output[:-4] + ".json" if output.lower().endswith(".csv") else output + ".json"
         try:
             meta = {
+                "schema_version": JSON_REPORT_SCHEMA_VERSION,
                 "command": "export-series",
                 "inputs": list(fit_files),
                 "output_csv": output,
@@ -572,6 +574,7 @@ def _export_series_command(
                 "n_samples": len(series.times),
                 "full_span_s": series.full_span_seconds,
                 "total_gain_m": float(series.values[-1] - series.values[0]) if series.values else 0.0,
+                "parser": _fit_parser_meta(),
                 "params": {
                     "source": source,
                     "resample_1hz": resample_1hz,
@@ -677,6 +680,31 @@ def _check_fitparse_version() -> None:
                 ver,
             )
             break
+
+
+def _fit_parser_meta() -> Dict[str, Any]:
+    """Best-effort parser identity for JSON sidecars (avoid silent ingestion drift)."""
+    name: Optional[str] = None
+    version: Optional[str] = None
+    try:
+        from importlib import metadata as importlib_metadata  # py3.8+
+    except Exception:
+        importlib_metadata = None  # type: ignore
+
+    if importlib_metadata is not None:
+        for pkg in ("python-fitparse", "fitparse"):
+            try:
+                version = importlib_metadata.version(pkg)
+            except Exception:
+                continue
+            name = pkg
+            break
+
+    return {
+        "name": name,
+        "version": version,
+        "module": "fitparse",
+    }
 
 
 def _pick_total_gain_key(sample_values: dict) -> Optional[str]:

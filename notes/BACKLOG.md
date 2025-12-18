@@ -35,7 +35,7 @@ See also: `docs/REVIEW_2025-12-18.md` (comprehensive handoff + decisions).
   - Acceptance: decide fate of `AGENTS.md.old` and `docs/gain_time_spec.md` (delete, ignore, or commit as canonical docs).
   - Acceptance: `.gitignore` remains correct (never track `outputs/`, `.cache/`, `.mplconfig/`, etc.).
 
-- [ ] **(ENG/Senior)** FIT parsing dependency strategy (python-fitparse vs fitdecode vs Rust-only)
+- [x] **(ENG/Senior)** FIT parsing dependency strategy (python-fitparse vs fitdecode vs Rust-only)
   - Acceptance: decision recorded with rationale and timeline:
     - (preferred) Rust parsing exposed to Python via bindings, OR
     - Python parser abstraction added and `fitdecode` evaluated as replacement default.

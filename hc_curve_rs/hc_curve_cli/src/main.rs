@@ -38,6 +38,7 @@ const DEFAULT_MAGIC_GAIN_TOKENS: &[&str] = &[
     "50m", "100m", "150m", "200m", "300m", "500m", "750m", "1000m",
 ];
 const FIT_CACHE_SCHEMA_VERSION: u32 = 1;
+const JSON_REPORT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachePayload {
@@ -787,7 +788,9 @@ fn handle_curve(args: CurveArgs) -> Result<()> {
             };
 
             let meta = json!({
+                "schema_version": JSON_REPORT_SCHEMA_VERSION,
                 "command": "curve",
+                "app_version": env!("CARGO_PKG_VERSION"),
                 "inputs": args.inputs.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
                 "output_csv": args.output.to_string_lossy(),
                 "selected_source": curves.selected_source,
@@ -795,9 +798,12 @@ fn handle_curve(args: CurveArgs) -> Result<()> {
                 "total_span_s": total_span_s,
                 "total_gain_m": total_gain_m,
                 "engine": format!("{:?}", params.engine).to_lowercase(),
+                "parser": { "name": "fitparser" },
                 "qc_enabled": params.qc_enabled,
                 "qc_spec": args.qc_spec.as_ref().map(|p| p.to_string_lossy()),
                 "resample_1hz": params.resample_1hz,
+                "resample_max_gap_sec": params.resample_max_gap_sec,
+                "resample_max_points": params.resample_max_points,
                 "gain_eps": params.gain_eps_m,
                 "smooth_sec": params.smooth_sec,
                 "durations_s": curves.points.iter().map(|p| p.duration_s).collect::<Vec<_>>(),
@@ -1009,7 +1015,9 @@ fn handle_gain_time(args: GainTimeArgs) -> Result<()> {
             };
 
             let meta = json!({
+                "schema_version": JSON_REPORT_SCHEMA_VERSION,
                 "command": "gain-time",
+                "app_version": env!("CARGO_PKG_VERSION"),
                 "inputs": args.inputs.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
                 "output_csv": args.output.to_string_lossy(),
                 "selected_source": result.selected_source,
@@ -1017,9 +1025,12 @@ fn handle_gain_time(args: GainTimeArgs) -> Result<()> {
                 "total_span_s": result.total_span_s,
                 "total_gain_m": result.total_gain_m,
                 "engine": format!("{:?}", params.engine).to_lowercase(),
+                "parser": { "name": "fitparser" },
                 "qc_enabled": params.qc_enabled,
                 "qc_spec": args.qc_spec.as_ref().map(|p| p.to_string_lossy()),
                 "resample_1hz": params.resample_1hz,
+                "resample_max_gap_sec": params.resample_max_gap_sec,
+                "resample_max_points": params.resample_max_points,
                 "gain_eps": params.gain_eps_m,
                 "smooth_sec": params.smooth_sec,
                 "exhaustive": params.exhaustive,
@@ -1193,16 +1204,21 @@ fn handle_export_series(args: ExportSeriesArgs) -> Result<()> {
             json_path.set_extension("json");
 
             let meta = json!({
+                "schema_version": JSON_REPORT_SCHEMA_VERSION,
                 "command": "export-series",
+                "app_version": env!("CARGO_PKG_VERSION"),
                 "inputs": args.inputs.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
                 "output_csv": args.output.to_string_lossy(),
                 "selected_source": series.selected_source,
                 "n_samples": series.times.len(),
                 "total_span_s": series.times.last().copied().unwrap_or(0.0),
                 "total_gain_m": series.gain.last().copied().unwrap_or(0.0) - series.gain.first().copied().unwrap_or(0.0),
+                "parser": { "name": "fitparser" },
                 "qc_enabled": params.qc_enabled,
                 "qc_spec": args.qc_spec.as_ref().map(|p| p.to_string_lossy()),
                 "resample_1hz": params.resample_1hz,
+                "resample_max_gap_sec": params.resample_max_gap_sec,
+                "resample_max_points": params.resample_max_points,
                 "gain_eps": params.gain_eps_m,
                 "smooth_sec": params.smooth_sec,
                 "session_gap_sec": params.session_gap_sec,

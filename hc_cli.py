@@ -357,6 +357,7 @@ def _run(
         json_path = output[:-4] + ".json" if output.lower().endswith(".csv") else output + ".json"
         try:
             meta = {
+                "schema_version": JSON_REPORT_SCHEMA_VERSION,
                 "command": "curve",
                 "inputs": list(fit_files),
                 "output_csv": output,
@@ -367,6 +368,7 @@ def _run(
                 "full_span_s": full_span_seconds,
                 "total_gain_m": total_ascent,
                 "engine": engine_mode,
+                "parser": _fit_parser_meta(),
                 "params": {
                     "durations_s": duration_grid,
                     "exhaustive": exhaustive,
@@ -813,6 +815,7 @@ def _run_gain_time(
         json_path = output[:-4] + ".json" if output.lower().endswith(".csv") else output + ".json"
         try:
             meta = {
+                "schema_version": JSON_REPORT_SCHEMA_VERSION,
                 "command": "time",
                 "inputs": list(fit_files),
                 "output_csv": output,
@@ -823,6 +826,7 @@ def _run_gain_time(
                 "full_span_s": full_span_seconds,
                 "total_gain_m": total_ascent,
                 "engine": engine_mode,
+                "parser": _fit_parser_meta(),
                 "params": {
                     "all_windows": all_windows,
                     "exhaustive": exhaustive,
