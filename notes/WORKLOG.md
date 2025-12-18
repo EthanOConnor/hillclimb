@@ -83,3 +83,4 @@ Chronological log of meaningful work. Add a short dated entry for any substantiv
 - Documented parser strategy guidance (python-fitparse vs fitdecode) and the recommended migration path.
 - Added a CI smoke workflow (`.github/workflows/ci-smoke.yml`) to run Python unit tests, Rust workspace tests, and a WASM compile check on PR/push.
 - Cleaned up Rust build warnings so `cargo check --workspace` is quiet (cfg-gated `mount_to_body`, removed unused `mut`, simplified unused `MagicPoint` fields).
+- Added `docs/compute_semantics.md` and aligned Rust gap/idle semantics to match the documented behavior (session gaps are timestamp gaps; gap-only windows are skipped; idle segments gate altitude ascent but don’t define session gaps).

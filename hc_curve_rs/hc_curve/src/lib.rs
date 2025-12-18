@@ -1459,10 +1459,10 @@ fn build_timeseries(records: &[MergedRecord], params: &Params) -> Result<Timeser
             if !any_alt {
                 return Err(HcError::InsufficientData);
             }
-            let (t, g, gaps_alt) = build_timeseries_from_altitude(records, t0, params)?;
+            let (t, g) = build_timeseries_from_altitude(records, t0, params)?;
             times = t;
             gains = g;
-            inactivity_gaps = gaps_alt;
+            inactivity_gaps = Vec::new();
             used_sources.insert("altitude".to_string());
             source_kind = SourceKind::Altitude;
         }
@@ -1529,7 +1529,6 @@ struct PerSourceCumulative {
     tg: Vec<Option<f64>>,
     incline: Vec<Option<f64>>,
     altitude: Vec<Option<f64>>,
-    inactivity_gaps: Vec<(f64, f64)>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1603,7 +1602,7 @@ fn build_canonical_timeseries(
     let mut base = 0.0;
     let mut last_value: Option<f64> = None;
     let mut last_switch: Option<f64> = None;
-    let mut inferred_gaps: Vec<(f64, f64)> = per_source.inactivity_gaps;
+    let mut inferred_gaps: Vec<(f64, f64)> = Vec::new();
 
     let mut last_time = per_source.times[0];
     for (idx, &time) in per_source.times.iter().enumerate() {
@@ -1790,7 +1789,6 @@ fn build_per_source_cumulative(
     enforce_optional_monotone(&mut tg_cum);
     enforce_optional_monotone(&mut inc_cum);
 
-    let mut inactivity_gaps = Vec::new();
     if alt_raw_t.len() >= 2 {
         let speed_med = estimate_session_speed(records, t0);
         let grade_med = estimate_session_grade(records);
@@ -1798,9 +1796,8 @@ fn build_per_source_cumulative(
         if params.smooth_sec > 0.0 {
             altitude_eff = rolling_median_time(&alt_raw_t, &altitude_eff, params.smooth_sec);
         }
-        let (altitude_adj, moving_mask, idle_mask) =
+        let (altitude_adj, moving_mask, _idle_mask) =
             apply_idle_detection(records, t0, &alt_raw_t, &altitude_eff);
-        inactivity_gaps = compute_inactivity_gaps(&alt_raw_t, &idle_mask);
         let gain_series =
             cumulative_ascent_from_altitude(&altitude_adj, params.gain_eps_m, &moving_mask);
         for (series_idx, value) in alt_raw_idx.iter().zip(gain_series.iter()) {
@@ -1816,7 +1813,6 @@ fn build_per_source_cumulative(
         tg: tg_cum,
         incline: inc_cum,
         altitude: alt_cum,
-        inactivity_gaps,
     }
 }
 
@@ -1909,7 +1905,7 @@ fn build_timeseries_from_altitude(
     records: &[MergedRecord],
     t0: f64,
     params: &Params,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<(f64, f64)>), HcError> {
+) -> Result<(Vec<f64>, Vec<f64>), HcError> {
     let mut points: Vec<(f64, f64)> = records
         .iter()
         .filter_map(|r| r.alt.map(|alt| (r.time_s - t0, alt)))
@@ -1940,14 +1936,12 @@ fn build_timeseries_from_altitude(
         altitude_eff = rolling_median_time(&times_raw, &altitude_eff, params.smooth_sec);
     }
 
-    let (altitude_adj, moving_mask, idle_mask) =
+    let (altitude_adj, moving_mask, _idle_mask) =
         apply_idle_detection(records, t0, &times_raw, &altitude_eff);
-
-    let inactivity_gaps = compute_inactivity_gaps(&times_raw, &idle_mask);
 
     let gain = cumulative_ascent_from_altitude(&altitude_adj, params.gain_eps_m, &moving_mask);
 
-    Ok((times_raw, gain, inactivity_gaps))
+    Ok((times_raw, gain))
 }
 
 fn estimate_session_speed(records: &[MergedRecord], t0: f64) -> f64 {
@@ -2149,29 +2143,6 @@ fn apply_idle_detection(
     let alt_adj = apply_idle_hold(times, altitude, &idle_mask, drift_limit);
 
     (alt_adj, moving_mask, idle_mask)
-}
-
-fn compute_inactivity_gaps(times: &[f64], idle_mask: &[bool]) -> Vec<(f64, f64)> {
-    let mut gaps = Vec::new();
-    if times.is_empty() || idle_mask.is_empty() {
-        return gaps;
-    }
-    let mut idx = 0usize;
-    let n = times.len();
-    while idx < n {
-        if idle_mask[idx] {
-            let start = times[idx];
-            while idx < n && idle_mask[idx] {
-                idx += 1;
-            }
-            let end_idx = idx.saturating_sub(1);
-            let end = times[end_idx];
-            gaps.push((start, end));
-        } else {
-            idx += 1;
-        }
-    }
-    gaps
 }
 
 fn cumulative_ascent_from_altitude(
@@ -3607,7 +3578,7 @@ fn u_eval(ex: &[f64], ey: &[f64], slopes: &[f64], t: f64) -> f64 {
     }
 }
 
-fn spans_gap(start: f64, end: f64, duration: f64, gaps: &[Gap]) -> bool {
+fn spans_gap(start: f64, _end: f64, duration: f64, gaps: &[Gap]) -> bool {
     if gaps.is_empty() {
         return false;
     }
@@ -3622,9 +3593,6 @@ fn spans_gap(start: f64, end: f64, duration: f64, gaps: &[Gap]) -> bool {
             continue;
         }
         if start >= gap_lo - eps && start <= gap_hi + eps {
-            return true;
-        }
-        if end >= gap.start - eps && end <= gap.end + eps {
             return true;
         }
     }
@@ -4182,6 +4150,26 @@ mod tests {
     fn test_haversine_distance() {
         let dist = haversine_distance(0.0, 0.0, 0.0, 1.0);
         assert!((dist - 111_195.0).abs() < 200.0);
+    }
+
+    #[test]
+    fn test_spans_gap_only_flags_gap_only_windows() {
+        let gaps = vec![Gap {
+            start: 10.0,
+            end: 110.0,
+            length: 100.0,
+        }];
+
+        // Window fully inside the gap should be skipped (duration <= gap length, start within [start, end-duration]).
+        assert!(spans_gap(50.0, 60.0, 10.0, &gaps));
+        assert!(spans_gap(100.0, 110.0, 10.0, &gaps));
+
+        // Windows that cross the gap boundary are allowed by design (gap is treated as "no-gain time", not a hard boundary).
+        assert!(!spans_gap(105.0, 115.0, 10.0, &gaps));
+        assert!(!spans_gap(0.0, 10.0, 10.0, &gaps));
+
+        // Durations longer than the gap are not treated as "gap-only" windows.
+        assert!(!spans_gap(0.0, 120.0, 120.0, &gaps));
     }
 
     #[test]
